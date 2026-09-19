@@ -69,6 +69,28 @@ int64_t tan_fx(int64_t theta_fx) {
 
 namespace pcc {
 
+// 4x4 の連立一次方程式を部分ピボットのガウス消去で解く。M は [A | b] の 4x5。
+static bool solve4(double M[4][5], double out[4]) {
+    for (int c = 0; c < 4; ++c) {
+        int piv = c;
+        for (int r = c + 1; r < 4; ++r)
+            if (std::fabs(M[r][c]) > std::fabs(M[piv][c])) piv = r;
+        if (std::fabs(M[piv][c]) < 1e-300) return false;
+        if (piv != c) for (int k = c; k < 5; ++k) std::swap(M[c][k], M[piv][k]);
+        for (int r = c + 1; r < 4; ++r) {
+            double f = M[r][c] / M[c][c];
+            for (int k = c; k < 5; ++k) M[r][k] -= f * M[c][k];
+        }
+    }
+    for (int r = 3; r >= 0; --r) {
+        double v = M[r][4];
+        for (int k = r + 1; k < 4; ++k) v -= M[r][k] * out[k];
+        out[r] = v / M[r][r];
+        if (!std::isfinite(out[r])) return false;
+    }
+    return true;
+}
+
 // (x,y) の主軸を返す（2x2 共分散の最大固有ベクトル）
 static void principal_axis(const int64_t* X, const int64_t* Y, size_t n,
                            double& dx, double& dy, double& cx, double& cy) {
@@ -157,6 +179,11 @@ SweepParam fit_scan_line(const int64_t* X, const int64_t* Y, const int64_t* Z,
     // 費用は zigzag のビット長で測る（符号長を決めるのは散らばりではなく裾の重さ）
     auto blen = [](int64_t v) { uint64_t z = zigzag(v); int k = 0; while (z) { ++k; z >>= 1; } return k; };
 
+    auto blen_d = [](double r) {
+        int64_t v = (int64_t)llround(r);
+        uint64_t z = zigzag(v); int k = 0; while (z) { ++k; z >>= 1; } return (double)k;
+    };
+
     // 初期値: 記録角から th0, om を線形に、Sz は広がりの比から
     std::vector<double> shot(n), zz(n), sf(n), ang(n);
     for (size_t i = 0; i < n; ++i) {
@@ -184,50 +211,97 @@ SweepParam fit_scan_line(const int64_t* X, const int64_t* Y, const int64_t* Z,
     for (size_t i = 0; i < n; ++i) s0 += sf[i];
     s0 /= n;
 
-    // 交互最適化: (s0, Sz) は線形、(th0, om) はガウス・ニュートン
-    auto blen_d = [](double r) {
-        int64_t v = (int64_t)llround(r);
-        uint64_t z = zigzag(v); int k = 0; while (z) { ++k; z >>= 1; } return (double)k;
+    // 角度は符号化器（scan_predict）と同じく [-45, 45] 度で打ち切る。
+    // 当てはめの目的関数が符号化器の計算と違うと、実態に合わない最適化になる。
+    const double TH_LIM = M_PI / 4 - 1e-9;
+    auto clamp_th = [&](double t) { return t > TH_LIM ? TH_LIM : (t < -TH_LIM ? -TH_LIM : t); };
+    auto cost_of = [&](double S0, double SZ, double TH, double OM) {
+        double c = 0;
+        for (size_t i = 0; i < n; ++i) {
+            double r = sf[i] - (S0 + (SZ - zz[i]) * std::tan(clamp_th(TH + OM * shot[i])));
+            c += r * r;
+        }
+        return c;
     };
-    for (int it = 0; it < FIT_ITERS; ++it) {
+
+    // 初期値の詰め: 角度を固定して (s0, Sz) を線形最小二乗で合わせる。
+    //   s + z T = s0 + Sz T  なので、計画行列 [1, T]、目標 s + z T の 2 変数
+    {
         double A00 = 0, A01 = 0, A11 = 0, b0 = 0, b1 = 0;
         for (size_t i = 0; i < n; ++i) {
-            double T = std::tan(th0 + om * shot[i]);
-            double t0 = 1.0, t1 = T, y = sf[i] + zz[i] * T;
-            A00 += t0 * t0; A01 += t0 * t1; A11 += t1 * t1;
-            b0 += t0 * y;  b1 += t1 * y;
+            double T = std::tan(clamp_th(th0 + om * shot[i]));
+            double y = sf[i] + zz[i] * T;
+            A00 += 1; A01 += T; A11 += T * T; b0 += y; b1 += y * T;
         }
-        double d = A00 * A11 - A01 * A01;
-        if (std::fabs(d) > 1e-9) {
-            double ns0 = (b0 * A11 - b1 * A01) / d;
-            double nSz = (A00 * b1 - A01 * b0) / d;
+        double det = A00 * A11 - A01 * A01;
+        if (std::fabs(det) > 1e-9) {
+            double ns0 = (b0 * A11 - b1 * A01) / det;
+            double nSz = (A00 * b1 - A01 * b0) / det;
             if (std::isfinite(ns0) && std::isfinite(nSz) &&
                 nSz > zmean + 5e4 && nSz < zmean + 4e6) { s0 = ns0; Sz = nSz; }
         }
-        double B00 = 0, B01 = 0, B11 = 0, g0 = 0, g1 = 0;
+    }
+
+    // レーベンバーグ・マルカート法で 4 パラメタを同時に合わせる。
+    //   (JᵀJ + λ diag(JᵀJ)) δ = -Jᵀr,  p ← p + δ
+    // 列のスケールが 6 桁違う（shot は最大 7 万、Sz は 10^6 mm）ので、
+    // D = diag(sqrt(A_kk)) で正規化してから解く。D⁻¹AD⁻¹ は対角が 1 になる。
+    double lambda = 1e-3;
+    double cost = cost_of(s0, Sz, th0, om);
+    for (int it = 0; it < FIT_ITERS; ++it) {
+        double A[4][4] = {{0, 0, 0, 0}, {0, 0, 0, 0}, {0, 0, 0, 0}, {0, 0, 0, 0}};
+        double g[4] = {0, 0, 0, 0};
         for (size_t i = 0; i < n; ++i) {
-            double T = std::tan(th0 + om * shot[i]);
-            double r = sf[i] - (s0 + (Sz - zz[i]) * T);
-            double j = -(Sz - zz[i]) * (1.0 + T * T);
-            double j0 = j, j1 = j * shot[i];
-            B00 += j0 * j0; B01 += j0 * j1; B11 += j1 * j1;
-            g0 -= j0 * r;  g1 -= j1 * r;
-        }
-        double e = B00 * B11 - B01 * B01;
-        if (std::fabs(e) > 1e-9) {
-            double dth = (g0 * B11 - g1 * B01) / e;
-            double dom = (B00 * g1 - B01 * g0) / e;
-            if (std::isfinite(dth) && std::isfinite(dom)) {
-                double nt = th0 + dth, no = om + dom;
-                if (std::fabs(nt) < M_PI / 4 - 1e-6) { th0 = nt; om = no; }
+            double raw = th0 + om * shot[i];
+            bool cl = (raw > TH_LIM || raw < -TH_LIM);       // 打ち切られた点は角度の勾配が 0
+            double T = std::tan(clamp_th(raw));
+            double dz = Sz - zz[i];
+            double r = sf[i] - (s0 + dz * T);
+            double w = cl ? 0.0 : dz * (1.0 + T * T);
+            double J[4] = {-1.0, -T, -w, -w * shot[i]};
+            for (int a2 = 0; a2 < 4; ++a2) {
+                g[a2] -= J[a2] * r;
+                for (int b2 = a2; b2 < 4; ++b2) A[a2][b2] += J[a2] * J[b2];
             }
+        }
+        for (int a2 = 0; a2 < 4; ++a2)
+            for (int b2 = 0; b2 < a2; ++b2) A[a2][b2] = A[b2][a2];
+
+        double sc[4];
+        for (int a2 = 0; a2 < 4; ++a2) sc[a2] = (A[a2][a2] > 0) ? std::sqrt(A[a2][a2]) : 1.0;
+
+        bool stepped = false;
+        for (int tr = 0; tr < 8 && !stepped; ++tr) {
+            double M[4][5];
+            for (int a2 = 0; a2 < 4; ++a2) {
+                for (int b2 = 0; b2 < 4; ++b2) M[a2][b2] = A[a2][b2] / (sc[a2] * sc[b2]);
+                M[a2][a2] += lambda;
+                M[a2][4] = g[a2] / sc[a2];
+            }
+            double dd[4];
+            if (solve4(M, dd)) {
+                double ns0 = s0 + dd[0] / sc[0], nSz = Sz + dd[1] / sc[1];
+                double nth = th0 + dd[2] / sc[2], nom = om + dd[3] / sc[3];
+                if (nSz < zmean + 5e4) nSz = zmean + 5e4;
+                if (nSz > zmean + 4e6) nSz = zmean + 4e6;
+                nth = clamp_th(nth);
+                double nc = cost_of(ns0, nSz, nth, nom);
+                if (std::isfinite(nc) && nc < cost) {
+                    s0 = ns0; Sz = nSz; th0 = nth; om = nom;
+                    cost = nc;
+                    lambda = std::max(lambda * 0.1, 1e-12);
+                    stepped = true;
+                }
+            }
+            if (!stepped) lambda = std::min(lambda * 10.0, 1e12);
         }
         if (diag) {
             double bb = 0;
             for (size_t i = 0; i < n; ++i)
-                bb += blen_d(sf[i] - (s0 + (Sz - zz[i]) * std::tan(th0 + om * shot[i])));
-            diag->iter_bits[it] = bb / n;
+                bb += blen_d(sf[i] - (s0 + (Sz - zz[i]) * std::tan(clamp_th(th0 + om * shot[i]))));
+            for (int j = it; j < FIT_ITERS; ++j) diag->iter_bits[j] = bb / n;
         }
+        if (!stepped) break;
     }
 
     // 整数へ。角度は [-45,45] 度 を [-2^31, 2^31] に写す
@@ -252,6 +326,31 @@ SweepParam fit_scan_line(const int64_t* X, const int64_t* Y, const int64_t* Z,
         mp.push(s[i]);
     }
     p.ok = (mdl_bits < alt_bits) ? 1 : 0;
+
+    // モデルを採らない線では、せん断回転は退避路の費用だけで決めてよい。
+    // 帯状に広がっていて主軸に意味がない線では、回転しないほうが安い。
+    // 両方を符号化してみて短い方を採る。
+    if (!p.ok) {
+        auto fb_bits = [&](const int64_t* u, const int64_t* v) {
+            MedPred a2, b2;
+            a2.prev = u[0]; b2.prev = v[0];
+            double c = 0;
+            for (size_t i = 0; i < n; ++i) {
+                c += blen(u[i] - a2.predict()) + blen(v[i] - b2.predict());
+                a2.push(u[i]); b2.push(v[i]);
+            }
+            return c;
+        };
+        if (fb_bits(X, Y) < fb_bits(s.data(), off.data())) {
+            p.t2 = 0; p.sn = 0;                       // 恒等（s = X, off = Y）
+            p.s0 = X[0];
+            p.off0 = Y[0];
+        } else {
+            p.s0 = s[0];
+            p.off0 = off[0];
+        }
+    }
+
     if (diag) {
         diag->span_deg = (double)(*std::max_element(sa, sa + n)
                                 - *std::min_element(sa, sa + n)) * 0.006;

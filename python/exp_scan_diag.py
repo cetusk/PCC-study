@@ -12,6 +12,7 @@ C++ 側で PCC_SCAN_DUMP=<path> を付けて符号化すると、走査線ごと
 """
 from __future__ import annotations
 import sys
+import pathlib
 import numpy as np
 from scipy.optimize import least_squares
 
@@ -73,7 +74,8 @@ def scipy_fit(s, z, shot, sa):
 
 def main(dump: str):
     d = load_rows(dump)
-    it = np.vstack([d[f'i{k}'] for k in range(12)]).T
+    ncol = sum(1 for nm in d.dtype.names if nm.startswith('i') and nm[1:].isdigit())
+    it = np.vstack([d[f'i{k}'] for k in range(ncol)]).T
     ok = d['ok'] > 0.5
     print(f"走査線 {len(d)} 本  採用 {ok.sum()} ({ok.mean():.3f}) / 不採用 {(~ok).sum()}")
 
@@ -89,13 +91,15 @@ def main(dump: str):
           f"採用 {np.mean((d['height_m'][ok] < 100) | (d['height_m'][ok] > 3000)):.3f} / "
           f"不採用 {np.mean((d['height_m'][~ok] < 100) | (d['height_m'][~ok] > 3000)):.3f}")
 
-    print("\n(2) 反復ごとの面内残差のビット長／点（中央値）")
-    print("   " + "  ".join(f"{k:>5}" for k in range(12)))
-    print("   " + "  ".join(f"{np.median(it[:, k]):5.2f}" for k in range(12)))
-    drop = it[:, 10] - it[:, 11]
+    print(f"\n(2) 反復ごとの面内残差のビット長／点（中央値、{ncol} 回）")
+    step = max(1, ncol // 12)
+    ks = list(range(0, ncol, step))
+    print("   " + "  ".join(f"{k:>5}" for k in ks))
+    print("   " + "  ".join(f"{np.median(it[:, k]):5.2f}" for k in ks))
+    drop = it[:, -2] - it[:, -1]
     print(f"  最後の 1 回でまだ減っている線: {np.mean(drop > 0.01):.3f}"
           f"  （減り幅の中央値 {np.median(drop):+.4f} bit）")
-    print(f"  反復 0 から 11 への改善: 中央 {np.median(it[:, 0] - it[:, 11]):+.3f} bit")
+    print(f"  反復 0 から {ncol-1} への改善: 中央 {np.median(it[:, 0] - it[:, -1]):+.3f} bit")
 
     print("\n(1) 同じ走査線での C++ と scipy の比較")
     raw = load_raw(dump + '.raw')
@@ -120,5 +124,53 @@ def main(dump: str):
     print(f"  scipy のほうが良かった線: {n_better / len(diffs):.3f}")
 
 
+def compare(dumps):
+    """複数の書き出しを並べ、退避側の費用と LM が止まった線を比べる。"""
+    print(f"\n(4) 退避側の費用と、当てはめが動かなかった線")
+    print(f"{'書き出し':<14}{'線':>7}{'採用率':>8}{'退避のalt_bits':>15}"
+          f"{'ω=0の線':>10}{'LM不動':>9}")
+    per = []
+    for path in dumps:
+        d = load_rows(path)
+        ncol = sum(1 for nm in d.dtype.names if nm.startswith('i') and nm[1:].isdigit())
+        it = np.vstack([d[f'i{k}'] for k in range(ncol)]).T
+        ok = d['ok'] > 0.5
+        big = d['n'] >= 20                       # 極小の線は当てはめ以前の問題
+        stuck = (np.abs(it[:, 0] - it[:, -1]) < 1e-9) & big
+        zero_om = (d['omega_deg_s'] == 0) & big
+        alt_ng = d['alt_bits'][(~ok) & big]
+        print(f"{pathlib.Path(path).stem:<14}{big.sum():>7}{ok[big].mean():>8.3f}"
+              f"{np.median(alt_ng):>15.2f}{zero_om.sum()/max(big.sum(),1):>10.3f}"
+              f"{stuck.sum()/max(big.sum(),1):>9.3f}")
+        per.append((pathlib.Path(path).stem, d, big, ok))
+
+    print("\n  退避側の alt_bits を走査線の長さで分けた中央値")
+    edges = [20, 100, 300, 600, 1200, 10**9]
+    hdr = "  ".join(f"{a}-{b if b < 10**8 else ''}".rjust(10)
+                    for a, b in zip(edges[:-1], edges[1:]))
+    print(f"{'':<14}{hdr}")
+    for nm, d, big, ok in per:
+        cells = []
+        for a, b in zip(edges[:-1], edges[1:]):
+            m = big & (~ok) & (d['n'] >= a) & (d['n'] < b)
+            cells.append(f"{np.median(d['alt_bits'][m]):10.2f}" if m.sum() >= 5 else f"{'—':>10}")
+        print(f"{nm:<14}" + "  ".join(cells))
+
+    print("\n  ω=0 の線の性質（中央値）")
+    for nm, d, big, ok in per:
+        m = big & (d['omega_deg_s'] == 0)
+        if m.sum() < 5:
+            print(f"{nm:<14}該当 {m.sum()} 本")
+            continue
+        print(f"{nm:<14}該当 {m.sum():5d} 本  点数 {np.median(d['n'][m]):5.0f}  "
+              f"角度幅 {np.median(d['span_deg'][m]):4.1f} 度  "
+              f"薄さ {np.median(d['thin_mm'][m]):7.2f} mm  "
+              f"採用率 {ok[m].mean():.3f}")
+
+
 if __name__ == '__main__':
-    main(sys.argv[1] if len(sys.argv) > 1 else 'scan_diag.tsv')
+    args = sys.argv[1:]
+    if len(args) > 1:
+        compare(args)
+    else:
+        main(args[0] if args else 'scan_diag.tsv')

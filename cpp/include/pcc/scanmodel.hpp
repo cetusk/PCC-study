@@ -81,7 +81,7 @@ inline int64_t scan_predict(const SweepParam& p, int64_t shot, int64_t z) {
 //   当てはめが素朴な差分に勝たなければ ok=0 を返す。
 // 当てはめの様子を外に出すための診断。符号化には使わない。
 // nullptr を渡せば何も起きない（PCC_SCAN_DUMP を付けたときだけ使う）。
-inline constexpr int FIT_ITERS = 12;
+inline constexpr int FIT_ITERS = 24;
 struct FitDiag {
     double span_deg = 0;                 // 走査角の幅
     double thin_mm = 0;                  // 鉛直面への当てはまりの薄さ

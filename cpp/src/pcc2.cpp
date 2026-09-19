@@ -414,14 +414,18 @@ static bool enc_geom_scan(const std::vector<const std::vector<int64_t>*>& cols,
     // PCC_SCAN_DUMP=<path> を付けたときだけ、走査線ごとの当てはめの様子を書き出す。
     // 符号化の結果には影響しない。
     FILE* dump = nullptr; FILE* dump_raw = nullptr;
+    int n_fat_dumped = 0;
     if (const char* dp = getenv("PCC_SCAN_DUMP")) {
         dump = fopen(dp, "w");
-        if (dump) fprintf(dump, "id\tn\tspan_deg\tthin_mm\theight_m\tomega_deg_s"
-                                "\tmdl_bits\talt_bits\tok"
-                                "\ti0\ti1\ti2\ti3\ti4\ti5\ti6\ti7\ti8\ti9\ti10\ti11\n");
+        if (dump) {
+            fprintf(dump, "id\tn\tspan_deg\tthin_mm\theight_m\tomega_deg_s"
+                          "\tmdl_bits\talt_bits\tok\tswp_r0_mm\tswp_w_mm\tsplit_code");
+            for (int i = 0; i < FIT_ITERS; ++i) fprintf(dump, "\ti%d", i);
+            fprintf(dump, "\n");
+        }
         std::string rp = std::string(dp) + ".raw";
         dump_raw = fopen(rp.c_str(), "w");
-        if (dump_raw) fprintf(dump_raw, "# s\tz\tshot_ulp\tscan_angle\n");
+        if (dump_raw) fprintf(dump_raw, "# x\ty\tz\tshot_ulp\tscan_angle\n");
     }
     for (size_t k = 0; k < nsw; ++k) {
         int32_t a = sc.swp[k], b = sc.swp[k + 1];
@@ -449,22 +453,31 @@ static bool enc_geom_scan(const std::vector<const std::vector<int64_t>*>& cols,
             }
             wide = ((double)(hi - lo) * 0.006) >= 20.0;   // scan_angle は 0.006 度単位
         }
+        double sp_r0 = 0, sp_w = 0;
+        int sp_code = 0;                 // 0 試みず / 1 EM が偏った / 2 判定で棄却 / 3 分割した
         if (m >= 40 && wide) {
             gather(0, false);
             double r0 = line_thinness(bx.data(), by.data(), m);
+            sp_r0 = r0;
             std::vector<uint8_t> lab;
             split_two_lines(bx.data(), by.data(), m, lab);
             size_t c1 = 0; for (auto v : lab) c1 += v;
-            if (c1 >= 10 && m - c1 >= 10) {
+            if (c1 < 10 || m - c1 < 10) {
+                sp_code = 1;
+            } else {
                 std::vector<int64_t> x0, y0, x1, y1;
                 for (size_t i = 0; i < m; ++i)
                     if (lab[i]) { x1.push_back(bx[i]); y1.push_back(by[i]); }
                     else        { x0.push_back(bx[i]); y0.push_back(by[i]); }
                 double w = (x0.size() * line_thinness(x0.data(), y0.data(), x0.size()) +
                             x1.size() * line_thinness(x1.data(), y1.data(), x1.size())) / m;
+                sp_w = w;
                 if (w < r0 * 0.5) {
+                    sp_code = 3;
                     L.split[k] = 1;
                     for (size_t i = 0; i < m; ++i) L.label[a + i] = lab[i];
+                } else {
+                    sp_code = 2;
                 }
             }
         }
@@ -477,22 +490,24 @@ static bool enc_geom_scan(const std::vector<const std::vector<int64_t>*>& cols,
                                 bx.size(), dump ? &fd : nullptr);
             if (dump && !bx.empty()) {
                 size_t id = L.line.size();
-                fprintf(dump, "%zu\t%zu\t%.3f\t%.4f\t%.1f\t%.1f\t%.4f\t%.4f\t%d",
+                fprintf(dump, "%zu\t%zu\t%.3f\t%.4f\t%.1f\t%.1f\t%.4f\t%.4f\t%d"
+                              "\t%.4f\t%.4f\t%d",
                         id, bx.size(), fd.span_deg, fd.thin_mm, fd.height_m,
-                        fd.omega_deg_s, fd.mdl_bits, fd.alt_bits, (int)sp.ok);
+                        fd.omega_deg_s, fd.mdl_bits, fd.alt_bits, (int)sp.ok,
+                        sp_r0, sp_w, sp_code);
                 for (int it = 0; it < FIT_ITERS; ++it) fprintf(dump, "\t%.4f", fd.iter_bits[it]);
                 fprintf(dump, "\n");
                 // 50 本に 1 本は生データも出す。Python 側で同じ走査線に
                 // scipy の当てはめを掛け、C++ の結果と直接比べるために使う。
-                if (dump_raw && (id % 50) == 0) {
-                    fprintf(dump_raw, "# line %zu n %zu\n", id, bx.size());
-                    int64_t s_i, off_i;
-                    for (size_t i = 0; i < bx.size(); ++i) {
-                        shear_fwd(bx[i], by[i], sp.t2, sp.sn, s_i, off_i);
-                        fprintf(dump_raw, "%lld\t%lld\t%lld\t%lld\n",
-                                (long long)s_i, (long long)bz[i],
+                bool fat_fail = (sp_code == 2 && sp_r0 > 1000.0 && n_fat_dumped < 40);
+                if (dump_raw && ((id % 50) == 0 || fat_fail)) {
+                    if (fat_fail) ++n_fat_dumped;
+                    fprintf(dump_raw, "# line %zu n %zu code %d r0 %.1f\n",
+                            id, bx.size(), sp_code, sp_r0);
+                    for (size_t i = 0; i < bx.size(); ++i)
+                        fprintf(dump_raw, "%lld\t%lld\t%lld\t%lld\t%lld\n",
+                                (long long)bx[i], (long long)by[i], (long long)bz[i],
                                 (long long)(bg[i] - bg[0]), (long long)bs[i]);
-                    }
                 }
             }
             L.line.push_back(sp);
