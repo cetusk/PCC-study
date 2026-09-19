@@ -44,7 +44,7 @@
 | 直近 3 差分の中央値を予測子に | 23.921 |
 | + 復帰番号ごとに予測器を分ける | 23.482（逆効果） |
 | + 軸をまたぐ文脈 | 22.032 |
-| **走査モデル経由** | **20.801** |
+| **走査モデル経由** | **20.079** |
 | （参考）LASzip | 22.219 |
 
 効いたのは予測式ではなく**文脈の取り方**と**取得の物理モデル**である。
@@ -67,7 +67,8 @@
 
 | 発見 | 規模 | 記録 |
 |---|---|---|
-| ALS の走査角は時刻から決まる | 幾何 −5.6%、0 次で −24% | [als_scan_structure.md](results/als_scan_structure.md) |
+| ALS の走査角は時刻から決まる | 0 次で −24% | [als_scan_structure.md](results/als_scan_structure.md) |
+| 走査モデル符号器と、当てはめの誤り | 幾何 −8.9%（200万点） | [scan_model_fitting.md](results/scan_model_fitting.md) |
 | 自前符号器が LAS/LAZ 非依存に | タイル全体 −31.5%、全列一致 | [pcc2_codec.md](results/pcc2_codec.md) |
 | 面を送って点を引き直す符号化 | 同じ面忠実度でオクトツリーの 4.0 倍 | [lossy_surface_finding.md](results/lossy_surface_finding.md) |
 | 歪み尺度の落とし穴 2 件 | Chamfer の下限は点密度だけで決まる | [lossy_surface_finding.md](results/lossy_surface_finding.md) |
