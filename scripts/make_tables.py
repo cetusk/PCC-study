@@ -2,19 +2,19 @@
 import re, os, sys
 D = 'results/matrix'
 ORDER = [
- ("AHN4_航空LiDAR","AHN4 航空LiDAR","航空"),
- ("autzen__PDAL_","autzen (PDAL)","航空"),
- ("plane__PDAL_","plane (PDAL)","航空"),
- ("fullwave__YellowScan_","fullwave (YellowScan)","航空"),
- ("simple1_4__GlobalMapper_","simple1_4 (GlobalMapper)","その他"),
- ("vegetation__RS_Survey_","vegetation (RS Survey)","航空"),
- ("KITTI_車載LiDAR","KITTI 車載LiDAR","車載"),
- ("Bunny_生スキャン","Bunny 生スキャン","三角測量 生"),
- ("Bunny_再構成","Bunny 再構成","三角測量 再構成"),
- ("Dragon_生スキャン","Dragon 生スキャン","三角測量 生"),
- ("Dragon_再構成","Dragon 再構成","三角測量 再構成"),
- ("Armadillo_生スキャン","Armadillo 生スキャン","三角測量 生"),
- ("Armadillo_再構成","Armadillo 再構成","三角測量 再構成"),
+ ("AHN4_ALS","AHN4 航空LiDAR","航空"),
+ ("autzen_PDAL","autzen (PDAL)","航空"),
+ ("plane_PDAL","plane (PDAL)","航空"),
+ ("fullwave_YellowScan","fullwave (YellowScan)","航空"),
+ ("simple1_4_GlobalMapper","simple1_4 (GlobalMapper)","その他"),
+ ("vegetation_RSSurvey","vegetation (RS Survey)","航空"),
+ ("KITTI_MLS","KITTI 車載LiDAR","車載"),
+ ("Bunny_rawscan","Bunny 生スキャン","三角測量 生"),
+ ("Bunny_recon","Bunny 再構成","三角測量 再構成"),
+ ("Dragon_rawscan","Dragon 生スキャン","三角測量 生"),
+ ("Dragon_recon","Dragon 再構成","三角測量 再構成"),
+ ("Armadillo_rawscan","Armadillo 生スキャン","三角測量 生"),
+ ("Armadillo_recon","Armadillo 再構成","三角測量 再構成"),
 ]
 def rd(slug, kind):
     p = f'{D}/{slug}__{kind}.txt'

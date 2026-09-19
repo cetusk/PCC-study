@@ -1,0 +1,36 @@
+PCC-study
+Copyright 2026 cetusk
+
+This product includes software developed by the PCC-study project.
+
+Licensed under the Apache License, Version 2.0. See the LICENSE file.
+
+--------------------------------------------------------------------------
+Third-party components
+--------------------------------------------------------------------------
+
+nanoflann (cpp/include/pcc/nanoflann.hpp)
+  https://github.com/jlblancoc/nanoflann
+  Copyright 2008-2009  Marius Muja
+  Copyright 2008-2009  David G. Lowe
+  Copyright 2011-2024  Jose Luis Blanco-Claraco
+  Licensed under the BSD 2-Clause License.
+
+The following are used at build or evaluation time and are not distributed
+with this repository:
+
+  LASzip            https://github.com/LASzip/LASzip            (Apache-2.0 / LGPL)
+  Zstandard         https://github.com/facebook/zstd            (BSD-3 / GPLv2)
+  GUDHI             https://gudhi.inria.fr/                     (MIT / GPLv3)
+  CGAL              https://www.cgal.org/                       (GPLv3 / commercial)
+  Eigen             https://eigen.tuxfamily.org/                (MPL2)
+  mpeg-pcc-tmc13    https://github.com/MPEGGroup/mpeg-pcc-tmc13 (BSD-3, MPEG)
+
+Datasets referenced by scripts/setup.sh are distributed by their respective
+providers under their own terms and are not part of this repository:
+
+  AHN3 / AHN4 / AHN5   geotiles.citg.tudelft.nl
+  KITTI                www.cvlibs.net/datasets/kitti
+  Stanford 3D Scanning Repository   graphics.stanford.edu/data/3Dscanrep
+  Osnabrueck / Wuerzburg 3D scans   kos.informatik.uni-osnabrueck.de/3Dscans
+  PDAL / entwine / laspy test data

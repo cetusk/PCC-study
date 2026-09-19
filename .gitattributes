@@ -1,0 +1,24 @@
+# 既定はテキストとして扱い、リポジトリ内では LF に正規化する。
+# チェックアウト時は各環境の設定（core.autocrlf）に従う。
+* text=auto eol=lf
+
+# ソースと記録は明示しておく
+*.cpp   text
+*.hpp   text
+*.py    text
+*.sh    text eol=lf
+*.md    text
+*.txt   text
+*.json  text
+*.tex   text
+CMakeLists.txt text
+Makefile       text
+
+# バイナリ（変換してはいけないもの）
+*.pdf   binary
+*.png   binary
+*.laz   binary
+*.las   binary
+*.ply   binary
+*.bin   binary
+*.pcc2  binary

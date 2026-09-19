@@ -184,6 +184,9 @@ data/       サンプルデータ（git 管理外。setup.sh が取得する）
 - [`notes/03_scan_model_codec.md`](notes/03_scan_model_codec.md) — 走査モデル符号器の設計
 - [`RESUME.md`](RESUME.md) — 中断・再開用の現在地
 
-## 第三者のコード
+## ライセンス
 
+[Apache License 2.0](LICENSE)。出典の保持に加えて特許ライセンスの付与と
+防御条項を持つため、圧縮コーデックの配布に向く。
+同梱・参照している第三者のコードとデータの出典は [NOTICE](NOTICE) にまとめてある。
 `cpp/include/pcc/nanoflann.hpp` は [nanoflann](https://github.com/jlblancoc/nanoflann)（BSD-2-Clause）。

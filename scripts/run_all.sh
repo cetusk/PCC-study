@@ -10,21 +10,23 @@ K=data/raw/kitti/2011_09_26/2011_09_26_drive_0001_sync/velodyne_points/data
 OUT=results/matrix
 MAXP=${MAXP:-400000}
 
-# name|path|kind
+# slug|name|path|kind
+# slug はファイル名に使うので英数字に限る（環境をまたぐときに事故らないため）。
+# name は表示用で、make_tables.py が同じ対応表を持つ。
 DATASETS=(
-  "AHN4 航空LiDAR|data/raw/ahn4/31HZ1_20.LAZ|las"
-  "autzen (PDAL)|data/raw/small/autzen_trim.laz|las"
-  "plane (PDAL)|data/raw/small/plane.laz|las"
-  "fullwave (YellowScan)|data/raw/small/fullwave.laz|las"
-  "simple1_4 (GlobalMapper)|data/raw/small/simple1_4.las|las"
-  "vegetation (RS Survey)|data/raw/small/vegetation_1_3.las|las"
-  "KITTI 車載LiDAR|$K/0000000000.bin|pts"
-  "Bunny 生スキャン|$S/bunny/data/bun000.ply|pts"
-  "Bunny 再構成|$S/bunny/reconstruction/bun_zipper.ply|pts"
-  "Dragon 生スキャン|$S/dragon_stand/dragonStandRight_0.ply|pts"
-  "Dragon 再構成|$S/dragon_recon/dragon_vrip_res2.ply|pts"
-  "Armadillo 生スキャン|$S/Armadillo_scans/ArmadilloBack_0.ply|pts"
-  "Armadillo 再構成|$S/Armadillo.ply|pts"
+  "AHN4_ALS|AHN4 航空LiDAR|data/raw/ahn4/31HZ1_20.LAZ|las"
+  "autzen_PDAL|autzen (PDAL)|data/raw/small/autzen_trim.laz|las"
+  "plane_PDAL|plane (PDAL)|data/raw/small/plane.laz|las"
+  "fullwave_YellowScan|fullwave (YellowScan)|data/raw/small/fullwave.laz|las"
+  "simple1_4_GlobalMapper|simple1_4 (GlobalMapper)|data/raw/small/simple1_4.las|las"
+  "vegetation_RSSurvey|vegetation (RS Survey)|data/raw/small/vegetation_1_3.las|las"
+  "KITTI_MLS|KITTI 車載LiDAR|$K/0000000000.bin|pts"
+  "Bunny_rawscan|Bunny 生スキャン|$S/bunny/data/bun000.ply|pts"
+  "Bunny_recon|Bunny 再構成|$S/bunny/reconstruction/bun_zipper.ply|pts"
+  "Dragon_rawscan|Dragon 生スキャン|$S/dragon_stand/dragonStandRight_0.ply|pts"
+  "Dragon_recon|Dragon 再構成|$S/dragon_recon/dragon_vrip_res2.ply|pts"
+  "Armadillo_rawscan|Armadillo 生スキャン|$S/Armadillo_scans/ArmadilloBack_0.ply|pts"
+  "Armadillo_recon|Armadillo 再構成|$S/Armadillo.ply|pts"
 )
 
 run() {   # run <出力名> <引数...>
@@ -38,9 +40,8 @@ run() {   # run <出力名> <引数...>
 }
 
 for entry in "${DATASETS[@]}"; do
-  IFS='|' read -r name path kind <<< "$entry"
+  IFS='|' read -r slug name path kind <<< "$entry"
   [ -f "$path" ] || { echo "skip (無い): $path"; continue; }
-  slug=$(echo "$name" | tr ' ()/' '____')
   echo ">>> $name"
   run "${slug}__score"   score   "$path" --max-points $MAXP
   run "${slug}__octant"  octant  "$path" --max-points $MAXP
