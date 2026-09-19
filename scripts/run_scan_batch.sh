@@ -6,7 +6,8 @@
 #   bash scripts/run_scan_batch.sh 1 5        # 1〜5 番目だけ
 #
 # 各実行のログは data/work/batch/ に残る。--trace と PCC_SCAN_DEBUG=1 を付けるので、
-# 幾何の全候補（走査v1〜v4 を含む）と走査モデルの内訳が記録される。
+# 幾何の全候補と走査モデルの内訳が記録される。z の中央値予測と交差軸文脈の変種も
+# 測るなら PCC_ALL_VARIANTS=1 を足す（既定は走査v1 と走査変換の 2 本）。
 # 1 件が失敗しても止まらない。安いものと一般性に効くものを先に置いてあるので、
 # 途中で打ち切っても結果は残る。
 set -u
@@ -61,17 +62,19 @@ done
 
 echo
 echo "== 一覧 =="
-printf "%-22s %12s %10s %10s %10s %10s %10s %10s %8s\n" \
-       ファイル 点数 幾何v3 走査v1 走査v2 走査v3 走査v4 PCC2合計 検証
+printf "%-22s %12s %9s %9s %9s %10s %9s %8s %6s\n" \
+       ファイル 点数 幾何v3 走査v1 走査変換 採択 PCC2合計 中身 検証
 for job in "${JOBS[@]}"; do
   IFS='|' read -r name path extra <<< "$job"
   f="$OUT/$name.log"; [ -s "$f" ] || continue
   g()  { grep -oP "^\s+$1\s+\K[\d.]+" "$f" | head -1; }
   pts=$(grep -oP '^\s+\K[\d]+(?= 点 / 出所)' "$f" | head -1)
+  sel=$(grep -oP '^  X\+Y\+Z\s+\K\S+' "$f" | head -1)
   tot=$(grep -oP '^PCC2\s+[\d.]+ MB\s+\K[\d.]+' "$f" | head -1)
+  emb=$(grep -q '^中身.*包んだ' "$f" && echo 包 || echo 自前)
   ver=$(grep -oP '全列一致 = \K\w+' "$f" | head -1)
-  printf "%-22s %12s %10s %10s %10s %10s %10s %10s %8s\n" \
-         "$name" "${pts:--}" "$(g 幾何v3)" "$(g 走査v1)" "$(g 走査v2)" \
-         "$(g 走査v3)" "$(g 走査v4)" "${tot:--}" "${ver:--}"
+  printf "%-22s %12s %9s %9s %9s %10s %9s %8s %6s\n" \
+         "$name" "${pts:--}" "$(g 幾何v3)" "$(g 走査v1)" "$(g 走査変換)" \
+         "${sel:--}" "${tot:--}" "$emb" "${ver:--}"
 done
 echo "== バッチ終了 $(date '+%F %T') =="
