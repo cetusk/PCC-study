@@ -1,0 +1,7 @@
+### geom data/raw/kitti/2011_09_26/2011_09_26_drive_0001_sync/velodyne_points/data/0000000000.bin --max-points 400000
+誤差上限 0.00228103（点間隔 0.0364964 の 1/16）
+    候補 grid              16.922 bpp  誤差   2.273mm  ← 採用
+    候補 polar/origin      19.382 bpp  誤差   2.225mm
+    候補 polar/centroid    19.382 bpp  誤差   2.225mm
+  選択 grid  実誤差 2.2730 mm
+__elapsed .249829200 s

@@ -1,0 +1,36 @@
+// 属性の空間予測 — 幾何から導いた順序で、既に復号済みの近傍から予測する。
+#pragma once
+#include <cstdint>
+#include <vector>
+#include <string>
+#include <cstddef>
+
+namespace pcc {
+
+std::vector<int32_t> coding_order(const std::vector<double>& xyz, size_t n,
+                                  const std::string& kind);
+void build_causal_predictors(const std::vector<double>& xyz, size_t n,
+                             const std::vector<int32_t>& perm, int P, int k_search,
+                             std::vector<int32_t>& pred);
+
+struct AttrResult {
+    std::string name;
+    double bpp_raw = 0;        // 差分を取らずそのまま符号化
+    double bpp_order = 0;      // 格納順の差分
+    double bpp_spatial = 0;    // 幾何由来の順序での空間予測
+    bool roundtrip_ok = false;
+};
+
+// 符号化順に並べ替えて予測残差を作る / 残差から元の並びへ戻す
+void spatial_residual(const std::vector<int64_t>& v, const std::vector<int32_t>& perm,
+                      const std::vector<int32_t>& pred, int P, size_t n,
+                      std::vector<int64_t>& out);
+void spatial_restore(const std::vector<int64_t>& res, const std::vector<int32_t>& perm,
+                     const std::vector<int32_t>& pred, int P, size_t n,
+                     std::vector<int64_t>& out);
+
+AttrResult compare_field(const std::string& name, const std::vector<int64_t>& v,
+                         const std::vector<int32_t>& perm,
+                         const std::vector<int32_t>& pred, int P, size_t n);
+
+} // namespace pcc

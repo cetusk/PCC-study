@@ -1,0 +1,7 @@
+### geom data/raw/small/vegetation_1_3.las --max-points 400000
+誤差上限 0.00136072（点間隔 0.0217715 の 1/16）
+    候補 grid              24.514 bpp  誤差   1.351mm  ← 採用
+    候補 polar/origin      26.571 bpp  誤差   1.353mm
+    候補 polar/centroid    26.571 bpp  誤差   1.353mm
+  選択 grid  実誤差 1.3510 mm
+__elapsed .034109100 s

@@ -1,0 +1,27 @@
+# ---- データ（git 管理外。scripts/setup.sh が取得する）
+/data/
+
+# ---- 実装と関係のないもの
+/claude_sandbox.bat
+/survey/
+/tools/
+/notes/survey_extracted.txt
+/notes/docs_normalization_layer.html
+/docs_normalization_layer.html
+
+# ---- ビルド生成物
+/cpp/build/
+__pycache__/
+*.pyc
+*.o
+*.so
+
+# ---- 論文は PDF だけを追跡する
+/paper/*
+!/paper/pcc.pdf
+!/paper/coding.pdf
+
+# ---- 符号化の出力
+*.pcc2
+*.pcc2.det
+*.laz.base

@@ -1,0 +1,7 @@
+### geom data/raw/small/plane.laz --max-points 400000
+誤差上限 0（点間隔 0 の 1/16）
+    候補 grid               0.000 bpp  誤差 1560.916mm
+    候補 polar/origin       0.000 bpp  誤差 1560.916mm
+    候補 polar/centroid     0.000 bpp  誤差 1560.916mm
+  選択 grid  実誤差 1560.9160 mm
+__elapsed .054041400 s
