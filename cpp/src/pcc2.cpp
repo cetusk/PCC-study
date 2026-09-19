@@ -283,6 +283,35 @@ static void enc_resid(const std::vector<std::vector<int64_t>>& res, std::vector<
         }
     out = e.finish();
 }
+// 走査モデル専用。3 列のうち z（列 2）の文脈を、同じ点の面内・面外の残差の
+// ビット長から作る。幾何v3 が Z に X と Y の平均を使うのと同じ考え方。
+static void enc_resid_x(const std::vector<std::vector<int64_t>>& res, std::vector<uint8_t>& out) {
+    size_t n = res[0].size();
+    Encoder e;
+    UIntCoder uc(3 * NCTX, 64);
+    int p0 = 0, p1 = 0;
+    for (size_t i = 0; i < n; ++i) {
+        uint64_t a = zigzag(res[0][i]); uc.encode(e, a, 0 * NCTX + p0); int k0 = ctx_of(a);
+        uint64_t b = zigzag(res[1][i]); uc.encode(e, b, 1 * NCTX + p1); int k1 = ctx_of(b);
+        uint64_t c = zigzag(res[2][i]); uc.encode(e, c, 2 * NCTX + (k0 + k1) / 2);
+        p0 = k0; p1 = k1;
+    }
+    out = e.finish();
+}
+static void dec_resid_x(const uint8_t* data, size_t len, size_t n,
+                        std::vector<std::vector<int64_t>>& res) {
+    res.assign(3, std::vector<int64_t>(n));
+    Decoder d(data, len);
+    UIntCoder uc(3 * NCTX, 64);
+    int p0 = 0, p1 = 0;
+    for (size_t i = 0; i < n; ++i) {
+        uint64_t a = uc.decode(d, 0 * NCTX + p0); res[0][i] = unzigzag(a); int k0 = ctx_of(a);
+        uint64_t b = uc.decode(d, 1 * NCTX + p1); res[1][i] = unzigzag(b); int k1 = ctx_of(b);
+        uint64_t c = uc.decode(d, 2 * NCTX + (k0 + k1) / 2); res[2][i] = unzigzag(c);
+        p0 = k0; p1 = k1;
+    }
+}
+
 static void dec_resid(const uint8_t* data, size_t len, size_t n, size_t nc,
                       std::vector<std::vector<int64_t>>& res) {
     res.assign(nc, std::vector<int64_t>(n));
@@ -402,6 +431,9 @@ static bool enc_geom_scan(const std::vector<const std::vector<int64_t>*>& cols,
     ScanCtx sc;
     if (!build_scan_ctx(ctx, param, n, sc, err)) return false;
     const auto &CX = *cols[0], &CY = *cols[1], &CZ = *cols[2];
+    const int var = param.empty() ? 1 : param[0];
+    const bool use_med = (var == 2 || var == 4);     // z を中央値予測にする
+    const bool use_xctx = (var == 3 || var == 4);    // z の文脈を面内・面外から作る
 
     size_t nsw = sc.swp.size() - 1;
     LineSet L;
@@ -523,8 +555,8 @@ static bool enc_geom_scan(const std::vector<const std::vector<int64_t>*>& cols,
     int64_t last_any = 0;
     for (size_t k = 0; k < nsw; ++k) {
         int32_t a = sc.swp[k], b = sc.swp[k + 1];
-        int64_t lz[16]; bool hz[16];
-        for (int i = 0; i < 16; ++i) { lz[i] = 0; hz[i] = false; }
+        int64_t lz[16]; bool hz[16]; MedPred mz[16];
+        for (int i = 0; i < 16; ++i) { lz[i] = 0; hz[i] = false; mz[i] = MedPred(); }
         int64_t g0[2] = {0, 0};
         bool hg[2] = {false, false};
         // 面外と、モデルを採らない走査線の面内は中央値予測（幾何v1 と同じ）。
@@ -549,8 +581,10 @@ static bool enc_geom_scan(const std::vector<const std::vector<int64_t>*>& cols,
             res[1][t] = off - po;
             mps[gidx].push(s); mpo[gidx].push(off);
             int r = (int)sc.ret[t] & 15;
-            int64_t pz = hz[r] ? lz[r] : last_any;
+            if (!hz[r]) { mz[r] = MedPred(); mz[r].prev = last_any; }
+            int64_t pz = use_med ? mz[r].predict() : (hz[r] ? lz[r] : last_any);
             res[2][t] = CZ[i] - pz;
+            mz[r].push(CZ[i]);
             lz[r] = CZ[i]; hz[r] = true; last_any = CZ[i];
         }
     }
@@ -588,7 +622,7 @@ static bool enc_geom_scan(const std::vector<const std::vector<int64_t>*>& cols,
         bl = e.finish();
     }
     std::vector<uint8_t> br;
-    enc_resid(res, br);
+    if (use_xctx) enc_resid_x(res, br); else enc_resid(res, br);
 
     // PCC_SCAN_DEBUG=1 で内訳を出す。走査モデルが効く規模と効かない規模を
     // 切り分けるための診断で、符号化の結果には影響しない。
@@ -647,6 +681,9 @@ static bool dec_geom_scan(const std::vector<uint8_t>& param, const uint8_t* data
                           std::string& err, const CodecCtx* ctx) {
     ScanCtx sc;
     if (!build_scan_ctx(ctx, param, n, sc, err)) return false;
+    const int var = param.empty() ? 1 : param[0];
+    const bool use_med = (var == 2 || var == 4);
+    const bool use_xctx = (var == 3 || var == 4);
     size_t p = 0;
     auto rd64 = [&](uint64_t& v) {
         if (p + 8 > len) return false;
@@ -671,7 +708,7 @@ static bool dec_geom_scan(const std::vector<uint8_t>& param, const uint8_t* data
     p += ll;
     if (!rd64(lr) || p + lr > len) { err = "残差が短い"; return false; }
     std::vector<std::vector<int64_t>> res;
-    dec_resid(data + p, lr, n, 3, res);
+    if (use_xctx) dec_resid_x(data + p, lr, n, res); else dec_resid(data + p, lr, n, 3, res);
 
     LineSet L;
     L.split.resize(nsw);
@@ -704,8 +741,8 @@ static bool dec_geom_scan(const std::vector<uint8_t>& param, const uint8_t* data
     int64_t last_any = 0;
     for (size_t k = 0; k < nsw; ++k) {
         int32_t a = sc.swp[k], b = sc.swp[k + 1];
-        int64_t lz[16]; bool hz[16];
-        for (int i = 0; i < 16; ++i) { lz[i] = 0; hz[i] = false; }
+        int64_t lz[16]; bool hz[16]; MedPred mz[16];
+        for (int i = 0; i < 16; ++i) { lz[i] = 0; hz[i] = false; mz[i] = MedPred(); }
         int64_t g0[2] = {0, 0};
         bool hg[2] = {false, false};
         MedPred mps[2], mpo[2];
@@ -719,8 +756,10 @@ static bool dec_geom_scan(const std::vector<uint8_t>& param, const uint8_t* data
                 mpo[gidx] = MedPred(); mpo[gidx].prev = sp.off0;
             }
             int r = (int)sc.ret[t] & 15;
-            int64_t pz = hz[r] ? lz[r] : last_any;
+            if (!hz[r]) { mz[r] = MedPred(); mz[r].prev = last_any; }
+            int64_t pz = use_med ? mz[r].predict() : (hz[r] ? lz[r] : last_any);
             int64_t z = pz + res[2][t];
+            mz[r].push(z);
             lz[r] = z; hz[r] = true; last_any = z;
             int64_t po = mpo[gidx].predict();
             int64_t ps = sp.ok ? scan_predict(sp, sc.gps[t] - g0[gidx], z)
@@ -921,7 +960,11 @@ std::string cand_name(uint16_t c, const std::vector<uint8_t>& p) {
     case C_RANGE_DELTA: return "delta";
     case C_RANGE_CTX: return "ctx";
     case C_RANGE_CTX2: return "ctx2";
-    case C_GEOM_SCAN: return "走査";
+    case C_GEOM_SCAN: {
+        static char b2[16];
+        snprintf(b2, sizeof b2, "走査v%d", p.empty() ? 1 : p[0]);
+        return b2;
+    }
     case C_GEOM_XYZ:
         if (p.empty() || p[0] == 0) return "幾何v0";
         return p[0] == 1 ? "幾何v1" : (p[0] == 2 ? "幾何v2" : "幾何v3");
@@ -1047,7 +1090,10 @@ std::vector<Stream> plan_streams(const Frame& f, bool joint_geom, std::string* l
                 pv.insert(pv.end(), nm.begin(), nm.end());
             };
             add("gps_time"); add("point_source_id"); add(ret);
-            gc.push_back({C_GEOM_SCAN, pv});
+            for (uint8_t v = 1; v <= 4; ++v) {
+                std::vector<uint8_t> q = pv; q[0] = v;
+                gc.push_back({C_GEOM_SCAN, q});
+            }
         }
         emit(best_stream(f, g, gc, ctx, trp));
     }

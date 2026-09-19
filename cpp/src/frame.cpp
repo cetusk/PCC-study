@@ -233,6 +233,18 @@ bool normalize_frame(Frame& f, const PointCloud& pc, std::string& err, bool resi
     // residual_ops=false: 「他フィールドとの残差」は符号器 C_ATTR_XREF が担当するので
     // 計画からは外し、厳密な構造の操作（定数・完全な複製・整数アフィン）だけ残す。
     Plan plan = analyze(pc, residual_ops);
+    // 走査モデルはこの 3 列を幾何より前に必要とする。落とすと復号の最後まで
+    // 復元されず、候補として提示できなくなる。定数列でも符号長は 0.001 bpp 程度。
+    {
+        static const char* need[] = {"point_source_id", "gps_time", "bit_fields"};
+        std::vector<Op> keep_ops;
+        for (const auto& o : plan.ops) {
+            bool skip = false;
+            for (const char* nm : need) if (o.target == nm) skip = true;
+            if (!skip) keep_ops.push_back(o);
+        }
+        plan.ops.swap(keep_ops);
+    }
     std::vector<std::string> keep;
     std::map<std::string, std::vector<int64_t>> external;
     apply_plan(pc, plan, keep, external);
