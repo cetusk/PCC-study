@@ -93,7 +93,14 @@ fetch() {   # fetch <url> <出力パス> <期待バイト数|0>
   fi
   mkdir -p "$(dirname "$out")"
   echo "  取得中: $(basename "$out")"
-  curl -L --retry 3 --fail -o "$out" "$url" || { echo "  !! 取得失敗: $url" >&2; return 1; }
+  # 出力が端末でないとき（ログへのリダイレクト）は進捗メーターを出さない。
+  # 進捗メーターは復帰文字で同じ行を上書きするので、ログに落とすと
+  # 1 行が 2 万文字を超える塊になり、tail や grep で読めなくなる
+  # （実測: 30 行 22,082 バイトのうち 21,060 バイトが 1 行の進捗メーターだった）。
+  local q=""
+  [ -t 1 ] || q="--no-progress-meter"
+  # shellcheck disable=SC2086
+  curl -L --retry 3 --fail $q -o "$out" "$url" || { echo "  !! 取得失敗: $url" >&2; return 1; }
   if [ "$want" != "0" ]; then
     local have; have=$(stat -c %s "$out")
     if [ "$have" != "$want" ]; then
