@@ -1,13 +1,9 @@
-// ALS の走査モデル — 掃引内の走査角は時刻の 1 次関数である。
-//
-// 測定の裏付けは results/als_scan_structure.md、設計は notes/03_scan_model_codec.md。
-//   * 掃引の点は厚さ 3.6 mm の鉛直面に乗る
-//   * 幅 278 m の掃引を 4 パラメタで 1.4 cm まで再現できる
-//   * 発射番号は gps_time から決まるので、角度 2 自由度は副情報を生まない
+// ALS の走査モデル — 掃引内の走査角を時刻の 1 次関数として当てはめる。
+// 設計は notes/03_scan_model_codec.md。
 //
 // 可逆・決定論のため三角関数は復号側で呼ばない。
 //   * 回転は 3 回のせん断（各段が Z^2 上の全単射）
-//   * 正接は整数 CORDIC で作った固定小数の表（誤差 1200 m 先で 0.051 mm）
+//   * 正接は整数 CORDIC で作った固定小数の表
 #pragma once
 #include <cstdint>
 #include <vector>
@@ -38,6 +34,22 @@ inline void shear_inv(int64_t s, int64_t off, int64_t t2, int64_t sn,
     X = x1 + ((t2 * Y) >> SCAN_SH);
 }
 
+// 直近 3 つの差分の中央値を次の値の予測に使う小さな予測器。
+// 幾何 v1/v2/v3 と走査モデルの退避路が共有する。
+inline int64_t med3(int64_t a, int64_t b, int64_t c) {
+    if (a > b) { int64_t t = a; a = b; b = t; }
+    if (b > c) { int64_t t = b; b = c; c = t; }
+    if (a > b) { int64_t t = a; a = b; b = t; }
+    return b;
+}
+struct MedPred {
+    int64_t prev = 0, d[3] = {0, 0, 0}; int k = 0;
+    inline int64_t predict() const {
+        return prev + (k >= 3 ? med3(d[0], d[1], d[2]) : (k ? d[(k - 1) % 3] : 0));
+    }
+    inline void push(int64_t x) { int64_t dd = x - prev; d[k % 3] = dd; prev = x; ++k; }
+};
+
 // 1 掃引ぶんのモデル。すべて整数で、そのまま副情報に書ける。
 struct SweepParam {
     int64_t t2 = 0, sn = 0;      // 掃引面への回転（せん断定数）
@@ -67,8 +79,21 @@ inline int64_t scan_predict(const SweepParam& p, int64_t shot, int64_t z) {
 //   s = s0 + (Sz - z) tan(th0 + om * shot) を当てはめる。
 //   sa は記録されている走査角（0.006 度単位）。初期値にのみ使う。
 //   当てはめが素朴な差分に勝たなければ ok=0 を返す。
+// 当てはめの様子を外に出すための診断。符号化には使わない。
+// nullptr を渡せば何も起きない（PCC_SCAN_DUMP を付けたときだけ使う）。
+inline constexpr int FIT_ITERS = 12;
+struct FitDiag {
+    double span_deg = 0;                 // 走査角の幅
+    double thin_mm = 0;                  // 鉛直面への当てはまりの薄さ
+    double height_m = 0;                 // 推定した飛行高度（点の平均 z からの差）
+    double omega_deg_s = 0;              // 角速度
+    double iter_bits[FIT_ITERS] = {0};   // 反復ごとの面内残差のビット長／点
+    double mdl_bits = 0, alt_bits = 0;   // 最終的なモデル／退避路の費用（／点）
+};
+
 SweepParam fit_scan_line(const int64_t* X, const int64_t* Y, const int64_t* Z,
-                         const int64_t* gps, const int64_t* sa, size_t n);
+                         const int64_t* gps, const int64_t* sa, size_t n,
+                         FitDiag* diag = nullptr);
 
 // 1 掃引に 2 台のスキャナの走査線が混ざっているとき、EM で 2 群に分ける。
 // 戻り値は 0/1 のラベル。分けても薄くならなければ全部 0 を返す。

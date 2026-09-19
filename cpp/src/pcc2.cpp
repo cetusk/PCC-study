@@ -7,6 +7,7 @@
 #include <map>
 #include <cstdio>
 #include <cstring>
+#include <cstdlib>
 
 namespace pcc {
 
@@ -95,17 +96,7 @@ static void enc_cols(const std::vector<const std::vector<int64_t>*>& cols, int m
 // 幾何 v1: LASzip と同じ考え方で、直近 3 つの差分の中央値を次の差分の予測に使う。
 // 走査線に沿った逐次予測であり、取得順が最も得意な入力になる。
 // 文脈は直前の残差のビット数（大きさごとに別の確率モデルを持つ）。
-static inline int64_t med3(int64_t a, int64_t b, int64_t c) {
-    if (a > b) std::swap(a, b);
-    if (b > c) std::swap(b, c);
-    if (a > b) std::swap(a, b);
-    return b;
-}
-struct MedPred {
-    int64_t prev = 0, d[3] = {0, 0, 0}; int k = 0;
-    inline int64_t predict() const { return prev + (k >= 3 ? med3(d[0], d[1], d[2]) : (k ? d[(k - 1) % 3] : 0)); }
-    inline void push(int64_t x) { int64_t dd = x - prev; d[k % 3] = dd; prev = x; ++k; }
-};
+// med3 / MedPred は scanmodel.hpp にある（走査モデルの退避路と共有）。
 
 static void enc_geom_med(const std::vector<const std::vector<int64_t>*>& cols,
                          std::vector<uint8_t>& out) {
@@ -420,6 +411,18 @@ static bool enc_geom_scan(const std::vector<const std::vector<int64_t>*>& cols,
 
     std::vector<int64_t> bx, by, bz, bg, bs;
     const auto* sa_col = ctx->fr->get("scan_angle");
+    // PCC_SCAN_DUMP=<path> を付けたときだけ、走査線ごとの当てはめの様子を書き出す。
+    // 符号化の結果には影響しない。
+    FILE* dump = nullptr; FILE* dump_raw = nullptr;
+    if (const char* dp = getenv("PCC_SCAN_DUMP")) {
+        dump = fopen(dp, "w");
+        if (dump) fprintf(dump, "id\tn\tspan_deg\tthin_mm\theight_m\tomega_deg_s"
+                                "\tmdl_bits\talt_bits\tok"
+                                "\ti0\ti1\ti2\ti3\ti4\ti5\ti6\ti7\ti8\ti9\ti10\ti11\n");
+        std::string rp = std::string(dp) + ".raw";
+        dump_raw = fopen(rp.c_str(), "w");
+        if (dump_raw) fprintf(dump_raw, "# s\tz\tshot_ulp\tscan_angle\n");
+    }
     for (size_t k = 0; k < nsw; ++k) {
         int32_t a = sc.swp[k], b = sc.swp[k + 1];
         size_t m = (size_t)(b - a);
@@ -434,7 +437,19 @@ static bool enc_geom_scan(const std::vector<const std::vector<int64_t>*>& cols,
                 bs.push_back(sa_col && sa_col->size() >= n ? (*sa_col)[i] : 0);
             }
         };
-        if (m >= 40) {
+        // 2 台のスキャナが混ざるのは走査幅を広く含む掃引だけ。狭い掃引を分割すると
+        // 走査線の角度幅が足りず、高度と角速度が縮退して当てはまらない。
+        bool wide = true;
+        if (sa_col && sa_col->size() >= n && m > 0) {
+            int64_t lo = (*sa_col)[sc.ord[a]], hi = lo;
+            for (int32_t t = a; t < b; ++t) {
+                int64_t v = (*sa_col)[sc.ord[t]];
+                if (v < lo) lo = v;
+                if (v > hi) hi = v;
+            }
+            wide = ((double)(hi - lo) * 0.006) >= 20.0;   // scan_angle は 0.006 度単位
+        }
+        if (m >= 40 && wide) {
             gather(0, false);
             double r0 = line_thinness(bx.data(), by.data(), m);
             std::vector<uint8_t> lab;
@@ -456,11 +471,36 @@ static bool enc_geom_scan(const std::vector<const std::vector<int64_t>*>& cols,
         int nl = L.split[k] ? 2 : 1;
         for (int g = 0; g < nl; ++g) {
             gather((uint8_t)g, L.split[k] != 0);
+            FitDiag fd;
             SweepParam sp = bx.empty() ? SweepParam()
-                : fit_scan_line(bx.data(), by.data(), bz.data(), bg.data(), bs.data(), bx.size());
+                : fit_scan_line(bx.data(), by.data(), bz.data(), bg.data(), bs.data(),
+                                bx.size(), dump ? &fd : nullptr);
+            if (dump && !bx.empty()) {
+                size_t id = L.line.size();
+                fprintf(dump, "%zu\t%zu\t%.3f\t%.4f\t%.1f\t%.1f\t%.4f\t%.4f\t%d",
+                        id, bx.size(), fd.span_deg, fd.thin_mm, fd.height_m,
+                        fd.omega_deg_s, fd.mdl_bits, fd.alt_bits, (int)sp.ok);
+                for (int it = 0; it < FIT_ITERS; ++it) fprintf(dump, "\t%.4f", fd.iter_bits[it]);
+                fprintf(dump, "\n");
+                // 50 本に 1 本は生データも出す。Python 側で同じ走査線に
+                // scipy の当てはめを掛け、C++ の結果と直接比べるために使う。
+                if (dump_raw && (id % 50) == 0) {
+                    fprintf(dump_raw, "# line %zu n %zu\n", id, bx.size());
+                    int64_t s_i, off_i;
+                    for (size_t i = 0; i < bx.size(); ++i) {
+                        shear_fwd(bx[i], by[i], sp.t2, sp.sn, s_i, off_i);
+                        fprintf(dump_raw, "%lld\t%lld\t%lld\t%lld\n",
+                                (long long)s_i, (long long)bz[i],
+                                (long long)(bg[i] - bg[0]), (long long)bs[i]);
+                    }
+                }
+            }
             L.line.push_back(sp);
         }
     }
+
+    if (dump) { fclose(dump); dump = nullptr; }
+    if (dump_raw) { fclose(dump_raw); dump_raw = nullptr; }
 
     std::vector<std::vector<int64_t>> res(3, std::vector<int64_t>(n, 0));
     // z は「同じ掃引・同じ戻り番号の直前の点」から予測する。
@@ -470,22 +510,29 @@ static bool enc_geom_scan(const std::vector<const std::vector<int64_t>*>& cols,
         int32_t a = sc.swp[k], b = sc.swp[k + 1];
         int64_t lz[16]; bool hz[16];
         for (int i = 0; i < 16; ++i) { lz[i] = 0; hz[i] = false; }
-        int64_t g0[2] = {0, 0}, ls[2] = {0, 0}, lo[2] = {0, 0};
+        int64_t g0[2] = {0, 0};
         bool hg[2] = {false, false};
+        // 面外と、モデルを採らない走査線の面内は中央値予測（幾何v1 と同じ）。
+        // 走査線の先頭は副情報の s0 / off0 から始める。
+        MedPred mps[2], mpo[2];
         for (int32_t t = a; t < b; ++t) {
             int li = line_index(L, k, (size_t)t);
             const SweepParam& sp = L.line[li];
             int gidx = (L.split[k] && L.label[t]) ? 1 : 0;
-            if (!hg[gidx]) { g0[gidx] = sc.gps[t]; hg[gidx] = true; }
+            if (!hg[gidx]) {
+                g0[gidx] = sc.gps[t]; hg[gidx] = true;
+                mps[gidx] = MedPred(); mps[gidx].prev = sp.s0;
+                mpo[gidx] = MedPred(); mpo[gidx].prev = sp.off0;
+            }
             int32_t i = sc.ord[t];
             int64_t s, off;
             shear_fwd(CX[i], CY[i], sp.t2, sp.sn, s, off);
-            int64_t ps, po;
-            if (sp.ok) { ps = scan_predict(sp, sc.gps[t] - g0[gidx], CZ[i]); po = sp.off0; }
-            else       { ps = ls[gidx]; po = lo[gidx]; }
+            int64_t po = mpo[gidx].predict();
+            int64_t ps = sp.ok ? scan_predict(sp, sc.gps[t] - g0[gidx], CZ[i])
+                               : mps[gidx].predict();
             res[0][t] = s - ps;
             res[1][t] = off - po;
-            ls[gidx] = s; lo[gidx] = off;
+            mps[gidx].push(s); mpo[gidx].push(off);
             int r = (int)sc.ret[t] & 15;
             int64_t pz = hz[r] ? lz[r] : last_any;
             res[2][t] = CZ[i] - pz;
@@ -527,6 +574,46 @@ static bool enc_geom_scan(const std::vector<const std::vector<int64_t>*>& cols,
     }
     std::vector<uint8_t> br;
     enc_resid(res, br);
+
+    // PCC_SCAN_DEBUG=1 で内訳を出す。走査モデルが効く規模と効かない規模を
+    // 切り分けるための診断で、符号化の結果には影響しない。
+    if (getenv("PCC_SCAN_DEBUG")) {
+        size_t n_ok = 0, n_split = 0;
+        for (size_t k = 0; k < nsw; ++k) n_split += L.split[k];
+        for (const auto& ln : L.line) n_ok += ln.ok ? (size_t)ln.count : 0;
+        // 採用した走査線と退避した走査線で、残差の大きさがどう違うか。
+        // 符号長そのものは 1 本のレンジ符号にまとめているので分けられない。
+        // zigzag のビット長の平均を代理として使う（1 点 3 軸ぶんの合計）。
+        double sok[3] = {0, 0, 0}, sng[3] = {0, 0, 0};
+        size_t c_ok = 0, c_ng = 0;
+        for (size_t k2 = 0; k2 < nsw; ++k2)
+            for (int32_t t = sc.swp[k2]; t < sc.swp[k2 + 1]; ++t) {
+                bool okl = L.line[line_index(L, k2, (size_t)t)].ok != 0;
+                for (int c = 0; c < 3; ++c)
+                    (okl ? sok : sng)[c] += bitlen(zigzag(res[c][t]));
+                if (okl) ++c_ok; else ++c_ng;
+            }
+        fprintf(stderr,
+            "       残差のビット長（成分別）\n"
+            "         採用した線 (%zu 点): 面内 %.2f  面外 %.2f  z %.2f  計 %.2f\n"
+            "         退避した線 (%zu 点): 面内 %.2f  面外 %.2f  z %.2f  計 %.2f\n",
+            c_ok, c_ok ? sok[0]/c_ok : 0.0, c_ok ? sok[1]/c_ok : 0.0,
+            c_ok ? sok[2]/c_ok : 0.0, c_ok ? (sok[0]+sok[1]+sok[2])/c_ok : 0.0,
+            c_ng, c_ng ? sng[0]/c_ng : 0.0, c_ng ? sng[1]/c_ng : 0.0,
+            c_ng ? sng[2]/c_ng : 0.0, c_ng ? (sng[0]+sng[1]+sng[2])/c_ng : 0.0);
+        double bpp = 8.0 / (double)n;
+        fprintf(stderr,
+            "[走査] 点 %zu / 掃引 %zu / 走査線 %zu / 分割 %zu\n"
+            "       走査線あたり %.0f 点  モデル採用 %.3f\n"
+            "       副情報 %.4f bpp（フラグ %.4f + パラメタ %.4f）\n"
+            "       標識 %.4f bpp  残差 %.4f bpp  合計 %.4f bpp\n",
+            n, nsw, nl, n_split,
+            (double)n / (double)std::max<size_t>(nl, 1),
+            (double)n_ok / (double)n,
+            (bf.size() + bp.size()) * bpp, bf.size() * bpp, bp.size() * bpp,
+            bl.size() * bpp, br.size() * bpp,
+            (bf.size() + bp.size() + bl.size() + br.size() + 56) * bpp);
+    }
 
     out.clear();
     put_u64(out, (uint64_t)nsw);
@@ -604,22 +691,27 @@ static bool dec_geom_scan(const std::vector<uint8_t>& param, const uint8_t* data
         int32_t a = sc.swp[k], b = sc.swp[k + 1];
         int64_t lz[16]; bool hz[16];
         for (int i = 0; i < 16; ++i) { lz[i] = 0; hz[i] = false; }
-        int64_t g0[2] = {0, 0}, ls[2] = {0, 0}, lo[2] = {0, 0};
+        int64_t g0[2] = {0, 0};
         bool hg[2] = {false, false};
+        MedPred mps[2], mpo[2];
         for (int32_t t = a; t < b; ++t) {
             int li = line_index(L, k, (size_t)t);
             const SweepParam& sp = L.line[li];
             int gidx = (L.split[k] && L.label[t]) ? 1 : 0;
-            if (!hg[gidx]) { g0[gidx] = sc.gps[t]; hg[gidx] = true; }
+            if (!hg[gidx]) {
+                g0[gidx] = sc.gps[t]; hg[gidx] = true;
+                mps[gidx] = MedPred(); mps[gidx].prev = sp.s0;
+                mpo[gidx] = MedPred(); mpo[gidx].prev = sp.off0;
+            }
             int r = (int)sc.ret[t] & 15;
             int64_t pz = hz[r] ? lz[r] : last_any;
             int64_t z = pz + res[2][t];
             lz[r] = z; hz[r] = true; last_any = z;
-            int64_t ps, po;
-            if (sp.ok) { ps = scan_predict(sp, sc.gps[t] - g0[gidx], z); po = sp.off0; }
-            else       { ps = ls[gidx]; po = lo[gidx]; }
+            int64_t po = mpo[gidx].predict();
+            int64_t ps = sp.ok ? scan_predict(sp, sc.gps[t] - g0[gidx], z)
+                               : mps[gidx].predict();
             int64_t s = res[0][t] + ps, off = res[1][t] + po;
-            ls[gidx] = s; lo[gidx] = off;
+            mps[gidx].push(s); mpo[gidx].push(off);
             int64_t X, Y;
             shear_inv(s, off, sp.t2, sp.sn, X, Y);
             int32_t i = sc.ord[t];
@@ -794,8 +886,7 @@ bool codec_decode(uint16_t id, const std::vector<uint8_t>& param,
 
 // ---------------------------------------------------------------- 候補を実測して選ぶ
 
-// 参照相手の絞り込み。全点で全対を測ると O(列^2 * 点数) になるので標本で選び、
-// 選ばれた候補だけを全点で符号化して比べる（判断は実測が下す）。
+// 参照相手の絞り込み。全対を全点で測ると O(列^2 * 点数) になるので標本で選ぶ。
 static double entropy_diff_sample(const std::vector<int64_t>& a,
                                   const std::vector<int64_t>& b, size_t cap) {
     size_t n = std::min({a.size(), b.size(), cap});
@@ -867,8 +958,7 @@ std::vector<Stream> plan_streams(const Frame& f, bool joint_geom, std::string* l
     std::vector<Stream> out;
     std::vector<Cand> cand{{C_RAW64, {}}, {C_RANGE, {}}, {C_RANGE_DELTA, {}},
                            {C_RANGE_CTX, {}}, {C_RANGE_CTX2, {}}};
-    // 幾何が揃っていれば、空間予測の候補（予測子 1 / 3 / 5 個）も加える。
-    // どれを採るかは実測が決める（条件 (4.4) が 3 群に分けることを確認済み）。
+    // 幾何が揃っていれば、空間予測の候補（予測子 1 / 3 / 5 個）も加える
     std::vector<Cand> cand_attr = cand;
     if (ctx && ctx->world)
         for (uint8_t P : {1, 3, 5}) cand_attr.push_back({C_ATTR_SPATIAL, {P}});
@@ -893,7 +983,8 @@ std::vector<Stream> plan_streams(const Frame& f, bool joint_geom, std::string* l
     // これらの列自身は空間予測を候補に持てない（座標がまだ無い）。
     std::vector<std::string> pre;
     if (joint_geom)
-        for (const char* nm : {"point_source_id", "gps_time", "bit_fields", "classification"}) {
+        // 走査モデルが必要とする 3 列に限る（前に置いた列は空間予測を使えなくなる）
+        for (const char* nm : {"point_source_id", "gps_time", "bit_fields"}) {
             const ColSpec* sp = f.spec(nm);
             if (sp && sp->storage == Storage::Raw && f.get(nm)) pre.push_back(nm);
         }

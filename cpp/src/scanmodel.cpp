@@ -65,6 +65,7 @@ int64_t tan_fx(int64_t theta_fx) {
 
 #include <cmath>
 #include <algorithm>
+#include "pcc/rangecoder.hpp"
 
 namespace pcc {
 
@@ -135,7 +136,8 @@ void split_two_lines(const int64_t* X, const int64_t* Y, size_t n,
 }
 
 SweepParam fit_scan_line(const int64_t* X, const int64_t* Y, const int64_t* Z,
-                         const int64_t* gps, const int64_t* sa, size_t n) {
+                         const int64_t* gps, const int64_t* sa, size_t n,
+                         FitDiag* diag) {
     SweepParam p;
     p.count = (int64_t)n;
     if (n < 8) return p;
@@ -152,10 +154,8 @@ SweepParam fit_scan_line(const int64_t* X, const int64_t* Y, const int64_t* Z,
     std::nth_element(tmp.begin(), tmp.begin() + n / 2, tmp.end());
     p.off0 = tmp[n / 2];
 
-    // 素朴な差分（退避）の散らばり
-    double m1 = 0, m2 = 0;
-    for (size_t i = 1; i < n; ++i) { double d = (double)(s[i] - s[i - 1]); m1 += d; m2 += d * d; }
-    double alt_sd = std::sqrt(std::max(0.0, m2 / (n - 1) - (m1 / (n - 1)) * (m1 / (n - 1))));
+    // 費用は zigzag のビット長で測る（符号長を決めるのは散らばりではなく裾の重さ）
+    auto blen = [](int64_t v) { uint64_t z = zigzag(v); int k = 0; while (z) { ++k; z >>= 1; } return k; };
 
     // 初期値: 記録角から th0, om を線形に、Sz は広がりの比から
     std::vector<double> shot(n), zz(n), sf(n), ang(n);
@@ -185,7 +185,11 @@ SweepParam fit_scan_line(const int64_t* X, const int64_t* Y, const int64_t* Z,
     s0 /= n;
 
     // 交互最適化: (s0, Sz) は線形、(th0, om) はガウス・ニュートン
-    for (int it = 0; it < 12; ++it) {
+    auto blen_d = [](double r) {
+        int64_t v = (int64_t)llround(r);
+        uint64_t z = zigzag(v); int k = 0; while (z) { ++k; z >>= 1; } return (double)k;
+    };
+    for (int it = 0; it < FIT_ITERS; ++it) {
         double A00 = 0, A01 = 0, A11 = 0, b0 = 0, b1 = 0;
         for (size_t i = 0; i < n; ++i) {
             double T = std::tan(th0 + om * shot[i]);
@@ -214,9 +218,15 @@ SweepParam fit_scan_line(const int64_t* X, const int64_t* Y, const int64_t* Z,
             double dth = (g0 * B11 - g1 * B01) / e;
             double dom = (B00 * g1 - B01 * g0) / e;
             if (std::isfinite(dth) && std::isfinite(dom)) {
-                double nt = th0 - dth, no = om - dom;
+                double nt = th0 + dth, no = om + dom;
                 if (std::fabs(nt) < M_PI / 4 - 1e-6) { th0 = nt; om = no; }
             }
+        }
+        if (diag) {
+            double bb = 0;
+            for (size_t i = 0; i < n; ++i)
+                bb += blen_d(sf[i] - (s0 + (Sz - zz[i]) * std::tan(th0 + om * shot[i])));
+            diag->iter_bits[it] = bb / n;
         }
     }
 
@@ -229,14 +239,29 @@ SweepParam fit_scan_line(const int64_t* X, const int64_t* Y, const int64_t* Z,
     if (p.th0 > SCAN_ANG_MAX - 1) p.th0 = SCAN_ANG_MAX - 1;
     if (p.th0 < -SCAN_ANG_MAX) p.th0 = -SCAN_ANG_MAX;
 
-    // 整数の経路で残差を作り、素朴な差分に勝つかを見る
-    double q1 = 0, q2 = 0;
+    // 整数の経路で残差を作り、退避路に勝つかを見る。
+    // 退避路は符号化器が実際に使うもの（s0 から始める中央値予測）と同一にする。
+    // ここが実態とずれると、また実態に合わない代理指標で選ぶことになる。
+    // 面外の符号化は採用・退避で変えないので、比べるのは面内だけでよい。
+    double mdl_bits = 0, alt_bits = 0;
+    MedPred mp;
+    mp.prev = p.s0;
     for (size_t i = 0; i < n; ++i) {
-        int64_t r = s[i] - scan_predict(p, gps[i] - gps[0], Z[i]);
-        q1 += (double)r; q2 += (double)r * (double)r;
+        mdl_bits += blen(s[i] - scan_predict(p, gps[i] - gps[0], Z[i]));
+        alt_bits += blen(s[i] - mp.predict());
+        mp.push(s[i]);
     }
-    double sd = std::sqrt(std::max(0.0, q2 / n - (q1 / n) * (q1 / n)));
-    p.ok = (sd < alt_sd) ? 1 : 0;
+    p.ok = (mdl_bits < alt_bits) ? 1 : 0;
+    if (diag) {
+        diag->span_deg = (double)(*std::max_element(sa, sa + n)
+                                - *std::min_element(sa, sa + n)) * 0.006;
+        diag->thin_mm = line_thinness(X, Y, n);
+        diag->height_m = ((double)p.Sz - zmean) * 0.001;
+        // 角度単位は [-45,45] 度 ↔ [-2^31,2^31]、時間単位は gps の ulp（59.6046 ns）
+        diag->omega_deg_s = (double)p.om * (45.0 / 2147483648.0) / 59.6046e-9;
+        diag->mdl_bits = mdl_bits / n;
+        diag->alt_bits = alt_bits / n;
+    }
     return p;
 }
 
