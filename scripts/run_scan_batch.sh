@@ -20,13 +20,13 @@ mkdir -p "$OUT"
 [ -x "$BIN" ] || { echo "$BIN が無い。cpp をビルドすること" >&2; exit 1; }
 
 # 名前|入力|追加引数
+# red-rocks と simple1_4 は外してある。psid が定数なうえ gps_time も単一値で、
+# 走査順そのものが作れないため走査モデルを試せない。
 JOBS=(
   "small_autzen_trim|data/raw/small/autzen_trim.laz|"
   "small_plane|data/raw/small/plane.laz|"
   "small_fullwave|data/raw/small/fullwave.laz|"
-  "small_simple1_4|data/raw/small/simple1_4.las|"
   "small_vegetation|data/raw/small/vegetation_1_3.las|"
-  "red_rocks|data/raw/extrabytes/entwine_data_red-rocks.laz|"
   "workshop_TerraScan|data/raw/extrabytes/workshop_TM_551_101.laz|"
   "autzen2023_LasMonkey|data/raw/extrabytes/autzen_2023_autzen-2023.copc.laz|"
   "ahn5_31HZ1_20|data/raw/ahn5/31HZ1_20.LAZ|"
