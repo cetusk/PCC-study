@@ -3,8 +3,7 @@
 実運用データ（航空 LiDAR / 車載 LiDAR / 地上型スキャナ）を対象に、
 「どこにビットが使われているか」を実測し、そこから符号化技術を設計・実装する作業場。
 
-**すべての数字は実測である。** 符号化は毎回その場で復号して全列の一致を確認し、
-同じ入力を 2 回符号化してバイト一致（決定性）も確認する。通らなければ数字を出さない。
+符号化は毎回その場で復号して全列の一致を確認し、同じ入力を 2 回符号化してバイト一致（決定性）も確認済。
 
 ---
 
@@ -186,7 +185,4 @@ data/       サンプルデータ（git 管理外。setup.sh が取得する）
 
 ## ライセンス
 
-[Apache License 2.0](LICENSE)。出典の保持に加えて特許ライセンスの付与と
-防御条項を持つため、圧縮コーデックの配布に向く。
-同梱・参照している第三者のコードとデータの出典は [NOTICE](NOTICE) にまとめてある。
-`cpp/include/pcc/nanoflann.hpp` は [nanoflann](https://github.com/jlblancoc/nanoflann)（BSD-2-Clause）。
+[Apache License 2.0](LICENSE)。同梱・参照している第三者のコードとデータの出典は [NOTICE](NOTICE) にまとめてある。`cpp/include/pcc/nanoflann.hpp` は [nanoflann](https://github.com/jlblancoc/nanoflann)（BSD-2-Clause）。
