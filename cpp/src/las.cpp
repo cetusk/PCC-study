@@ -48,9 +48,8 @@ static void write_raw(uint8_t* p, FType t, int64_t v) {
 
 // LAS の ExtraBytes の data_type からバイト数を出す。
 // 0 は「未定義（options の size 指定）」、11-30 は 2要素/3要素の配列型（非推奨）。
-// 扱えない型でも**サイズだけは正しく進めなければならない**。
-// 進めないと後続フィールドの読み出し位置が全部ずれる（実測: extrabytes.las で
-// Time が blue と一致すると誤検出した）。
+// 扱えない型でもサイズだけは正しく進めなければならない。
+// 進めないと後続フィールドの読み出し位置が全部ずれる。
 static int eb_type_size(uint8_t dt) {
     static const int base[11] = {0, 1, 1, 2, 2, 4, 4, 8, 8, 4, 8};
     if (dt <= 10) return base[dt];

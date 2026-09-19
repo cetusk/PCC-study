@@ -86,7 +86,7 @@ private:
 // ビット位置ごとに別モデルを持ち、文脈ごとにモデル一式を分ける。
 // max_k は 64 でなければならない。int64 の zigzag は最大 64 bit になるので、
 // 32 のままだと pm[k] が配列外に出て BitModel が壊れ、p0=0 → bound=0 → range=0
-// となって renormalize の while が永久に抜けなくなる（実測: 35 分以上スピン）。
+// となって renormalize の while が永久に抜けなくなる。
 class UIntCoder {
 public:
     explicit UIntCoder(int n_ctx = 1, int max_k = 64)
