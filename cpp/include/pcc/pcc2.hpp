@@ -19,6 +19,7 @@ inline constexpr uint16_t C_RANGE       = 1;   // zigzag + レンジ符号
 inline constexpr uint16_t C_RANGE_DELTA = 2;   // 1 次差分 + レンジ符号
 inline constexpr uint16_t C_RANGE_CTX   = 3;   // 1 次差分 + 直前値のビット数を文脈に
 inline constexpr uint16_t C_RANGE_CTX2  = 4;   // 2 次差分＋文脈（一定刻みの列に効く）
+inline constexpr uint16_t C_RANGE_MED   = 5;   // 直近 3 差分の中央値を予測子に＋文脈
 inline constexpr uint16_t C_GEOM_XYZ    = 10;
 inline constexpr uint16_t C_GEOM_SCAN   = 11;  // ALS の走査モデル経由（scanmodel.hpp）  // 幾何 3 軸を同時に
 inline constexpr uint16_t C_ATTR_SPATIAL= 20;  // 幾何由来の順序で先行する近傍 P 個から予測

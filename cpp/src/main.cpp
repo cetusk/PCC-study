@@ -98,14 +98,15 @@ int main(int argc, char** argv) {
         // 基準 ℓ_C(P): 同じ点を一度書き直した LAZ。元の配布ファイルとは比べない
         // （切り出して測るときに点数が違ってしまうため）。
         uint64_t base_bytes = 0;
+        std::string basep;              // 基準に書いた LAZ。退避に使うので消さずに残す
         PointCloud pc;
         if (is_las) {
             if (!read_las(path, pc, err, mp)) { fprintf(stderr, "読み込み失敗: %s\n", err.c_str()); return 1; }
             std::string bp = outp + ".base.laz";
             std::vector<std::string> all;
             for (const auto& nm : pc.order) all.push_back(nm);
-            if (write_las(bp, pc, all, err)) base_bytes = fsize(bp);
-            remove(bp.c_str());
+            if (write_las(bp, pc, all, err)) { base_bytes = fsize(bp); basep = bp; }
+            else remove(bp.c_str());
             if (!frame_from_las(pc, f, err)) { fprintf(stderr, "%s\n", err.c_str()); return 1; }
         } else {
             if (!load_frame(path, f, err, mp)) { fprintf(stderr, "読み込み失敗: %s\n", err.c_str()); return 1; }
@@ -150,12 +151,51 @@ int main(int argc, char** argv) {
         }
         uint64_t bytes = 0;
         if (!write_pcc2(outp, f, st, bytes, err)) { fprintf(stderr, "書き込み失敗: %s\n", err.c_str()); return 1; }
+
+        // 自前の符号器が元の器に負けることがある。両方書いて短い方を残し、
+        // どちらを使ったかを容器に書いておく。符号器そのものは独立のままで、
+        // 「決して悪化しない」という運用上の保証だけを取り戻す。
+        Frame fe;
+        bool used_embed = false;
+        if (!basep.empty() && base_bytes) {
+            std::vector<uint8_t> lz(base_bytes);
+            FILE* lf = fopen(basep.c_str(), "rb");
+            bool got = lf && fread(lz.data(), 1, base_bytes, lf) == base_bytes;
+            if (lf) fclose(lf);
+            if (got) {
+                fe.n = f.n; fe.source_kind = f.source_kind;
+                fe.embed_kind = "laz"; fe.embed = std::move(lz);
+                std::string ep = outp + ".embed";
+                uint64_t be = 0;
+                if (write_pcc2(ep, fe, {}, be, err) && be < bytes) {
+                    remove(outp.c_str());
+                    if (rename(ep.c_str(), outp.c_str()) == 0) { bytes = be; used_embed = true; }
+                } else {
+                    remove(ep.c_str());
+                }
+            }
+        }
+        if (!basep.empty()) remove(basep.c_str());
         double t_enc = now() - t1;
 
         double t2 = now();
         Frame g;
         if (!read_pcc2(outp, g, err)) { fprintf(stderr, "復号失敗: %s\n", err.c_str()); return 1; }
-        if (!denormalize_frame(g, err)) { fprintf(stderr, "復元失敗: %s\n", err.c_str()); return 1; }
+        if (!g.embed.empty()) {
+            // 包んであるのは元の器そのもの。書き出して読み直せば列が揃う。
+            std::string tp = outp + ".tmp.laz";
+            FILE* tf = fopen(tp.c_str(), "wb");
+            if (!tf) { fprintf(stderr, "復号失敗: 一時ファイルを作れない\n"); return 1; }
+            fwrite(g.embed.data(), 1, g.embed.size(), tf);
+            fclose(tf);
+            Frame ge;
+            bool okr = load_frame(tp, ge, err, 0);
+            remove(tp.c_str());
+            if (!okr) { fprintf(stderr, "復号失敗: %s\n", err.c_str()); return 1; }
+            g = std::move(ge);
+        } else if (!denormalize_frame(g, err)) {
+            fprintf(stderr, "復元失敗: %s\n", err.c_str()); return 1;
+        }
         double t_dec = now() - t2;
 
         // 検証は元ファイルを読み直して全列を突き合わせる。
@@ -167,7 +207,9 @@ int main(int argc, char** argv) {
         orig = Frame();
 
         std::string p2 = outp + ".det";
-        uint64_t b2 = 0; bool det = write_pcc2(p2, f, st, b2, err) && b2 == bytes;
+        uint64_t b2 = 0;
+        bool det = (used_embed ? write_pcc2(p2, fe, {}, b2, err)
+                               : write_pcc2(p2, f, st, b2, err)) && b2 == bytes;
         if (det) {
             FILE* a = fopen(outp.c_str(), "rb"); FILE* b = fopen(p2.c_str(), "rb");
             std::vector<uint8_t> ba(bytes), bb(bytes);
@@ -192,6 +234,8 @@ int main(int argc, char** argv) {
         printf("PCC2        %10.1f MB  %8.3f bpp", bytes / 1e6, ml);
         if (base_bytes) printf("   %+.1f%%", 100.0 * (ml / bl - 1.0));
         printf("\n");
+        printf("中身        %s\n", used_embed ? "元の器を包んだ（自前の符号器より短かった）"
+                                              : "自前の符号器");
         printf("検証        全列一致 = %s%s\n", ok ? "true" : "false",
                ok ? "" : ("  差異: " + diff).c_str());
         printf("5 軸        enc %.2fs / dec %.2fs / 読込 %.2fs / ピーク %.2f GB / 決定性 %s\n",

@@ -341,6 +341,7 @@ struct ScanCtx {
     std::vector<int32_t> ord;        // 走査順 → 格納順
     std::vector<int64_t> gps, ret;   // 走査順に並べた値
     std::vector<int32_t> swp;        // 掃引の先頭位置（末尾に n）
+    int64_t gap_thr = 200;           // 掃引を切る時刻の隙間（データから測る）
 };
 
 static bool scan_names(const std::vector<uint8_t>& p, std::string& g,
@@ -379,17 +380,58 @@ static bool build_scan_ctx(const CodecCtx* ctx, const std::vector<uint8_t>& para
         sc.gps[t] = (*g)[sc.ord[t]];
         if (r && r->size() >= n) sc.ret[t] = (*r)[sc.ord[t]] & 0x0F;
     }
+    // 掃引の切れ目は時刻の隙間で決める。しきい値は発射間隔の中央値の 20 倍とし、
+    // データから測る。gps_time の刻みは記録の仕方で桁が変わる（AHN4 は ulp 単位の
+    // 10 刻み、AHN3 は GPS 週秒で約 43000 ulp）ので、定数では片方が必ず壊れる。
+    // 復号器も同じ gps_time から同じ値を得るため、副情報は要らない。
+    {
+        std::vector<int64_t> gap;
+        size_t stride = n > (1u << 21) ? n / (1u << 21) : 1;
+        for (size_t t = 1; t < n; t += stride) {
+            if ((*s)[sc.ord[t - 1]] != (*s)[sc.ord[t]]) continue;
+            int64_t d = sc.gps[t] - sc.gps[t - 1];
+            if (d > 0) gap.push_back(d);
+        }
+        int64_t med = 10;
+        if (!gap.empty()) {
+            size_t h = gap.size() / 2;
+            std::nth_element(gap.begin(), gap.begin() + h, gap.end());
+            med = gap[h];
+        }
+        sc.gap_thr = med > 0 ? med * 20 : 200;
+    }
     sc.swp.clear();
     for (size_t t = 0; t < n; ++t) {
         bool brk = (t == 0);
         if (!brk) {
             int32_t a = sc.ord[t - 1], b = sc.ord[t];
-            brk = ((*s)[a] != (*s)[b]) || (sc.gps[t] - sc.gps[t - 1] > 200);
+            brk = ((*s)[a] != (*s)[b]) || (sc.gps[t] - sc.gps[t - 1] > sc.gap_thr);
         }
         if (brk) sc.swp.push_back((int32_t)t);
     }
     sc.swp.push_back((int32_t)n);
     return true;
+}
+
+// 走査線 1 本を符号化したときの面内・面外の費用［bit］。
+// 分割するかどうかを推定ではなく実測で決めるために使う。
+// 予測の手順は下の符号化ループと同じで、z は分割の影響を受けないので数えない。
+static double line_cost(const SweepParam& sp, const std::vector<int64_t>& bx,
+                        const std::vector<int64_t>& by, const std::vector<int64_t>& bz,
+                        const std::vector<int64_t>& bg) {
+    size_t m = bx.size();
+    if (!m) return 0.0;
+    MedPred mps, mpo;
+    mps.prev = sp.s0; mpo.prev = sp.off0;
+    double bits = 0;
+    for (size_t i = 0; i < m; ++i) {
+        int64_t s, off;
+        shear_fwd(bx[i], by[i], sp.t2, sp.sn, s, off);
+        int64_t ps = sp.ok ? scan_predict(sp, bg[i] - bg[0], bz[i]) : mps.predict();
+        bits += bitlen(zigzag(s - ps)) + bitlen(zigzag(off - mpo.predict()));
+        mps.push(s); mpo.push(off);
+    }
+    return bits;
 }
 
 // 掃引ごとに 1 本か 2 本の走査線を割り当てた結果
@@ -473,53 +515,54 @@ static bool enc_geom_scan(const std::vector<const std::vector<int64_t>*>& cols,
                 bs.push_back(sa_col && sa_col->size() >= n ? (*sa_col)[i] : 0);
             }
         };
-        // 2 台のスキャナが混ざるのは走査幅を広く含む掃引だけ。狭い掃引を分割すると
-        // 走査線の角度幅が足りず、高度と角速度が縮退して当てはまらない。
-        bool wide = true;
-        if (sa_col && sa_col->size() >= n && m > 0) {
-            int64_t lo = (*sa_col)[sc.ord[a]], hi = lo;
-            for (int32_t t = a; t < b; ++t) {
-                int64_t v = (*sa_col)[sc.ord[t]];
-                if (v < lo) lo = v;
-                if (v > hi) hi = v;
-            }
-            wide = ((double)(hi - lo) * 0.006) >= 20.0;   // scan_angle は 0.006 度単位
-        }
         double sp_r0 = 0, sp_w = 0;
-        int sp_code = 0;                 // 0 試みず / 1 EM が偏った / 2 判定で棄却 / 3 分割した
-        if (m >= 40 && wide) {
-            gather(0, false);
-            double r0 = line_thinness(bx.data(), by.data(), m);
-            sp_r0 = r0;
+        int sp_code = 0;                 // 0 試みず / 1 EM が偏った / 2 費用で棄却 / 3 分割した
+        FitDiag fd1;
+        SweepParam one;
+        gather(0, false);
+        if (!bx.empty()) {
+            sp_r0 = line_thinness(bx.data(), by.data(), m);
+            one = fit_scan_line(bx.data(), by.data(), bz.data(), bg.data(), bs.data(),
+                                bx.size(), &fd1);
+        }
+        double cost1 = line_cost(one, bx, by, bz, bg);
+
+        // 2 本に分けたほうが短いかを、推定ではなく実際の符号長で決める。
+        // 標識は 1 点 1 bit を上限として見込む（実際は文脈符号化でこれより安い）。
+        SweepParam two[2];
+        FitDiag fd2[2];
+        if (m >= 40) {
             std::vector<uint8_t> lab;
             split_two_lines(bx.data(), by.data(), m, lab);
             size_t c1 = 0; for (auto v : lab) c1 += v;
             if (c1 < 10 || m - c1 < 10) {
                 sp_code = 1;
             } else {
-                std::vector<int64_t> x0, y0, x1, y1;
-                for (size_t i = 0; i < m; ++i)
-                    if (lab[i]) { x1.push_back(bx[i]); y1.push_back(by[i]); }
-                    else        { x0.push_back(bx[i]); y0.push_back(by[i]); }
-                double w = (x0.size() * line_thinness(x0.data(), y0.data(), x0.size()) +
-                            x1.size() * line_thinness(x1.data(), y1.data(), x1.size())) / m;
-                sp_w = w;
-                if (w < r0 * 0.5) {
+                for (size_t i = 0; i < m; ++i) L.label[a + i] = lab[i];
+                double cost2 = 0;
+                for (int g = 0; g < 2; ++g) {
+                    gather((uint8_t)g, true);
+                    two[g] = bx.empty() ? SweepParam()
+                        : fit_scan_line(bx.data(), by.data(), bz.data(), bg.data(),
+                                        bs.data(), bx.size(), &fd2[g]);
+                    cost2 += line_cost(two[g], bx, by, bz, bg);
+                }
+                sp_w = cost2 / (double)m;
+                if (cost2 + (double)m < cost1) {
                     sp_code = 3;
                     L.split[k] = 1;
-                    for (size_t i = 0; i < m; ++i) L.label[a + i] = lab[i];
                 } else {
                     sp_code = 2;
+                    for (size_t i = 0; i < m; ++i) L.label[a + i] = 0;
                 }
             }
         }
+
         int nl = L.split[k] ? 2 : 1;
         for (int g = 0; g < nl; ++g) {
-            gather((uint8_t)g, L.split[k] != 0);
-            FitDiag fd;
-            SweepParam sp = bx.empty() ? SweepParam()
-                : fit_scan_line(bx.data(), by.data(), bz.data(), bg.data(), bs.data(),
-                                bx.size(), dump ? &fd : nullptr);
+            SweepParam sp = L.split[k] ? two[g] : one;
+            FitDiag fd = L.split[k] ? fd2[g] : fd1;
+            if (dump) gather((uint8_t)g, L.split[k] != 0);
             if (dump && !bx.empty()) {
                 size_t id = L.line.size();
                 fprintf(dump, "%zu\t%zu\t%.3f\t%.4f\t%.1f\t%.1f\t%.4f\t%.4f\t%d"
@@ -548,6 +591,11 @@ static bool enc_geom_scan(const std::vector<const std::vector<int64_t>*>& cols,
 
     if (dump) { fclose(dump); dump = nullptr; }
     if (dump_raw) { fclose(dump_raw); dump_raw = nullptr; }
+
+    // 変種 5: 掃引の分割と走査線ごとの回転だけを使い、当てはめた曲線は使わない。
+    // 使わないパラメタを 0 にすると、差分をとった副情報からほぼ消える。
+    if (var == 5)
+        for (auto& ln : L.line) { ln.ok = 0; ln.Sz = 0; ln.th0 = 0; ln.om = 0; }
 
     std::vector<std::vector<int64_t>> res(3, std::vector<int64_t>(n, 0));
     // z は「同じ掃引・同じ戻り番号の直前の点」から予測する。
@@ -800,6 +848,7 @@ bool codec_encode(uint16_t id, const std::vector<const std::vector<int64_t>*>& c
     case C_RANGE_DELTA:  enc_cols(cols, 1, out); return true;
     case C_RANGE_CTX:    enc_cols(cols, 2, out); return true;
     case C_RANGE_CTX2:   enc_cols(cols, 3, out); return true;
+    case C_RANGE_MED:    enc_geom_med(cols, out); return true;
     case C_GEOM_XYZ: {
         int var = param.empty() ? 0 : param[0];
         if (var == 2) {
@@ -880,6 +929,7 @@ bool codec_decode(uint16_t id, const std::vector<uint8_t>& param,
     case C_RANGE_DELTA:  dec_cols(data, len, n, ncol, 1, out); return true;
     case C_RANGE_CTX:    dec_cols(data, len, n, ncol, 2, out); return true;
     case C_RANGE_CTX2:   dec_cols(data, len, n, ncol, 3, out); return true;
+    case C_RANGE_MED:    dec_geom_med(data, len, n, ncol, out); return true;
     case C_GEOM_XYZ: {
         int var = param.empty() ? 0 : param[0];
         if (var == 2) {
@@ -960,9 +1010,12 @@ std::string cand_name(uint16_t c, const std::vector<uint8_t>& p) {
     case C_RANGE_DELTA: return "delta";
     case C_RANGE_CTX: return "ctx";
     case C_RANGE_CTX2: return "ctx2";
+    case C_RANGE_MED: return "med3";
     case C_GEOM_SCAN: {
         static char b2[16];
-        snprintf(b2, sizeof b2, "走査v%d", p.empty() ? 1 : p[0]);
+        int v = p.empty() ? 1 : p[0];
+        if (v == 5) return "走査変換";
+        snprintf(b2, sizeof b2, "走査v%d", v);
         return b2;
     }
     case C_GEOM_XYZ:
@@ -1015,7 +1068,7 @@ std::vector<Stream> plan_streams(const Frame& f, bool joint_geom, std::string* l
                                  const CodecCtx* ctx, bool trace_all) {
     std::vector<Stream> out;
     std::vector<Cand> cand{{C_RAW64, {}}, {C_RANGE, {}}, {C_RANGE_DELTA, {}},
-                           {C_RANGE_CTX, {}}, {C_RANGE_CTX2, {}}};
+                           {C_RANGE_CTX, {}}, {C_RANGE_CTX2, {}}, {C_RANGE_MED, {}}};
     // 幾何が揃っていれば、空間予測の候補（予測子 1 / 3 / 5 個）も加える
     std::vector<Cand> cand_attr = cand;
     if (ctx && ctx->world)
@@ -1090,7 +1143,13 @@ std::vector<Stream> plan_streams(const Frame& f, bool joint_geom, std::string* l
                 pv.insert(pv.end(), nm.begin(), nm.end());
             };
             add("gps_time"); add("point_source_id"); add(ret);
-            for (uint8_t v = 1; v <= 4; ++v) {
+            // v2（z を中央値予測）と v3（z の文脈を面内・面外から作る）と v4 は
+            // 11 ファイルの実測でいずれも v1 に及ばなかったので既定では出さない。
+            // 分割の仕方を変えたら結論も変わりうるので、コードと再測の口は残す。
+            std::vector<uint8_t> vars{1, 5};
+            if (const char* e = getenv("PCC_ALL_VARIANTS"))
+                if (e[0] == '1') vars = {1, 2, 3, 4, 5};
+            for (uint8_t v : vars) {
                 std::vector<uint8_t> q = pv; q[0] = v;
                 gc.push_back({C_GEOM_SCAN, q});
             }
@@ -1178,7 +1237,8 @@ std::vector<Stream> plan_streams(const Frame& f, bool joint_geom, std::string* l
 // ---------------------------------------------------------------- 書き出し / 読み込み
 enum : uint16_t {
     T_SRC_KIND = 1, T_SRC_BYTES = 2, T_SCALE = 3, T_OFFSET = 4, T_SCHEMA = 5,
-    T_PLAN = 6, T_FIDELITY = 7, T_ENVELOPE = 8, T_GEOM_COLS = 9, T_GEOM_REPR = 10
+    T_PLAN = 6, T_FIDELITY = 7, T_ENVELOPE = 8, T_GEOM_COLS = 9, T_GEOM_REPR = 10,
+    T_EMBED = 11
 };
 
 static void put_tag(std::vector<uint8_t>& h, uint16_t tag, const std::vector<uint8_t>& body) {
@@ -1210,6 +1270,9 @@ bool write_pcc2(const std::string& path, const Frame& f, const std::vector<Strea
     b.clear(); put_blob(b, f.envelope);                put_tag(h, T_ENVELOPE, b);
     b.clear(); for (int i = 0; i < 3; ++i) put_str(b, f.geom[i]);  put_tag(h, T_GEOM_COLS, b);
     b.clear(); put_str(b, f.geom_repr);                put_tag(h, T_GEOM_REPR, b);
+    if (!f.embed.empty()) {
+        b.clear(); put_str(b, f.embed_kind); put_blob(b, f.embed);  put_tag(h, T_EMBED, b);
+    }
 
     std::vector<uint8_t> o;
     o.insert(o.end(), {'P', 'C', 'C', '2'});
@@ -1284,6 +1347,7 @@ bool read_pcc2(const std::string& path, Frame& f, std::string& err) {
         case T_ENVELOPE:  f.envelope = r.blob(); break;
         case T_GEOM_COLS: for (int i = 0; i < 3; ++i) f.geom[i] = r.str(); break;
         case T_GEOM_REPR: f.geom_repr = r.str(); break;
+        case T_EMBED:     f.embed_kind = r.str(); f.embed = r.blob(); break;
         default: break;   // 知らないタグは読み飛ばす（前方互換）
         }
         r.p = next;

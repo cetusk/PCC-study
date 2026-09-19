@@ -52,6 +52,10 @@ struct Frame {
     std::string plan;                                     // 正規化の副情報（JSON）
     Fidelity fid;
     std::vector<uint8_t> envelope;                        // 元の器を再生成する情報
+    // 自前の符号器より元の器のほうが短いときに、その中身をそのまま包んで運ぶ。
+    // 空でなければ列ストリームは無く、復号はこの中身を書き出して読み直す。
+    std::vector<uint8_t> embed;
+    std::string embed_kind;
 
     const std::vector<int64_t>* get(const std::string& k) const {
         auto it = col.find(k); return it == col.end() ? nullptr : &it->second;
