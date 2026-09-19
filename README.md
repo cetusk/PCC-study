@@ -9,10 +9,12 @@
 
 ## 論文
 
+姉妹論文で、依存は下から上への一方向。符号化論文は単独で読める。
+
 | | 内容 |
 |---|---|
-| [点群圧縮における表現正規化レイヤー](paper/pcc.pdf) | 符号化の前段に置く可逆写像の族。恒等写像を含めて実測で選ぶことで「元より悪化しない」を構成的に保証する |
-| [幾何から導く符号化順序による航空 LiDAR 属性の可逆符号化](paper/coding.pdf) | 容器が幾何を先に復号する性質を使い、座標だけで決まる順序と予測子を副情報なしで使う |
+| [Lossless Coding of Airborne LiDAR Attributes in a Geometry-Derived Order](paper/coding.pdf) | 容器が幾何を先に復号する性質を使い、座標だけで決まる順序と予測子を副情報なしで使う |
+| [A Representation Normalization Layer for Point Cloud Compression](paper/pcc.pdf) | 符号化の前段に置く可逆写像の族。恒等写像を含めて実測で選ぶことで「元より悪化しない」を構成的に保証する。属性の符号化方式は上の論文に委ねる |
 
 いずれも LASzip を内側のコーデックとして用いる構成である。
 **本リポジトリの現在の主題は、その外側ではなく符号器そのものの開発**（下記）。
