@@ -234,6 +234,44 @@ def main() -> None:
     print(f"  {len(over)} / {meas} ブロック（走査列が測れたブロックのみ）")
     print()
 
+    print("=== 群サイズは鍵の重複率より説明力があるか ===")
+    print("  鍵の重複群の大きさをブロックごとに測り直し、走査v1 の増分との順位相関を出す。")
+    import exp_order_matrix as M
+    gs = []
+    for name, path, off, kind in M.FILES:
+        if kind != "las" or not Path(path).is_file():
+            continue
+        total = M.total_points(kind, path)
+        nb = M.NBLOCK if total >= M.BLOCK * M.NBLOCK else 1
+        if nb == 1:
+            starts = [max(0, total // 2 - M.BLOCK // 2)
+                      if off < 0 and total > M.BLOCK else 0]
+        else:
+            step = (total - M.BLOCK) // (nb - 1)
+            starts = [i * step for i in range(nb)]
+        for bi, st in enumerate(starts):
+            lab = name if nb == 1 else f"{name}#{bi}"
+            v = [x for c in ("ランダム1", "ランダム2")
+                 if (x := delta(rows, lab, c, "scan1")) is not None]
+            if not v:
+                continue
+            _, g, sid, *_ = M.read_block(kind, path, st, M.BLOCK)
+            key = np.stack([sid.astype(np.float64), g], 1)
+            _, cnt = np.unique(key, axis=0, return_counts=True)
+            dk = 100.0 * (1.0 - len(cnt) / len(g))
+            gs.append((lab, dk, float(np.median(cnt)), float(np.mean(cnt)),
+                       float(np.mean(v))))
+    if gs:
+        a = np.array([[t[1], t[2], t[3], t[4]] for t in gs])
+        for i, lab in ((0, "鍵の重複率"), (1, "群サイズ中央値"), (2, "群サイズ平均")):
+            rr, pp = spearmanr(a[:, i], a[:, 3])
+            print(f"    {lab:<14} rho = {rr:+.3f}  p = {pp:.4f}  (n={len(gs)})")
+        for lab in ("plane", "USGS NY#0"):
+            t = next((x for x in gs if x[0] == lab), None)
+            if t:
+                print(f"    {lab:<10} 鍵重複 {t[1]:5.1f}%  群サイズ 中央値 {t[2]:.0f} 平均 {t[3]:.2f}")
+    print()
+
     n = 1_000_000
     print(f"参考: log2(n!)/n = {math.log2(n) - math.log2(math.e):.3f} bit/点（n = {n}）。")
     print("  これは置換そのものの情報量であって、上の増分と直接は比べられない。")
