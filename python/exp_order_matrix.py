@@ -268,9 +268,12 @@ def main() -> None:
             rs = {f: run_pcc(str(p), f) for f in FORCE}
             p.unlink()
             # 退避路に落ちた行は、検証の対象が符号器ではないので失格にする
-            ver = all(r["ok"] and r["det"] and not r["emb"]
-                      for r in rs.values() if r["avail"])
-            ver = ver and (gp.lossless is not False)
+            # avail な候補が 1 つも無いと all() が空集合で真になるので、
+            # 「少なくとも 1 つが検証を通った」ことを明示的に要求する。
+            av = [r for r in rs.values() if r["avail"]]
+            ver = bool(av) and all(r["ok"] and r["det"] and not r["emb"] for r in av)
+            # is not False だと、復号できず None のままの行が合格になる。
+            ver = ver and (gp.lossless is True)
             vals = []
             for f in FORCE:
                 vals.append(rs[f]["bpp"] if rs[f]["avail"] else float("nan"))
