@@ -47,7 +47,8 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 PCC = "./cpp/build/pccnorm"
 BLOCK = 1_000_000
 FORCE = ("幾何v3", "走査v1")
-TARGETS = (0.0, 10.0, 25.0, 50.0, 75.0, 100.0)
+# 45〜82% は本測定にデータが無い範囲なので、そこを厚くする。
+TARGETS = (0.0, 10.0, 25.0, 50.0, 60.0, 70.0, 80.0, 90.0, 100.0)
 FILES = [("vegetation", "data/raw/small/vegetation_1_3.las"),
          ("AHN4 _20", "data/raw/ahn4/31HZ1_20.LAZ")]
 
@@ -119,12 +120,16 @@ def dither(sid: np.ndarray, gq: np.ndarray, q: float) -> np.ndarray:
     start = np.r_[True, grp[1:] != grp[:-1]]
     rank = np.empty(len(inv), dtype=np.int64)
     rank[order] = idx - np.maximum.accumulate(np.where(start, idx, 0))
-    eps = q / (rank.max() + 2)
+    # eps を全群共通で「最大群」から決めると、大きい群が 1 つあるだけで
+    # 全群の eps が潰れる。群ごとに決める。
+    size = np.bincount(inv)[inv]
+    eps = q / (size + 2.0)
     ulp = float(np.spacing(np.abs(gq).max()))
-    if eps < ulp * 4:
-        # 量子化幅が ulp に近すぎて、群を分けるだけの余地が無い
-        return gq.copy()
-    return gq + rank * eps
+    out = gq + rank * eps
+    # 動かせなかった点を数えて返せるようにする（黙って不発にしない）
+    dither.stuck = int(np.count_nonzero((rank > 0) & (out == gq)))
+    dither.headroom = float(eps.min() / ulp) if ulp > 0 else float("inf")
+    return out
 
 
 def measure(pts, gq, orders, hdr, tmp) -> tuple[dict, bool]:
@@ -173,20 +178,25 @@ def main() -> None:
         pts = pts[start:start + BLOCK]
         n = len(pts)
         g0 = np.asarray(pts["gps_time"]).astype(np.float64)
+        # gps_time は絶対値が 2.7e8 で ulp が 6e-8 あるのに、幅は 1000 秒しかない。
+        # 最小値を引くと ulp が 1e-13 になり、ディザが群を分ける余地が 5 桁増える。
+        # 両条件に同じ平行移動を掛けるので、条件間の比較は変わらない。
+        g0 = g0 - g0.min()
         sid = np.asarray(pts["point_source_id"]).astype(np.int64)
         print(f"### {label}  {n} 点  元の鍵の重複率 {dup_rate(sid, g0):.1f}%")
         print(f"{'目標':>6}{'条件':>8}{'重複率':>8}{'群サイズ':>10}{'量子化幅':>12}"
-              f"{'幾何v3':>9}{'走査v1':>9}{'走査v1 Δ':>10}{'逆順Δ':>9}{'検証':>6}")
+              f"{'幾何v3':>9}{'走査v1':>9}{'走査v1 Δ':>10}{'逆順Δ':>9}"
+              f"{'不動点':>8}{'検証':>6}")
         rng = np.random.default_rng(20260920)
         orders = {"恒等": np.arange(n), "逆順": np.arange(n)[::-1].copy(),
                   "ランダム": rng.permutation(n)}
         for target in TARGETS:
             gq0, q, actual = quantize_for(sid, g0, target)
-            variants = [("量子化", gq0, actual)]
+            variants = [("量子化", gq0, actual, 0)]
             if target > 0:
                 gd = dither(sid, gq0, q)
-                variants.append(("ディザ", gd, dup_rate(sid, gd)))
-            for vname, gq, rate in variants:
+                variants.append(("ディザ", gd, dup_rate(sid, gd), dither.stuck))
+            for vname, gq, rate, stuck in variants:
                 vals, allok = measure(pts, gq, orders, hdr, tmp)
                 b3 = vals[("恒等", "幾何v3")]
                 b1 = vals[("恒等", "走査v1")]
@@ -195,7 +205,7 @@ def main() -> None:
                 grp = 1.0 / max(1e-9, 1.0 - rate / 100.0)
                 print(f"{target:>5.0f}%{vname:>8}{rate:>7.1f}%{grp:>10.1f}{q:>12.2e}"
                       f"{b3:>9.3f}{b1:>9.3f}{d:>9.1f}%{dr:>8.1f}%"
-                      f"{'ok' if allok else 'NG':>6}", flush=True)
+                      f"{stuck:>8}{'ok' if allok else 'NG':>6}", flush=True)
         print()
     print("Δ = ランダム置換 / 恒等 の増分。逆順Δ は同じ基準での逆順の増分（引かない）。")
     print("ディザは量子化幅を変えずに鍵の単射性だけを戻した条件。")

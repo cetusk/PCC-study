@@ -4,14 +4,14 @@
 （型 D）。読み取りはここ 1 か所に集める。
 
 出力は固定幅で、先頭 13 文字がブロックの名前（"AHN4 _20#0" のように
-`#` と空白を含む）。残りは空白区切りの 16 列である。
+`#` と空白を含む）。残りは空白区切りの 19 列である。
 """
 from __future__ import annotations
 from pathlib import Path
 
 COND = ("恒等", "逆順", "Morton", "ランダム1", "ランダム2")
 FIELDS = ("cond", "n", "dup_key", "dup_pt", "gpcc", "laz", "geom3", "scan1",
-          "total", "genc", "gdec", "gpeak", "lenc", "ldec",
+          "tot_geom3", "tot_scan1", "genc", "gdec", "gpeak", "lenc", "ldec",
           "penc", "pdec", "ppeak", "ver")
 
 
@@ -30,11 +30,12 @@ def read_matrix(path: str | Path) -> list[dict]:
         try:
             r = {"name": name, "file": name.split("#")[0], "cond": f[0],
                  "n": int(f[1]), "dup_key": float(f[2].rstrip("%")), "dup_pt": int(f[3]),
-                 "ver": f[17]}
+                 "ver": f[18]}
             for k, i in (("gpcc", 4), ("laz", 5), ("geom3", 6), ("scan1", 7),
-                         ("total", 8), ("genc", 9), ("gdec", 10), ("gpeak", 11),
-                         ("lenc", 12), ("ldec", 13),
-                         ("penc", 14), ("pdec", 15), ("ppeak", 16)):
+                         ("tot_geom3", 8), ("tot_scan1", 9),
+                         ("genc", 10), ("gdec", 11), ("gpeak", 12),
+                         ("lenc", 13), ("ldec", 14),
+                         ("penc", 15), ("pdec", 16), ("ppeak", 17)):
                 r[k] = float(f[i])
         except ValueError:
             continue

@@ -37,7 +37,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from baselines import tmc13_bits           # noqa: E402
 
 PCC = "./cpp/build/pccnorm"
-BLOCK = 1_000_000
+BLOCK = int(os.environ.get("PCC_BLOCK", "1000000"))
 # 大きいファイルから取る互いに素なブロックの数。ファイル内の分散を測るため。
 # 1 だと Δ がすべて標本数 1 になり、分散推定が付かない。
 NBLOCK = int(os.environ.get("PCC_NBLOCK", "3"))
@@ -47,21 +47,32 @@ ONLY = [x for x in os.environ.get("PCC_ONLY", "").split(",") if x]
 DRY = os.environ.get("PCC_DRY", "") == "1"
 
 # 名前 | 入力 | 開始点（負なら中央付近を自動）
+# 4 つ目は種別。las 以外は点ごとの時刻も飛行線番号も持たないので、
+# 走査モデルは候補から外す（鍵を合成すると、まさに交絡させたい量を自分で作る）。
 FILES = [
-    ("red-rocks",   "data/raw/extrabytes/entwine_data_red-rocks.laz", 0),
-    ("simple1_4",   "data/raw/small/simple1_4.las", 0),
-    ("plane",       "data/raw/small/plane.laz", 0),
-    ("vegetation",  "data/raw/small/vegetation_1_3.las", 0),
-    ("fullwave",    "data/raw/small/fullwave.laz", 0),
-    ("autzen_trim", "data/raw/small/autzen_trim.laz", 0),
-    ("workshop",    "data/raw/extrabytes/workshop_TM_551_101.laz", -1),
-    ("autzen-2023", "data/raw/extrabytes/autzen_2023_autzen-2023.copc.laz", -1),
-    ("AHN3 _20",    "data/raw/ahn3/31HZ1_20.LAZ", -1),
-    ("AHN4 _20",    "data/raw/ahn4/31HZ1_20.LAZ", -1),
-    ("AHN4 _21",    "data/raw/ahn4/31HZ1_21.LAZ", -1),
-    ("AHN5 _20",    "data/raw/ahn5/31HZ1_20.LAZ", -1),
+    ("red-rocks",   "data/raw/extrabytes/entwine_data_red-rocks.laz", 0, "las"),
+    ("simple1_4",   "data/raw/small/simple1_4.las", 0, "las"),
+    ("plane",       "data/raw/small/plane.laz", 0, "las"),
+    ("vegetation",  "data/raw/small/vegetation_1_3.las", 0, "las"),
+    ("fullwave",    "data/raw/small/fullwave.laz", 0, "las"),
+    ("autzen_trim", "data/raw/small/autzen_trim.laz", 0, "las"),
+    ("workshop",    "data/raw/extrabytes/workshop_TM_551_101.laz", -1, "las"),
+    ("autzen-2023", "data/raw/extrabytes/autzen_2023_autzen-2023.copc.laz", -1, "las"),
+    ("AHN3 _20",    "data/raw/ahn3/31HZ1_20.LAZ", -1, "las"),
+    ("AHN4 _20",    "data/raw/ahn4/31HZ1_20.LAZ", -1, "las"),
+    ("AHN4 _21",    "data/raw/ahn4/31HZ1_21.LAZ", -1, "las"),
+    ("AHN5 _20",    "data/raw/ahn5/31HZ1_20.LAZ", -1, "las"),
+    ("USGS AK",     "data/raw/usgs/AK_Kenai_2008_000001.laz", -1, "las"),
+    ("USGS NY",     "data/raw/usgs/NY_ClintonEssex_2014.laz", -1, "las"),
+    ("KITTI",       "data/raw/kitti", 0, "kitti"),
+    ("TLS p1",      "data/raw/tls/lecturehall/lecturehall1.pose1.object1.label.csv", 0, "tls"),
+    ("TLS p2",      "data/raw/tls/lecturehall/lecturehall1.pose2.object2.label.csv", 0, "tls"),
 ]
 FORCE = ("幾何v3", "走査v1")
+FORCE_NOKEY = ("幾何v3",)          # 鍵を持たない入力では走査モデルを候補から外す
+QSCALE = 0.001                      # 実数座標を持つ入力の量子化幅 [m]
+GPCC_ONLY = os.environ.get("PCC_GPCC_ONLY", "") == "1"
+TMC13_ARGS = [a for a in os.environ.get("PCC_TMC13_ARGS", "").split() if a]
 
 
 def morton3(a: np.ndarray) -> np.ndarray:
@@ -93,6 +104,100 @@ def block_shuffle(n: int, w: int, rng) -> np.ndarray:
         b = min(a + w, n)
         idx[a:b] = rng.permutation(idx[a:b])
     return idx
+
+
+# ---------------------------------------------------------------- 入力
+# 種別ごとに「ブロックの総点数」と「ブロックの読み出し」を与える。
+# las 以外は点ごとの時刻も飛行線番号も無いので、鍵は作らない（走査モデルを外す）。
+
+def kitti_frames(root: str) -> list[Path]:
+    return sorted(Path(root).glob("**/velodyne_points/data/*.bin"))
+
+
+def total_points(kind: str, path: str) -> int:
+    if kind == "las":
+        with laspy.open(path) as fh:
+            return fh.header.point_count
+    if kind == "kitti":
+        return sum(f.stat().st_size // 16 for f in kitti_frames(path))
+    if kind == "tls":
+        # 平均行長からの見積もりは 1M 点ずれ、末尾ブロックが短くなってブロック長が
+        # 揃わなくなった。数え上げは 831MB でも 2 秒なので正確に数える。
+        cnt = 0
+        with open(path, "rb") as f:
+            while True:
+                b = f.read(1 << 22)
+                if not b:
+                    break
+                cnt += b.count(b"\n")
+        return cnt
+    raise ValueError(kind)
+
+
+def read_block(kind: str, path: str, start: int, count: int):
+    """(xyz int64, gps or None, sid or None, scales, offsets, laspy の点列 or None)。"""
+    if kind == "las":
+        with laspy.open(path) as fh:
+            hdr = fh.header
+            pts = fh.read_points(start + count)
+        pts = pts[start:start + count]
+        xyz = np.stack([np.asarray(pts["X"]), np.asarray(pts["Y"]),
+                        np.asarray(pts["Z"])], 1).astype(np.int64)
+        return (xyz, np.asarray(pts["gps_time"]).astype(np.float64),
+                np.asarray(pts["point_source_id"]).astype(np.int64),
+                list(hdr.scales), list(hdr.offsets), pts, hdr)
+    if kind == "kitti":
+        # 取得順はフレームの順、フレーム内はセンサの発射順。連結して 1 本の系列にする。
+        acc, got, skipped = [], 0, 0
+        for f in kitti_frames(path):
+            k = f.stat().st_size // 16
+            if skipped + k <= start:
+                skipped += k
+                continue
+            a = np.fromfile(f, dtype=np.float32).reshape(-1, 4)[:, :3]
+            if skipped < start:
+                a = a[start - skipped:]
+                skipped = start
+            acc.append(a)
+            got += len(a)
+            if got >= count:
+                break
+        w = np.concatenate(acc)[:count].astype(np.float64)
+    elif kind == "tls":
+        w = np.loadtxt(path, delimiter=",", usecols=(0, 1, 2), dtype=np.float64,
+                       skiprows=start, max_rows=count)
+    else:
+        raise ValueError(kind)
+    off = np.floor(w.min(0) / QSCALE) * QSCALE
+    xyz = np.rint((w - off) / QSCALE).astype(np.int64)
+    return xyz, None, None, [QSCALE] * 3, list(off), None, None
+
+
+def write_las(dst: Path, xyz: np.ndarray, sc, of, pts=None, hdr_src=None) -> None:
+    """PCC2 に渡す入力。las 由来なら元の点列と VLR を保つ。"""
+    if pts is not None and hdr_src is not None:
+        h2 = laspy.LasHeader(version=hdr_src.version, point_format=hdr_src.point_format)
+        for v in hdr_src.vlrs:
+            tn = type(v).__name__
+            # ExtraBytes の記述子は laspy が点形式から自前で書き出すので、
+            # ここで複製すると VLR が二重になり追加バイトのオフセットが狂う。
+            # COPC の VLR は laspy が書き戻せない（空間索引で中身に無関係）。
+            if tn.startswith("ExtraBytes") or tn.startswith("Copc"):
+                continue
+            try:
+                v.record_data_bytes()
+            except Exception:
+                continue
+            h2.vlrs.append(v)
+        h2.scales, h2.offsets = hdr_src.scales, hdr_src.offsets
+        las = laspy.LasData(h2)
+        las.points = pts
+    else:
+        h2 = laspy.LasHeader(version="1.4", point_format=6)
+        h2.scales, h2.offsets = sc, of
+        las = laspy.LasData(h2)
+        las.X, las.Y, las.Z = xyz[:, 0], xyz[:, 1], xyz[:, 2]
+    las.write(str(dst))
 
 
 def laz_geom_bpp(xyz: np.ndarray, scale, offset) -> tuple[float, bool, float, float]:
@@ -163,7 +268,8 @@ def main() -> None:
     say("退避路に落ちた行は検証の対象が符号器でないので NG にする。")
     say()
     hdr = (f"{'データ':<13}{'条件':<10}{'点数':>9}{'鍵重複':>7}{'重複点':>7}"
-           f"{'G-PCC':>9}{'LAZ幾何':>9}{'幾何v3':>9}{'走査v1':>9}{'全列計':>9}"
+           f"{'G-PCC':>9}{'LAZ幾何':>9}{'幾何v3':>9}{'走査v1':>9}"
+           f"{'全列v3':>9}{'全列sc':>9}"
            f"{'Genc':>7}{'Gdec':>7}{'GpkMB':>8}{'Lenc':>7}{'Ldec':>7}"
            f"{'Penc':>7}{'Pdec':>7}{'PpkMB':>8}{'検証':>5}")
     say(hdr)
@@ -174,7 +280,7 @@ def main() -> None:
     # 一致せず、全部やり直しになる。
     done = set()
     if len(sys.argv) > 2 and Path(sys.argv[2]).is_file():
-        names = {nm for nm, _, _ in FILES}
+        names = {nm for nm, _, _, _ in FILES}
         for ln in Path(sys.argv[2]).read_text(encoding="utf-8").splitlines():
             lab = ln[:13].strip()
             if lab and (lab in names or lab.split("#")[0] in names):
@@ -183,14 +289,13 @@ def main() -> None:
     # ブロックの一覧を先に作る。1 ファイルから互いに素なブロックを等間隔に取り、
     # ファイル内の分散を測れるようにする。取れないファイルは 1 ブロックのまま。
     blocks = []
-    for name, path, off in FILES:
+    for name, path, off, kind in FILES:
         if ONLY and name not in ONLY:
             continue
-        if not Path(path).is_file():
+        if not (Path(path).is_file() or (kind == "kitti" and Path(path).is_dir())):
             say(f"{name:<13}  入力が無い: {path}")
             continue
-        with laspy.open(path) as fh:
-            total = fh.header.point_count
+        total = total_points(kind, path)
         nb = NBLOCK if total >= BLOCK * NBLOCK else 1
         if nb == 1:
             st = [max(0, total // 2 - BLOCK // 2) if off < 0 and total > BLOCK else 0]
@@ -198,7 +303,7 @@ def main() -> None:
             step = (total - BLOCK) // (nb - 1)
             st = [i * step for i in range(nb)]
         for bi, x in enumerate(st):
-            blocks.append((name if nb == 1 else f"{name}#{bi}", path, x))
+            blocks.append((name if nb == 1 else f"{name}#{bi}", path, x, kind))
     say(f"ブロック {len(blocks)} 個（{sum(1 for b in blocks if '#' in b[0])} 個は"
         f"大きいファイルから {NBLOCK} 分割）")
     say("Genc/Gdec/GpkMB は G-PCC、Lenc/Ldec は幾何のみの LAZ、"
@@ -207,30 +312,26 @@ def main() -> None:
     say()
 
     if DRY:
-        for nm, pa, st in blocks:
-            say(f"  {nm:<14} 開始 {st:>10}  {pa}")
+        for nm, pa, st, kd in blocks:
+            say(f"  {nm:<14} {kd:<6} 開始 {st:>10}  {pa}")
         if dest is not sys.stdout:
             dest.close()
         return
 
     tmp = Path(tempfile.mkdtemp())
-    for name, path, start in blocks:
+    for name, path, start, kind in blocks:
         if name in done:
             continue
-        with laspy.open(path) as fh:
-            hdr_src = fh.header
-            sc, of = list(hdr_src.scales), list(hdr_src.offsets)
-            total = hdr_src.point_count
-            pts = fh.read_points(start + min(BLOCK, total))
-        pts = pts[start:start + BLOCK]
-        n = len(pts)
-        xyz = np.stack([np.asarray(pts["X"]), np.asarray(pts["Y"]),
-                        np.asarray(pts["Z"])], 1).astype(np.int64)
-        g = np.asarray(pts["gps_time"]).astype(np.float64)
-        sid = np.asarray(pts["point_source_id"]).astype(np.int64)
-        # 走査モデルが実際に見るのは鍵の重複率である。隣接同値率ではない。
-        key = np.stack([sid.astype(np.float64), g], 1)
-        dup_key = 100.0 * (1.0 - len(np.unique(key, axis=0)) / n)
+        xyz, g, sid, sc, of, pts, hdr_src = read_block(kind, path, start, BLOCK)
+        n = len(xyz)
+        if sid is None:
+            # 点ごとの時刻も飛行線番号も無い。鍵が作れないので走査モデルは候補外。
+            forces, dup_key = FORCE_NOKEY, float("nan")
+        else:
+            # 走査モデルが実際に見るのは鍵の重複率である。隣接同値率ではない。
+            key = np.stack([sid.astype(np.float64), g], 1)
+            dup_key = 100.0 * (1.0 - len(np.unique(key, axis=0)) / n)
+            forces = FORCE
         dup_pt = int(n - len(np.unique(xyz, axis=0)))   # 重複点の数（可逆判定の前提）
 
         rng = np.random.default_rng(20260920)
@@ -245,47 +346,38 @@ def main() -> None:
 
         for cname, idx in conds:
             p = tmp / "x.laz"
-            h2 = laspy.LasHeader(version=hdr_src.version, point_format=hdr_src.point_format)
-            for v in hdr_src.vlrs:
-                tn = type(v).__name__
-                # ExtraBytes の記述子は laspy が点形式から自前で書き出すので、
-                # ここで複製すると VLR が二重になり追加バイトのオフセットが狂う。
-                # COPC の VLR は laspy が書き戻せない（空間索引で中身に無関係）。
-                if tn.startswith("ExtraBytes") or tn.startswith("Copc"):
-                    continue
-                try:
-                    v.record_data_bytes()
-                except Exception:
-                    continue
-                h2.vlrs.append(v)
-            h2.scales, h2.offsets = hdr_src.scales, hdr_src.offsets
-            las = laspy.LasData(h2)
-            las.points = pts[idx].copy()
-            las.write(str(p))
             lz, lzok, lz_enc, lz_dec = laz_geom_bpp(xyz[idx], sc, of)
-            gp = tmc13_bits(xyz[idx])
+            gp = tmc13_bits(xyz[idx], extra=TMC13_ARGS) if TMC13_ARGS else tmc13_bits(xyz[idx])
             gb = gp.bytes * 8.0 / n if gp.bytes else float("nan")
-            rs = {f: run_pcc(str(p), f) for f in FORCE}
-            p.unlink()
+            if GPCC_ONLY:
+                rs = {}
+            else:
+                write_las(p, xyz[idx], sc, of,
+                          pts[idx].copy() if pts is not None else None, hdr_src)
+                rs = {f: run_pcc(str(p), f) for f in forces}
+                p.unlink()
             # 退避路に落ちた行は、検証の対象が符号器ではないので失格にする
-            # avail な候補が 1 つも無いと all() が空集合で真になるので、
-            # 「少なくとも 1 つが検証を通った」ことを明示的に要求する。
-            av = [r for r in rs.values() if r["avail"]]
-            ver = bool(av) and all(r["ok"] and r["det"] and not r["emb"] for r in av)
             # is not False だと、復号できず None のままの行が合格になる。
-            ver = ver and (gp.lossless is True)
-            vals = []
-            for f in FORCE:
-                vals.append(rs[f]["bpp"] if rs[f]["avail"] else float("nan"))
-            pk = [rs[f]["peak"] for f in FORCE]
-            ver = ver and lzok
+            ver = (gp.lossless is True) and lzok
+            if not GPCC_ONLY:
+                # avail な候補が 1 つも無いと all() が空集合で真になるので、
+                # 「少なくとも 1 つが検証を通った」ことを明示的に要求する。
+                av = [r for r in rs.values() if r["avail"]]
+                ver = ver and bool(av) and all(
+                    r["ok"] and r["det"] and not r["emb"] for r in av)
+            nanv = float("nan")
+            get = lambda f, k: (rs[f][k] if f in rs and rs[f]["avail"] else nanv)
+            vals = [get(f, "bpp") for f in FORCE]
+            tots = [get(f, "total") for f in FORCE]
+            allr = list(rs.values()) or [{"enc": nanv, "dec": nanv, "peak": nanv}]
             say(f"{name:<13}{cname:<10}{n:>9}{dup_key:>6.1f}%{dup_pt:>7}"
                 f"{gb:>9.3f}{lz:>9.3f}{vals[0]:>9.3f}{vals[1]:>9.3f}"
-                f"{rs[FORCE[0]]['total']:>9.3f}"
+                f"{tots[0]:>9.3f}{tots[1]:>9.3f}"
                 f"{gp.enc_s:>7.1f}{gp.dec_s:>7.1f}{gp.peak_mb:>8.0f}"
                 f"{lz_enc:>7.1f}{lz_dec:>7.1f}"
-                f"{max(r['enc'] for r in rs.values()):>7.1f}"
-                f"{max(r['dec'] for r in rs.values()):>7.1f}{max(pk):>8.0f}"
+                f"{max(r['enc'] for r in allr):>7.1f}"
+                f"{max(r['dec'] for r in allr):>7.1f}"
+                f"{max(r['peak'] for r in allr):>8.0f}"
                 f"{'ok' if ver else 'NG':>5}")
         say()
     if dest is not sys.stdout:
