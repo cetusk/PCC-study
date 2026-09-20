@@ -173,7 +173,9 @@ def tmc13_bits(xyz_int: np.ndarray, tmpdir: str | None = None,
             f.write(np.ascontiguousarray(a.astype(np.float32)).tobytes())
         base = [TMC3, "--mode=0", f"--uncompressedDataPath={ply}",
                 f"--compressedStreamPath={bs}", "--trisoupNodeSizeLog2=0",
-                "--mergeDuplicatedPoints=0", "--positionQuantizationScale=1",
+                "--mergeDuplicatedPoints=0",
+                # --positionQuantizationScale は v23 で非推奨。既定 1 と同じなので外した
+                # （実測で出力は 1 バイトも変わらない）。
                 "--inferredDirectCodingMode=1", "--neighbourAvailBoundaryLog2=8",
                 "--intra_pred_max_node_size_log2=6", "--planarEnabled=1",
                 "--maxNumQtBtBeforeOt=4", "--minQtbtSizeLog2=0"] + (extra or [])
@@ -205,7 +207,12 @@ def _ply_matches(path: Path, ref: np.ndarray) -> bool:
     dt = {12: np.float32, 24: np.float64}.get(itemsize)
     if dt is None:
         return False
-    got = np.rint(np.frombuffer(raw, dtype=dt).reshape(-1, 3)).astype(np.int64)
+    raw_v = np.frombuffer(raw, dtype=dt).reshape(-1, 3)
+    # 無条件に丸めると ±0.5 未満のずれを「可逆」と判定してしまう。
+    # 復号値が整数そのものであることを先に検査する。
+    if not np.all(raw_v == np.rint(raw_v)):
+        return False
+    got = np.rint(raw_v).astype(np.int64)
     a = got[np.lexsort(got.T)]
     b = ref[np.lexsort(ref.T)]
     return np.array_equal(a, b)
