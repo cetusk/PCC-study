@@ -1076,6 +1076,8 @@ std::vector<Stream> plan_streams(const Frame& f, bool joint_geom, std::string* l
         for (uint8_t P : {1, 3, 5}) cand_attr.push_back({C_ATTR_SPATIAL, {P}});
     // 順序の実験では幾何だけが関心で、属性の候補掃引が時間の大半を占める。
     // 絞っても往復検証は全列に掛かるので、検証の強さは落ちない。
+    // 幾何より前に置く列（gps_time など）も cand から作るので、ここで一緒に絞られる。
+    // 幾何の候補 gc は別に組むので影響しない。
     if (ctx && ctx->fast_attr) {
         cand = {{C_RANGE_DELTA, {}}, {C_RANGE_CTX, {}}};
         cand_attr = cand;

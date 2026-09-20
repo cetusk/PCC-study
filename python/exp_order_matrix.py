@@ -16,8 +16,8 @@
 ブロックは 100 万点。TMC13 の sliceMaxPoints 既定 1,100,000 を下回るので
 G-PCC が単一スライスになり、厳密に順序不変な対照になる。
 
-PCC2 の値は --force-geom で候補を固定して測るので、報告するすべての値が
-往復検証（全列一致）と決定性（2 回書いてバイト一致）を通っている。
+PCC2 の値は --force-geom で候補を固定し、--no-fallback で退避路を切って測る。
+退避路に落ちると検証の対象が埋め込んだ器になり、符号器を検証しなくなるため。
 
 使い方:
     $PCCPY python/exp_order_matrix.py <出力先>
@@ -93,7 +93,7 @@ def run_pcc(path: str, force: str) -> dict:
                               + env.get("LD_LIBRARY_PATH", ""))
     with tempfile.TemporaryDirectory() as d:
         r = subprocess.run([PCC, "pack", path, os.path.join(d, "o.pcc2"),
-                            "--force-geom", force, "--fast-attr"],
+                            "--force-geom", force, "--fast-attr", "--no-fallback"],
                            capture_output=True, text=True, env=env)
     out = {"bpp": float("nan"), "ok": None, "det": None, "avail": True,
            "sel": None, "emb": False}
@@ -121,7 +121,9 @@ def main() -> None:
         print(s, file=dest, flush=True)
 
     say("順序感度の測定 — 入力順を統制して符号器ごとの費用を測る")
-    say(f"ブロック {BLOCK} 点。PCC2 の値は --force-geom で固定し、すべて往復検証済み。")
+    say(f"大きいファイルはブロック {BLOCK} 点、小さいファイルは全点。")
+    say("PCC2 の値は --force-geom で候補を固定し、--no-fallback で退避路を切って測る。")
+    say("退避路に落ちた行は検証の対象が符号器でないので NG にする。")
     say()
     hdr = (f"{'データ':<13}{'条件':<12}{'タイ率':>7}{'G-PCC':>9}{'LAZ':>9}"
            f"{'幾何v3':>9}{'走査v1':>9}{'検証':>6}")
