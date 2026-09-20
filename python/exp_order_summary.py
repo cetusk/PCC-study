@@ -21,7 +21,7 @@ from scipy.stats import spearmanr
 sys.path.insert(0, str(Path(__file__).parent))
 from ordermatrix_io import read_matrix, check
 
-SRC = Path("data/work/order_matrix.txt")
+SRC = Path(sys.argv[1] if len(sys.argv) > 1 else "data/work/order_matrix.txt")
 COD = [("gpcc", "G-PCC"), ("laz", "LAZ"), ("geom3", "幾何v3"), ("scan1", "走査v1")]
 CONDS = ["逆順", "Morton", "窓100", "窓1000", "窓10000", "ランダム1", "ランダム2"]
 
