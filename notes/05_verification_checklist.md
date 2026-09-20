@@ -5,7 +5,8 @@
 **同じ型の誤りが何度も別の場所に出るので、場所ではなく型で点検する。**
 
 実例は [`results/scan_model_fitting.md`](../results/scan_model_fitting.md) の
-24・27・29〜32 節にある。
+24・27・29〜32 節にある。測る前の規則は
+[`04_next_steps.md`](04_next_steps.md) の末尾にある。
 
 ---
 

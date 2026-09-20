@@ -194,7 +194,8 @@ data/       サンプルデータ（git 管理外。setup.sh が取得する）
 4. **可逆な多重解像度** — 走査モデルが与える 2 次元格子の上で mipmap / パッチ
 5. **未論文化の成果の論文化** — 面符号化と歪み尺度、走査モデル、PCC2
 
-作業規則（守ること）は `notes/04_next_steps.md` の末尾にある。
+作業規則は [`notes/04_next_steps.md`](notes/04_next_steps.md) の末尾、
+点検の手順は [`notes/05_verification_checklist.md`](notes/05_verification_checklist.md) にある。
 **部分集合で測った値を全体の性質として報告しない** — 2026-09-19 に実際にやらかした。
 
 ---
@@ -205,6 +206,7 @@ data/       サンプルデータ（git 管理外。setup.sh が取得する）
 - [`notes/01_normalization_layer.md`](notes/01_normalization_layer.md) — 正規化レイヤーの設計
 - [`notes/02_codec_container.md`](notes/02_codec_container.md) — PCC2 コンテナの設計
 - [`notes/03_scan_model_codec.md`](notes/03_scan_model_codec.md) — 走査モデル符号器の設計
+- [`notes/05_verification_checklist.md`](notes/05_verification_checklist.md) — **点検の手引き。数字を出す前・主張する前・訂正した後に通す**
 - [`RESUME.md`](RESUME.md) — 中断・再開用の現在地
 
 ## ライセンス
