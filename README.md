@@ -37,20 +37,20 @@
 記録は [`results/pcc2_codec.md`](results/pcc2_codec.md)、設計は
 [`notes/02_codec_container.md`](notes/02_codec_container.md)。
 
-### 11 ファイルでの LASzip との比較
+### 10 ファイルでの LASzip との比較
 
-2026-09-19 に 11 ファイル（小 4 件・ALS 7 件、計 2.4 億点）を一括で測った。
+2026-09-19 に 10 ファイル（小 4 件・ALS 6 件、計 2.4 億点）を 12 構成で一括測定した。
 全件で往復検証の全列一致と決定性のバイト一致を通している
 （[`results/scan_model_fitting.md`](results/scan_model_fitting.md) 16〜18 節）。
 
 | | 件数 | 幅 |
 |---|---|---|
-| PCC2 が勝つ | 8 | −3.8% 〜 −35.2% |
-| PCC2 が負ける | 3 | +1.2%（autzen_trim）/ +6.5%（AHN3）/ +9.4%（vegetation） |
+| PCC2 が勝つ | 9 | −3.8% 〜 −35.5% |
+| **符号器が負ける** | 3 | +1.1%（autzen_trim）/ +4.9%（AHN3）/ +8.2%（vegetation） |
 
-負ける 3 件のうち AHN3 は gps_time 単独で 9.693 bpp を占めることが原因で、
-残り 2 件は 1〜11 万点の小ファイルで容器の固定費が効いている。
-どちらも下記 2 の「決して悪化しない」保証で解消できる。
+負ける 3 件は、元の器を容器に包んで出す退避路（A-3）により、
+**最終出力では +0.0〜0.3% に収まる**。ただしこれは運用上の保証であって、
+符号器が追いついたわけではない。
 
 ### 幾何の符号器（AHN4 200万点、全候補の実測）
 
@@ -64,7 +64,7 @@
 | （参考）LASzip | 22.219 |
 
 効いたのは予測式ではなく**文脈の取り方**と**取得の物理モデル**である。
-ただし走査モデルの優位は一般ではない。11 ファイルで測ると採られたのは 3 件で、
+ただし走査モデルの優位は一般ではない。12 構成で測ると採られたのは 6 件で、
 幅は −18.9% から +71% まで開く（下記）。軸をまたぐ文脈（22.032）は全件で安定して効く。
 
 ### ALS の走査モデル
@@ -87,8 +87,8 @@
 |---|---|---|
 | ALS の走査角は時刻から決まる | 0 次で −24% | [als_scan_structure.md](results/als_scan_structure.md) |
 | 走査モデル符号器と、当てはめの誤り | 幾何 −8.9%（200万点） | [scan_model_fitting.md](results/scan_model_fitting.md) |
-| 走査モデルが勝つのは 11 件中 3 件 | 勝敗は退避した線の面外ビット長で決まる | [scan_model_fitting.md](results/scan_model_fitting.md) |
-| 標本選択は 9.3 倍速で +1.06% | 誤るのは 14 列中 X+Y+Z の 1 列だけ | [scan_model_fitting.md](results/scan_model_fitting.md) |
+| 走査モデルが勝つのは 12 構成中 6 件 | 勝敗は退避した線の面外ビット長で決まる | [scan_model_fitting.md](results/scan_model_fitting.md) |
+| 標本選択は 10.2 倍速で +1.05% | 誤るのは 14 列中 X+Y+Z の 1 列だけ | [scan_model_fitting.md](results/scan_model_fitting.md) |
 | 自前符号器が LAS/LAZ 非依存に | タイル全体 −31.5%、全列一致 | [pcc2_codec.md](results/pcc2_codec.md) |
 | 面を送って点を引き直す符号化 | 同じ面忠実度でオクトツリーの 4.0 倍 | [lossy_surface_finding.md](results/lossy_surface_finding.md) |
 | 歪み尺度の落とし穴 2 件 | Chamfer の下限は点密度だけで決まる | [lossy_surface_finding.md](results/lossy_surface_finding.md) |
