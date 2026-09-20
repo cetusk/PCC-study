@@ -13,8 +13,12 @@
   逆順      局所差分の大きさは不変で符号だけ反転。対称な符号器なら Δ≈0
   ランダム  完全置換（種を固定）
 
+鍵の強さも同時に出す。走査モデルの順序再構成は
+(point_source_id, gps_time) を鍵にするので、その鍵が一意でないファイルでは
+並べ替えがタイの解け方に依存し、不変性は崩れるはずである。
+
 使い方:
-    $PCCPY python/exp_order_pilot.py [開始点] [点数]
+    $PCCPY python/exp_order_pilot.py [入力] [開始点] [点数]
 """
 from __future__ import annotations
 import os
@@ -29,7 +33,6 @@ import laspy
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from baselines import tmc13_bits           # noqa: E402
 
-SRC = "data/raw/ahn4/31HZ1_20.LAZ"
 PCC = "./cpp/build/pccnorm"
 PRE = ("gps_time", "point_source_id", "bit_fields")
 SHOW = ("raw64", "range", "delta", "幾何v0", "幾何v1", "幾何v2", "幾何v3", "走査v1", "走査変換")
@@ -80,11 +83,15 @@ def run_pcc(path: str) -> dict:
 
 
 def main() -> None:
-    off = int(sys.argv[1]) if len(sys.argv) > 1 else 10_000_000
-    cnt = int(sys.argv[2]) if len(sys.argv) > 2 else 1_000_000
+    src = sys.argv[1] if len(sys.argv) > 1 else "data/raw/ahn4/31HZ1_20.LAZ"
+    off = int(sys.argv[2]) if len(sys.argv) > 2 else 10_000_000
+    cnt = int(sys.argv[3]) if len(sys.argv) > 3 else 1_000_000
 
-    with laspy.open(SRC) as fh:
+    with laspy.open(src) as fh:
         hdr = fh.header
+        total = hdr.point_count
+        if off + cnt > total:
+            off, cnt = 0, min(cnt, total)
         pts = fh.read_points(off + cnt)
     pts = pts[off:off + cnt]
     n = len(pts)
@@ -99,7 +106,15 @@ def main() -> None:
         "ランダム": rng.permutation(n),
     }
 
-    print(f"入力        {SRC}  点 {off}〜{off + cnt}（{n} 点）")
+    # 鍵の強さ。走査モデルは (point_source_id, gps_time) で順序を作り直す。
+    g = np.asarray(pts["gps_time"]).astype(np.float64)
+    sid = np.asarray(pts["point_source_id"]).astype(np.int64)
+    desc = int(np.sum((sid[1:] < sid[:-1]) | ((sid[1:] == sid[:-1]) & (g[1:] < g[:-1]))))
+    tie = int(np.sum((sid[1:] == sid[:-1]) & (g[1:] == g[:-1])))
+    print(f"入力        {src}  点 {off}〜{off + cnt}（{n} 点）")
+    print(f"鍵の強さ    降順隣接 {100 * desc / (n - 1):.3f}%  "
+          f"タイ隣接 {100 * tie / (n - 1):.3f}%  "
+          f"gps_time 定数 = {g.min() == g.max()}")
     print()
     tmp = Path(tempfile.mkdtemp())
     res = {}
