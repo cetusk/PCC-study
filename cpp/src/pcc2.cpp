@@ -1153,8 +1153,10 @@ std::vector<Stream> plan_streams(const Frame& f, bool joint_geom, std::string* l
             };
             add("gps_time"); add("point_source_id"); add(ret);
             // v2（z を中央値予測）と v3（z の文脈を面内・面外から作る）と v4 は
-            // 11 ファイルの実測でいずれも v1 に及ばなかったので既定では出さない。
-            // 分割の仕方を変えたら結論も変わりうるので、コードと再測の口は残す。
+            // 既定では出さない。ただし**その根拠だった集計は誤りだった**
+            // （results/scan_model_fitting.md 16・32 節）。v3 が v1 を上回るのは
+            // 1 件ではなく 2 件で、vegetation の 0.31% は誤差では片づかない。
+            // PCC_ALL_VARIANTS=1 で測り直して決め直すこと。
             std::vector<uint8_t> vars{1, 5};
             if (const char* e = getenv("PCC_ALL_VARIANTS"))
                 if (e[0] == '1') vars = {1, 2, 3, 4, 5};
