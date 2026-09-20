@@ -75,7 +75,10 @@ def main() -> None:
     dup, dlt = [], {k: [] for k, _ in COD}
     for f in files:
         bs = [b for b in blocks if fname(b) == f]
-        dk = next(r["dup_key"] for r in rows if fname(r["name"]) == f)
+        # ファイル内で鍵重複率は大きく振れる（AHN4 _21 は 14.6〜45.0%）。
+        # 先頭ブロックは系統的に低めに出るので中央値を使う。
+        dks = [next(r["dup_key"] for r in rows if r["name"] == b) for b in bs]
+        dk = float(np.median(dks))
         dup.append(dk)
         cells = []
         for key, _ in COD:
@@ -91,10 +94,11 @@ def main() -> None:
             dlt[key].append(m)
             rng = f"({min(per):+.1f}〜{max(per):+.1f})" if len(per) > 1 else "(—)"
             cells.append(f"{m:>+9.1f}% {rng:>11}")
-        print(f"{f:<13}{dk:>6.1f}%  " + "".join(cells))
+        dkl = f"{dk:.1f}" if len(dks) == 1 else f"{dk:.1f}({min(dks):.0f}〜{max(dks):.0f})"
+        print(f"{f:<13}{dkl:>13}%  " + "".join(cells))
     print()
 
-    print(f"=== 鍵の重複率との順位相関（独立ファイル単位、n = {len(files)}）===")
+    print(f"=== 鍵の重複率との順位相関（独立ファイル単位、鍵重複はファイル内中央値、n = {len(files)}）===")
     dup_a = np.asarray(dup, float)
     for label, keep in (("全 12 件", dup_a < 101), ("鍵重複 100% の 2 件を除く", dup_a < 100)):
         print(f"  [{label}]")
@@ -107,7 +111,27 @@ def main() -> None:
             r, p = spearmanr(dup_a[ok], v[ok])
             star = "  *p<0.05" if p < 0.05 else ""
             print(f"    {lab:<8} rho = {r:+.3f}  p = {p:.4f}  (n={int(ok.sum())}){star}")
+
+    bdup, bdlt = [], {k: [] for k, _ in COD}
+    for b in blocks:
+        bdup.append(next(r["dup_key"] for r in rows if r["name"] == b))
+        for key, _ in COD:
+            v = [delta(rows, b, c, key) for c in ("ランダム1", "ランダム2")]
+            v = [x for x in v if x is not None]
+            bdlt[key].append(float(np.mean(v)) if v else float("nan"))
+    print(f"  [ブロック単位 n = {len(blocks)}（同一ファイルの 3 ブロックは独立でない。参考値）]")
+    ba = np.asarray(bdup, float)
+    for key, lab in COD:
+        v = np.asarray(bdlt[key], float)
+        ok = ~np.isnan(v)
+        if np.ptp(v[ok]) == 0:
+            print(f"    {lab:<8} 定義されない（片方が定数）  (n={int(ok.sum())})")
+            continue
+        r, p = spearmanr(ba[ok], v[ok])
+        print(f"    {lab:<8} rho = {r:+.3f}  p = {p:.4f}  (n={int(ok.sum())})"
+              + ("  *p<0.05" if p < 0.05 else ""))
     print()
+
 
     print("=== 条件ごとの増分（全ブロック、恒等比 %）中央値 [第1四分位, 第3四分位] ===")
     print(f"{'条件':<10}" + "".join(f"{l:>22}" for _, l in COD))
@@ -119,6 +143,41 @@ def main() -> None:
         print(f"{c:<10}" + "".join(cells))
     print()
     print("  窓10000 は小さい 4 ブロック（1〜2.8 万点）では作れないので n が 4 少ない。")
+    print("=== 窓幅に対する単調性（ブロックごと、窓100 < 窓1000 < 窓10000 < ランダム）===")
+    for key, lab in COD:
+        mono = tot = 0
+        for b in blocks:
+            v = [delta(rows, b, c, key) for c in ("窓100", "窓1000", "窓10000", "ランダム1")]
+            if any(x is None for x in v):
+                continue
+            tot += 1
+            mono += all(v[i] < v[i + 1] for i in range(3))
+        note = "（値が定数なので厳密な単調増加は成立しない）" if lab == "G-PCC" else ""
+        print(f"  {lab:<8} {mono} / {tot}{note}")
+    print()
+
+    print("=== Morton の符号の割れ（ブロックごと）===")
+    for key, lab in COD:
+        d = [x for b in blocks if (x := delta(rows, b, "Morton", key)) is not None]
+        neg = [x for x in d if x < 0]
+        print(f"  {lab:<8} 負 {len(neg)} / {len(d)}" +
+              (f"  最小 {min(d):+.1f}%  最大 {max(d):+.1f}%" if d else ""))
+    print()
+
+    print("=== 走査v1 の増分が雑音の下限を超えるブロック ===")
+    floor = max(abs((delta(rows, b, "ランダム1", "scan1") or 0)
+                    - (delta(rows, b, "ランダム2", "scan1") or 0)) for b in blocks)
+    print(f"  雑音の下限（種違いの差の最大） {floor:.3f}%点")
+    over = []
+    for b in blocks:
+        v = [delta(rows, b, c, "scan1") for c in ("ランダム1", "ランダム2")]
+        m = float(np.mean([x for x in v if x is not None]))
+        if abs(m) > floor:
+            dk = next(r["dup_key"] for r in rows if r["name"] == b)
+            over.append((b, dk, m))
+    for b, dk, m in sorted(over, key=lambda x: -abs(x[2])):
+        print(f"    {b:<13} 鍵重複 {dk:>5.1f}%  Δ {m:+8.2f}%")
+    print(f"  {len(over)} / {len(blocks)} ブロック")
     print()
 
     n = 1_000_000

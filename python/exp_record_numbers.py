@@ -11,6 +11,7 @@
 from __future__ import annotations
 import math
 import re
+import sys
 from pathlib import Path
 import numpy as np
 from scipy.stats import spearmanr
@@ -130,70 +131,15 @@ def main() -> None:
         print(f"    採用率 {a:.3f}  当てはめの利得 {100 * (v1 - v5) / v1:+6.2f}%  {nm}")
     print()
 
-    # --- 30 節: 順序感度の相関（すべての標本の取り方）---
-    print("== 30 節: タイ率との順位相関 ==")
-    rows = []
-    for ln in Path("data/work/order_matrix.txt").read_text(encoding="utf-8").splitlines():
-        m = re.match(r"^(\S+(?: \S+)?)\s+(恒等|逆順|Morton|窓\d+|ランダム\d)\s+([\d.]+)%"
-                     r"\s+([\d.]+)\s+([\d.]+)\s+([\d.]+)\s+([\d.]+)\s+(ok|NG)\s*$", ln)
-        if m:
-            rows.append((m.group(1), m.group(2), float(m.group(3)),
-                         [float(m.group(i)) for i in (4, 5, 6, 7)]))
-    files = []
-    for r in rows:
-        if r[0] not in files:
-            files.append(r[0])
-    COD = ["G-PCC", "LAZ", "幾何v3", "走査v1"]
-    tie, dlt, rev = [], {c: [] for c in COD}, {c: [] for c in COD}
-    for nm in files:
-        b = next(r for r in rows if r[0] == nm and r[1] == "恒等")
-        rn = [r for r in rows if r[0] == nm and r[1].startswith("ランダム")]
-        rv = next(r for r in rows if r[0] == nm and r[1] == "逆順")
-        tie.append(b[2])
-        for i, c in enumerate(COD):
-            dlt[c].append(100 * (float(np.mean([x[3][i] for x in rn])) / b[3][i] - 1))
-            rev[c].append(100 * (rv[3][i] / b[3][i] - 1))
-    a = np.array(tie)
-    print(f"{'符号器':<9}{'n=12':>20}{'n=10（縮退2件除く）':>24}{'逆順補正 n=10':>20}")
-    for c in COD[1:]:
-        v, w = np.array(dlt[c]), np.array(rev[c])
-        m = a < 100
-        r1, p1 = spearmanr(a, v)
-        r2, p2 = spearmanr(a[m], v[m])
-        r3, p3 = spearmanr(a[m], v[m] - w[m])
-        print(f"{c:<9}{f'{r1:+.3f} (p={p1:.4f})':>20}{f'{r2:+.3f} (p={p2:.4f})':>24}"
-              f"{f'{r3:+.3f} (p={p3:.4f})':>20}")
-    print()
-    print("  逆順のファイル別の幅（この研究自身の雑音床）:")
-    for c in COD[1:]:
-        print(f"    {c:<8} 最小 {min(rev[c]):+.2f}%  最大 {max(rev[c]):+.2f}%")
-    print()
-    print("  窓幅の単調性（窓100 → 窓1000 → 窓10000 → ランダム1）:")
-    wc = ["窓100", "窓1000", "窓10000", "ランダム1"]
-    for i, c in enumerate(COD):
-        bad = []
-        for nm in files:
-            v = [next((r[3][i] for r in rows if r[0] == nm and r[1] == w), None) for w in wc]
-            if all(x is not None for x in v) and not all(v[j] <= v[j + 1] + 1e-9 for j in range(3)):
-                bad.append(nm)
-        print(f"    {c:<8} 単調なファイル {len(files) - len(bad)} / {len(files)}"
-              + (f"  反例: {', '.join(bad)}" if bad else ""))
-    print()
-    print("  条件ごとの中央値（恒等比 %）:")
-    conds2 = ["逆順", "Morton", "窓100", "窓1000", "窓10000", "ランダム1"]
-    print(f"    {'条件':<10}" + "".join(f"{c:>10}" for c in COD))
-    for cn in conds2:
-        out = []
-        for i, c in enumerate(COD):
-            ds = []
-            for nm in files:
-                b = next(r for r in rows if r[0] == nm and r[1] == "恒等")
-                x = next((r for r in rows if r[0] == nm and r[1] == cn), None)
-                if x and b[3][i]:
-                    ds.append(100 * (x[3][i] / b[3][i] - 1))
-            out.append(float(np.median(ds)) if ds else float("nan"))
-        print(f"    {cn:<10}" + "".join(f"{v:>9.1f}%" for v in out))
-
+    # --- 30 節 ---
+    # 30 節の導出値は exp_order_summary.py が正本である。ここで同じ計算を
+    # 持つと両方を直す羽目になり、実際に一度ずれた（型 D）。そちらを呼ぶ。
+    print("== 30 節: 順序感度 ==")
+    print("  exp_order_summary.py が正本（出力 data/work/order_summary.txt）。")
+    print("  ここでは行数と検証だけを確かめる。")
+    sys.path.insert(0, str(Path(__file__).parent))
+    from ordermatrix_io import read_matrix, check
+    print(check(read_matrix("data/work/order_matrix.txt")))
 
 if __name__ == "__main__":
     main()
