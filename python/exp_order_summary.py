@@ -59,13 +59,23 @@ def main() -> None:
     print(f"  ブロック {len(blocks)} / 独立ファイル {len(files)}")
     print()
 
-    print("=== 雑音の下限 — 種だけが違う 2 つのランダム置換の差 [%点] ===")
-    print("  逆順は構造のある処置なので雑音の推定には使えない。")
+    print("=== 雑音の下限 — 2 つの対照 [%点] ===")
+    print("  (a) 種だけが違う 2 つのランダム置換の差。同一処置内の種ゆらぎだけを測る。")
+    print("  (b) 逆順条件。Δ=0 が理想の、構造のある帰無処置。局所性を壊さない並べ替えで")
+    print("      どれだけ動くかを測るので、こちらが実際に効く下限である。")
+    print(f"  {'符号器':<8}{'(a) 中央値':>12}{'(a) 最大':>10}{'(b) 最小':>10}{'(b) 最大':>10}{'(b) |Δ|>(a)最大':>16}")
+    floors = {}
     for key, lab in COD:
         d = [abs((delta(rows, b, "ランダム1", key) or 0) - (delta(rows, b, "ランダム2", key) or 0))
              for b in blocks]
-        a = np.asarray(d, float)
-        print(f"  {lab:<8} 中央値 {np.median(a):.3f}  最大 {a.max():.3f}  (n={len(a)})")
+        rv = [x for b in blocks if (x := delta(rows, b, "逆順", key)) is not None]
+        a, rr = np.asarray(d, float), np.asarray(rv, float)
+        floors[key] = max(a.max(), np.abs(rr).max())
+        over = int((np.abs(rr) > a.max()).sum())
+        print(f"  {lab:<8}{np.median(a):>12.3f}{a.max():>10.3f}"
+              f"{rr.min():>+10.3f}{rr.max():>+10.3f}{f'{over}/{len(rr)}':>16}")
+    print("  実効下限（(a) 最大と |(b)| 最大の大きいほう）: "
+          + " / ".join(f"{lab} {floors[key]:.3f}" for key, lab in COD))
     print()
 
     print("=== ランダム置換 / 恒等（ファイルごと、%）===")
@@ -77,8 +87,13 @@ def main() -> None:
         bs = [b for b in blocks if fname(b) == f]
         # ファイル内で鍵重複率は大きく振れる（AHN4 _21 は 14.6〜45.0%）。
         # 先頭ブロックは系統的に低めに出るので中央値を使う。
+        # dup と Δ を別々に中央値にすると、どのブロックにも存在しない組になる
+        # （7 ファイル中 3 件でそうなっていた）。鍵重複が中央値のブロックを選び、
+        # そのブロックの Δ を対にする。
         dks = [next(r["dup_key"] for r in rows if r["name"] == b) for b in bs]
-        dk = float(np.median(dks))
+        rep_i = int(np.argsort(dks)[len(bs) // 2])
+        rep_b = bs[rep_i]
+        dk = dks[rep_i]
         dup.append(dk)
         cells = []
         for key, _ in COD:
@@ -90,7 +105,8 @@ def main() -> None:
                     per.append(float(np.mean(v)))
             if not per:
                 cells.append(f"{'—':>22}"); dlt[key].append(float("nan")); continue
-            m = float(np.median(per))
+            rv = [delta(rows, rep_b, c, key) for c in ("ランダム1", "ランダム2")]
+            m = float(np.mean([x for x in rv if x is not None]))
             dlt[key].append(m)
             rng = f"({min(per):+.1f}〜{max(per):+.1f})" if len(per) > 1 else "(—)"
             cells.append(f"{m:>+9.1f}% {rng:>11}")
@@ -110,7 +126,8 @@ def main() -> None:
                 continue
             r, p = spearmanr(dup_a[ok], v[ok])
             star = "  *p<0.05" if p < 0.05 else ""
-            print(f"    {lab:<8} rho = {r:+.3f}  p = {p:.4f}  (n={int(ok.sum())}){star}")
+            print(f"    {lab:<8} rho = {r:+.3f}  p = {p:.4f}  p×9 = {min(p * 9, 1):.3f}"
+                  f"  (n={int(ok.sum())}){star}")
 
     bdup, bdlt = [], {k: [] for k, _ in COD}
     for b in blocks:
@@ -127,9 +144,24 @@ def main() -> None:
         if np.ptp(v[ok]) == 0:
             print(f"    {lab:<8} 定義されない（片方が定数）  (n={int(ok.sum())})")
             continue
-        r, p = spearmanr(ba[ok], v[ok])
-        print(f"    {lab:<8} rho = {r:+.3f}  p = {p:.4f}  (n={int(ok.sum())})"
-              + ("  *p<0.05" if p < 0.05 else ""))
+        r, _ = spearmanr(ba[ok], v[ok])
+        print(f"    {lab:<8} rho = {r:+.3f}  (n={int(ok.sum())}) — p 値は出さない"
+              " （同一ファイルの 3 ブロックが独立でなく、検定の前提を満たさない）")
+    print()
+    print("  検定は 3 符号器 × 3 単位で 9 本ある。p×9 はボンフェローニ補正後の上限。")
+    print()
+    print("  [非縮退 10 件から 1 件ずつ抜いたとき（走査v1）]")
+    v = np.asarray(dlt["scan1"], float)
+    keep = dup_a < 100
+    fa, va = dup_a[keep], v[keep]
+    names = [f for f, k in zip(files, keep) if k]
+    r0, p0 = spearmanr(fa, va)
+    print(f"    全 10 件  rho = {r0:+.3f}  p = {p0:.4f}")
+    for i, nm in enumerate(names):
+        m = np.ones(len(names), bool); m[i] = False
+        rr, pp = spearmanr(fa[m], va[m])
+        mark = "  ← 有意でなくなる" if pp >= 0.05 else ""
+        print(f"    −{nm:<12} rho = {rr:+.3f}  p = {pp:.4f}{mark}")
     print()
 
 
@@ -164,10 +196,13 @@ def main() -> None:
               (f"  最小 {min(d):+.1f}%  最大 {max(d):+.1f}%" if d else ""))
     print()
 
-    print("=== 走査v1 の増分が雑音の下限を超えるブロック ===")
-    floor = max(abs((delta(rows, b, "ランダム1", "scan1") or 0)
-                    - (delta(rows, b, "ランダム2", "scan1") or 0)) for b in blocks)
-    print(f"  雑音の下限（種違いの差の最大） {floor:.3f}%点")
+    print("=== 走査v1 の増分が実効下限を超えるブロック ===")
+    seed = max(abs((delta(rows, b, "ランダム1", "scan1") or 0)
+                   - (delta(rows, b, "ランダム2", "scan1") or 0)) for b in blocks)
+    revm = max(abs(delta(rows, b, "逆順", "scan1")) for b in blocks)
+    floor = max(seed, revm)
+    print(f"  種違いの差の最大 {seed:.3f}%点、逆順の |Δ| 最大 {revm:.3f}%点 "
+          f"→ 実効下限 {floor:.3f}%点")
     over = []
     for b in blocks:
         v = [delta(rows, b, c, "scan1") for c in ("ランダム1", "ランダム2")]
