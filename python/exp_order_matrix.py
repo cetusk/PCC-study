@@ -38,6 +38,13 @@ from baselines import tmc13_bits           # noqa: E402
 
 PCC = "./cpp/build/pccnorm"
 BLOCK = 1_000_000
+# 大きいファイルから取る互いに素なブロックの数。ファイル内の分散を測るため。
+# 1 だと Δ がすべて標本数 1 になり、分散推定が付かない。
+NBLOCK = int(os.environ.get("PCC_NBLOCK", "3"))
+# 動作確認や再開のために、対象のファイルを名前で絞る（カンマ区切り）
+ONLY = [x for x in os.environ.get("PCC_ONLY", "").split(",") if x]
+# ブロックの一覧だけ出して止める（設計の確認用）
+DRY = os.environ.get("PCC_DRY", "") == "1"
 
 # 名前 | 入力 | 開始点（負なら中央付近を自動）
 FILES = [
@@ -168,20 +175,44 @@ def main() -> None:
                 if ln.startswith(nm):
                     done.add(nm)
 
-    tmp = Path(tempfile.mkdtemp())
+    # ブロックの一覧を先に作る。1 ファイルから互いに素なブロックを等間隔に取り、
+    # ファイル内の分散を測れるようにする。取れないファイルは 1 ブロックのまま。
+    blocks = []
     for name, path, off in FILES:
-        if name in done:
+        if ONLY and name not in ONLY:
             continue
         if not Path(path).is_file():
             say(f"{name:<13}  入力が無い: {path}")
             continue
         with laspy.open(path) as fh:
+            total = fh.header.point_count
+        nb = NBLOCK if total >= BLOCK * NBLOCK else 1
+        if nb == 1:
+            st = [max(0, total // 2 - BLOCK // 2) if off < 0 and total > BLOCK else 0]
+        else:
+            step = (total - BLOCK) // (nb - 1)
+            st = [i * step for i in range(nb)]
+        for bi, x in enumerate(st):
+            blocks.append((name if nb == 1 else f"{name}#{bi}", path, x))
+    say(f"ブロック {len(blocks)} 個（{sum(1 for b in blocks if '#' in b[0])} 個は"
+        f"大きいファイルから {NBLOCK} 分割）")
+    say()
+
+    if DRY:
+        for nm, pa, st in blocks:
+            say(f"  {nm:<14} 開始 {st:>10}  {pa}")
+        if dest is not sys.stdout:
+            dest.close()
+        return
+
+    tmp = Path(tempfile.mkdtemp())
+    for name, path, start in blocks:
+        if name in done:
+            continue
+        with laspy.open(path) as fh:
             hdr_src = fh.header
             sc, of = list(hdr_src.scales), list(hdr_src.offsets)
             total = hdr_src.point_count
-            start = max(0, total // 2 - BLOCK // 2) if off < 0 else off
-            if start + BLOCK > total:
-                start = 0
             pts = fh.read_points(start + min(BLOCK, total))
         pts = pts[start:start + BLOCK]
         n = len(pts)
