@@ -35,6 +35,9 @@ struct CodecCtx {
     mutable std::vector<int32_t> perm, pred;
     mutable int built_P = -1;
     bool ensure(size_t n, int P) const;           // 順序表と予測子表を作る（P ごとに 1 回）
+    // 報告する構成を往復検証に通すための指定。空なら通常どおり全候補を実測して選ぶ。
+    std::string force_geom;                       // X+Y+Z をこの候補名に固定する
+    bool fast_attr = false;                       // 属性列の候補を絞って時間を詰める
 };
 
 struct Stream {

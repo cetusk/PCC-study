@@ -63,6 +63,7 @@ int main(int argc, char** argv) {
             "  pccnorm surf <file> [--voxel V] [--eps E] [--nbits B] [--out P.ply]\n"
             "        面を符号化して点を引き直す方式と、点をそのまま送る方式の比較\n"
             "  pccnorm pack   <in> <out.pcc2> [--max-points N] [--split-geom]\n"
+            "                 [--force-geom <候補名>] [--fast-attr]\n"
             "        PCC2 コンテナへ符号化し、往復検証と 5 軸の計測を出す\n"
             "  pccnorm unpack <in.pcc2> [--las <out.laz>]   PCC2 を復号して中身を出す\n"
             "  pccnorm combine <orig.laz> <geom_decoded.ply> <geom_stream.bin> [--max-points N]\n"
@@ -77,6 +78,7 @@ int main(int argc, char** argv) {
         std::string outp = argv[3];
         size_t mp = 0, samp = 0;
         bool joint = true, do_norm = true, do_spatial = true, trace_all = false;
+        std::string force_geom; bool fast_attr = false;
         for (int i = 4; i < argc; ++i) {
             if (!strcmp(argv[i], "--max-points") && i + 1 < argc) mp = atol(argv[++i]);
             else if (!strcmp(argv[i], "--split-geom")) joint = false;
@@ -84,6 +86,8 @@ int main(int argc, char** argv) {
             else if (!strcmp(argv[i], "--no-spatial")) do_spatial = false;
             else if (!strcmp(argv[i], "--trace")) trace_all = true;
             else if (!strcmp(argv[i], "--sample-select") && i + 1 < argc) samp = atol(argv[++i]);
+            else if (!strcmp(argv[i], "--force-geom") && i + 1 < argc) force_geom = argv[++i];
+            else if (!strcmp(argv[i], "--fast-attr")) fast_attr = true;
         }
         std::string err;
         double t0 = now();
@@ -123,6 +127,8 @@ int main(int argc, char** argv) {
         CodecCtx ctx;
         std::vector<double> world;
         ctx.fr = &f;
+        ctx.force_geom = force_geom;
+        ctx.fast_attr = fast_attr;
         if (do_spatial) { frame_world(f, world); ctx.world = &world; }
 
         std::string log;
@@ -132,6 +138,8 @@ int main(int argc, char** argv) {
             Frame fs = truncate_frame(f, samp);
             CodecCtx sctx; std::vector<double> sworld;
             sctx.fr = &fs;
+            sctx.force_geom = force_geom;
+            sctx.fast_attr = fast_attr;
             if (do_spatial) { frame_world(fs, sworld); sctx.world = &sworld; }
             auto sel = plan_streams(fs, joint, &log, &sctx, trace_all);
             for (auto& s0 : sel) {

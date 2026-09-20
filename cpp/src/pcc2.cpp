@@ -1074,6 +1074,12 @@ std::vector<Stream> plan_streams(const Frame& f, bool joint_geom, std::string* l
     std::vector<Cand> cand_attr = cand;
     if (ctx && ctx->world)
         for (uint8_t P : {1, 3, 5}) cand_attr.push_back({C_ATTR_SPATIAL, {P}});
+    // 順序の実験では幾何だけが関心で、属性の候補掃引が時間の大半を占める。
+    // 絞っても往復検証は全列に掛かるので、検証の強さは落ちない。
+    if (ctx && ctx->fast_attr) {
+        cand = {{C_RANGE_DELTA, {}}, {C_RANGE_CTX, {}}};
+        cand_attr = cand;
+    }
 
     std::string tr;
     std::string* trp = trace_all ? &tr : nullptr;
@@ -1153,6 +1159,17 @@ std::vector<Stream> plan_streams(const Frame& f, bool joint_geom, std::string* l
             for (uint8_t v : vars) {
                 std::vector<uint8_t> q = pv; q[0] = v;
                 gc.push_back({C_GEOM_SCAN, q});
+            }
+        }
+        if (ctx && !ctx->force_geom.empty()) {
+            std::vector<Cand> only;
+            for (const auto& c : gc)
+                if (cand_name(c.codec, c.param) == ctx->force_geom) only.push_back(c);
+            if (only.empty()) {
+                if (log) *log += "  （--force-geom " + ctx->force_geom +
+                                 " はこの入力では候補にならない）\n";
+            } else {
+                gc.swap(only);
             }
         }
         emit(best_stream(f, g, gc, ctx, trp));
