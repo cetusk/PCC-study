@@ -164,7 +164,8 @@ def main() -> None:
     say()
     hdr = (f"{'データ':<13}{'条件':<10}{'点数':>9}{'鍵重複':>7}{'重複点':>7}"
            f"{'G-PCC':>9}{'LAZ幾何':>9}{'幾何v3':>9}{'走査v1':>9}{'全列計':>9}"
-           f"{'Genc':>7}{'Gdec':>7}{'GpkMB':>8}{'Penc':>7}{'Pdec':>7}{'PpkMB':>8}{'検証':>5}")
+           f"{'Genc':>7}{'Gdec':>7}{'GpkMB':>8}{'Lenc':>7}{'Ldec':>7}"
+           f"{'Penc':>7}{'Pdec':>7}{'PpkMB':>8}{'検証':>5}")
     say(hdr)
     say("-" * len(hdr))
 
@@ -200,6 +201,9 @@ def main() -> None:
             blocks.append((name if nb == 1 else f"{name}#{bi}", path, x))
     say(f"ブロック {len(blocks)} 個（{sum(1 for b in blocks if '#' in b[0])} 個は"
         f"大きいファイルから {NBLOCK} 分割）")
+    say("Genc/Gdec/GpkMB は G-PCC、Lenc/Ldec は幾何のみの LAZ、"
+        "Penc/Pdec/PpkMB は PCC2（2 候補の最大）。")
+    say("LAZ は laspy がこのプロセス内で動くのでピークを分離できない。")
     say()
 
     if DRY:
@@ -276,6 +280,7 @@ def main() -> None:
                 f"{gb:>9.3f}{lz:>9.3f}{vals[0]:>9.3f}{vals[1]:>9.3f}"
                 f"{rs[FORCE[0]]['total']:>9.3f}"
                 f"{gp.enc_s:>7.1f}{gp.dec_s:>7.1f}{gp.peak_mb:>8.0f}"
+                f"{lz_enc:>7.1f}{lz_dec:>7.1f}"
                 f"{max(r['enc'] for r in rs.values()):>7.1f}"
                 f"{max(r['dec'] for r in rs.values()):>7.1f}{max(pk):>8.0f}"
                 f"{'ok' if ver else 'NG':>5}")

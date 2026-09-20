@@ -11,7 +11,8 @@ from pathlib import Path
 
 COND = ("恒等", "逆順", "Morton", "ランダム1", "ランダム2")
 FIELDS = ("cond", "n", "dup_key", "dup_pt", "gpcc", "laz", "geom3", "scan1",
-          "total", "genc", "gdec", "gpeak", "penc", "pdec", "ppeak", "ver")
+          "total", "genc", "gdec", "gpeak", "lenc", "ldec",
+          "penc", "pdec", "ppeak", "ver")
 
 
 def read_matrix(path: str | Path) -> list[dict]:
@@ -29,10 +30,11 @@ def read_matrix(path: str | Path) -> list[dict]:
         try:
             r = {"name": name, "file": name.split("#")[0], "cond": f[0],
                  "n": int(f[1]), "dup_key": float(f[2].rstrip("%")), "dup_pt": int(f[3]),
-                 "ver": f[15]}
+                 "ver": f[17]}
             for k, i in (("gpcc", 4), ("laz", 5), ("geom3", 6), ("scan1", 7),
                          ("total", 8), ("genc", 9), ("gdec", 10), ("gpeak", 11),
-                         ("penc", 12), ("pdec", 13), ("ppeak", 14)):
+                         ("lenc", 12), ("ldec", 13),
+                         ("penc", 14), ("pdec", 15), ("ppeak", 16)):
                 r[k] = float(f[i])
         except ValueError:
             continue
