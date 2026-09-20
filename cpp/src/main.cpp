@@ -63,7 +63,7 @@ int main(int argc, char** argv) {
             "  pccnorm surf <file> [--voxel V] [--eps E] [--nbits B] [--out P.ply]\n"
             "        面を符号化して点を引き直す方式と、点をそのまま送る方式の比較\n"
             "  pccnorm pack   <in> <out.pcc2> [--max-points N] [--split-geom]\n"
-            "                 [--force-geom <候補名>] [--fast-attr]\n"
+            "                 [--force-geom <候補名>] [--fast-attr] [--no-fallback]\n"
             "        PCC2 コンテナへ符号化し、往復検証と 5 軸の計測を出す\n"
             "  pccnorm unpack <in.pcc2> [--las <out.laz>]   PCC2 を復号して中身を出す\n"
             "  pccnorm combine <orig.laz> <geom_decoded.ply> <geom_stream.bin> [--max-points N]\n"
@@ -78,7 +78,7 @@ int main(int argc, char** argv) {
         std::string outp = argv[3];
         size_t mp = 0, samp = 0;
         bool joint = true, do_norm = true, do_spatial = true, trace_all = false;
-        std::string force_geom; bool fast_attr = false;
+        std::string force_geom; bool fast_attr = false, no_fallback = false;
         for (int i = 4; i < argc; ++i) {
             if (!strcmp(argv[i], "--max-points") && i + 1 < argc) mp = atol(argv[++i]);
             else if (!strcmp(argv[i], "--split-geom")) joint = false;
@@ -88,6 +88,7 @@ int main(int argc, char** argv) {
             else if (!strcmp(argv[i], "--sample-select") && i + 1 < argc) samp = atol(argv[++i]);
             else if (!strcmp(argv[i], "--force-geom") && i + 1 < argc) force_geom = argv[++i];
             else if (!strcmp(argv[i], "--fast-attr")) fast_attr = true;
+            else if (!strcmp(argv[i], "--no-fallback")) no_fallback = true;
         }
         std::string err;
         double t0 = now();
@@ -165,7 +166,9 @@ int main(int argc, char** argv) {
         // 「決して悪化しない」という運用上の保証だけを取り戻す。
         Frame fe;
         bool used_embed = false;
-        if (!basep.empty() && base_bytes) {
+        // 測定では退避路を切る。落ちると検証の対象が埋め込んだ器になり、
+        // 報告している符号器の値と検証対象が食い違う。
+        if (!no_fallback && !basep.empty() && base_bytes) {
             std::vector<uint8_t> lz(base_bytes);
             FILE* lf = fopen(basep.c_str(), "rb");
             bool got = lf && fread(lz.data(), 1, base_bytes, lf) == base_bytes;

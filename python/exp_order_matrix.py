@@ -57,6 +57,16 @@ FORCE = ("幾何v3", "走査v1")
 
 
 def morton3(a: np.ndarray) -> np.ndarray:
+    """21 bit ずつ 3 軸を交互に並べた Morton 符号。
+
+    座標を各軸の範囲で 21 bit に正規化してから詰める。生の値をマスクすると
+    範囲が 2^21 を超える軸（例: simple1_4 は X 2.25 億 / Y 9.9 億）で
+    上位が黙って捨てられ、空間局所性と無関係な並びになる。
+    """
+    b = a - a.min(0)
+    r = np.maximum(b.max(0), 1)
+    a = ((b.astype(np.float64) * ((1 << 21) - 1)) / r).astype(np.int64)
+
     def spread(v):
         v = v.astype(np.uint64) & np.uint64((1 << 21) - 1)
         v = (v | (v << np.uint64(32))) & np.uint64(0x1F00000000FFFF)
@@ -65,8 +75,7 @@ def morton3(a: np.ndarray) -> np.ndarray:
         v = (v | (v << np.uint64(4)))  & np.uint64(0x10C30C30C30C30C3)
         v = (v | (v << np.uint64(2)))  & np.uint64(0x1249249249249249)
         return v
-    b = a - a.min(0)
-    return spread(b[:, 0]) | (spread(b[:, 1]) << np.uint64(1)) | (spread(b[:, 2]) << np.uint64(2))
+    return spread(a[:, 0]) | (spread(a[:, 1]) << np.uint64(1)) | (spread(a[:, 2]) << np.uint64(2))
 
 
 def block_shuffle(n: int, w: int, rng) -> np.ndarray:
@@ -86,7 +95,8 @@ def run_pcc(path: str, force: str) -> dict:
         r = subprocess.run([PCC, "pack", path, os.path.join(d, "o.pcc2"),
                             "--force-geom", force, "--fast-attr"],
                            capture_output=True, text=True, env=env)
-    out = {"bpp": float("nan"), "ok": None, "det": None, "avail": True, "sel": None}
+    out = {"bpp": float("nan"), "ok": None, "det": None, "avail": True,
+           "sel": None, "emb": False}
     for ln in r.stdout.splitlines():
         if "候補にならない" in ln:
             out["avail"] = False
@@ -97,6 +107,8 @@ def run_pcc(path: str, force: str) -> dict:
             out["ok"] = "true" in ln
         if "決定性" in ln:
             out["det"] = "バイト一致" in ln
+        if ln.startswith("中身") and "包んだ" in ln:
+            out["emb"] = True
     if out["sel"] != force:
         out["avail"] = False
     return out
@@ -178,7 +190,9 @@ def main() -> None:
             gb = gp.bytes * 8.0 / n if gp.bytes else float("nan")
             rs = {f: run_pcc(str(p), f) for f in FORCE}
             p.unlink()
-            ver = all(r["ok"] and r["det"] for r in rs.values() if r["avail"])
+            # 退避路に落ちた行は、検証の対象が符号器ではないので失格にする
+            ver = all(r["ok"] and r["det"] and not r["emb"]
+                      for r in rs.values() if r["avail"])
             ver = ver and (gp.lossless is not False)
             vals = []
             for f in FORCE:
