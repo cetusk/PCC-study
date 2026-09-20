@@ -33,7 +33,51 @@ class Result:
 
 
 def _peak_mb() -> float:
+    """この python 自身のピーク。子プロセスの測定には使えない（run_peak を使う）。"""
     return resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024.0
+
+
+def run_peak(cmd, env=None):
+    """子プロセスを走らせ、その子だけのピーク常駐メモリ［MB］と所要［秒］を返す。
+
+    `getrusage(RUSAGE_SELF)` は呼び出し側の python を測るので外部符号器の
+    ピークにはならない。`RUSAGE_CHILDREN` は終了した全ての子の最大値が
+    累積するので 1 回分を取り出せない。fork して `os.wait4` を使うと
+    その子の rusage だけが得られる。
+
+    返り値: (終了コード, 標準出力, 標準エラー, 所要秒, ピーク MB)
+    """
+    import select
+    ro, wo = os.pipe()
+    re_, we = os.pipe()
+    t = time.perf_counter()
+    pid = os.fork()
+    if pid == 0:
+        os.close(ro); os.close(re_)
+        os.dup2(wo, 1); os.dup2(we, 2)
+        os.close(wo); os.close(we)
+        try:
+            os.execvpe(cmd[0], cmd, env or os.environ)
+        except Exception:
+            pass
+        os._exit(127)
+    os.close(wo); os.close(we)
+    out, err, fds = b"", b"", [ro, re_]
+    while fds:
+        r, _, _ = select.select(fds, [], [])
+        for fd in r:
+            b = os.read(fd, 65536)
+            if not b:
+                fds.remove(fd); os.close(fd); continue
+            if fd == ro:
+                out += b
+            else:
+                err += b
+    _, status, ru = os.wait4(pid, 0)
+    dt = time.perf_counter() - t
+    return (os.waitstatus_to_exitcode(status),
+            out.decode("utf-8", "replace"), err.decode("utf-8", "replace"),
+            dt, ru.ru_maxrss / 1024.0)
 
 
 # ---------------------------------------------------------------- 汎用圧縮器
@@ -179,19 +223,19 @@ def tmc13_bits(xyz_int: np.ndarray, tmpdir: str | None = None,
                 "--inferredDirectCodingMode=1", "--neighbourAvailBoundaryLog2=8",
                 "--intra_pred_max_node_size_log2=6", "--planarEnabled=1",
                 "--maxNumQtBtBeforeOt=4", "--minQtbtSizeLog2=0"] + (extra or [])
-        t = time.perf_counter(); e = subprocess.run(base, capture_output=True, text=True); enc = time.perf_counter() - t
-        if e.returncode != 0 or not bs.exists():
+        rc, so, se, enc, peak_e = run_peak(base)
+        if rc != 0 or not bs.exists():
             return Result("G-PCC/TMC13", n, 0, 0, 0, 0, None,
-                          note="ENC FAIL: " + (e.stderr or e.stdout)[-200:].replace("\n", " "))
-        t = time.perf_counter()
+                          note="ENC FAIL: " + (se or so)[-200:].replace("\n", " "))
         dcmd = [TMC3, "--mode=1", f"--compressedStreamPath={bs}",
                 f"--reconstructedDataPath={rec}", "--outputBinaryPly=1"]
-        dr = subprocess.run(dcmd, capture_output=True, text=True); dec = time.perf_counter() - t
+        drc, _, _, dec, peak_d = run_peak(dcmd)
+        peak = max(peak_e, peak_d)
         b = bs.stat().st_size
         ok = None
-        if dr.returncode == 0 and rec.exists():
+        if drc == 0 and rec.exists():
             ok = _ply_matches(rec, a)
-    return Result("G-PCC/TMC13 (geom, lossless)", n, b, enc, dec, _peak_mb(), lossless=ok)
+    return Result("G-PCC/TMC13 (geom, lossless)", n, b, enc, dec, peak, lossless=ok)
 
 
 def _ply_matches(path: Path, ref: np.ndarray) -> bool:

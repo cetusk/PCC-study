@@ -28,6 +28,7 @@ import re
 import subprocess
 import sys
 import tempfile
+import time
 from pathlib import Path
 import numpy as np
 import laspy
@@ -87,6 +88,27 @@ def block_shuffle(n: int, w: int, rng) -> np.ndarray:
     return idx
 
 
+def laz_geom_bpp(xyz: np.ndarray, scale, offset) -> tuple[float, bool, float, float]:
+    """幾何のみの LAZ。属性を含めると他の 3 列（幾何のみ）と比較できない。"""
+    n = len(xyz)
+    with tempfile.TemporaryDirectory() as d:
+        p = Path(d) / "g.laz"
+        hdr = laspy.LasHeader(version="1.4", point_format=6)
+        hdr.scales, hdr.offsets = scale, offset
+        las = laspy.LasData(hdr)
+        las.X, las.Y, las.Z = xyz[:, 0], xyz[:, 1], xyz[:, 2]
+        t0 = time.perf_counter(); las.write(str(p)); enc = time.perf_counter() - t0
+        b = p.stat().st_size
+        t0 = time.perf_counter()
+        with laspy.open(str(p)) as fh:
+            back = fh.read()
+        dec = time.perf_counter() - t0
+        ok = bool(np.array_equal(np.asarray(back.X), xyz[:, 0]) and
+                  np.array_equal(np.asarray(back.Y), xyz[:, 1]) and
+                  np.array_equal(np.asarray(back.Z), xyz[:, 2]))
+    return b * 8.0 / n, ok, enc, dec
+
+
 def run_pcc(path: str, force: str) -> dict:
     env = dict(os.environ)
     env["LD_LIBRARY_PATH"] = (os.path.expanduser("~/tools/laszip-install/lib") + ":"
@@ -96,7 +118,8 @@ def run_pcc(path: str, force: str) -> dict:
                             "--force-geom", force, "--fast-attr", "--no-fallback"],
                            capture_output=True, text=True, env=env)
     out = {"bpp": float("nan"), "ok": None, "det": None, "avail": True,
-           "sel": None, "emb": False}
+           "sel": None, "emb": False, "enc": float("nan"), "dec": float("nan"),
+           "peak": float("nan"), "total": float("nan")}
     for ln in r.stdout.splitlines():
         if "候補にならない" in ln:
             out["avail"] = False
@@ -109,6 +132,13 @@ def run_pcc(path: str, force: str) -> dict:
             out["det"] = "バイト一致" in ln
         if ln.startswith("中身") and "包んだ" in ln:
             out["emb"] = True
+        m = re.match(r"^PCC2\s+[\d.]+ MB\s+([\d.]+) bpp", ln)
+        if m:
+            out["total"] = float(m.group(1))       # 容器込みの全列合計（幾何ストリームとの差が固定費）
+        m = re.search(r"enc ([\d.]+)s / dec ([\d.]+)s .*ピーク ([\d.]+) GB", ln)
+        if m:
+            out["enc"] = float(m.group(1)); out["dec"] = float(m.group(2))
+            out["peak"] = float(m.group(3)) * 1024.0
     if out["sel"] != force:
         out["avail"] = False
     return out
@@ -125,8 +155,9 @@ def main() -> None:
     say("PCC2 の値は --force-geom で候補を固定し、--no-fallback で退避路を切って測る。")
     say("退避路に落ちた行は検証の対象が符号器でないので NG にする。")
     say()
-    hdr = (f"{'データ':<13}{'条件':<12}{'タイ率':>7}{'G-PCC':>9}{'LAZ':>9}"
-           f"{'幾何v3':>9}{'走査v1':>9}{'検証':>6}")
+    hdr = (f"{'データ':<13}{'条件':<10}{'点数':>9}{'鍵重複':>7}{'重複点':>7}"
+           f"{'G-PCC':>9}{'LAZ幾何':>9}{'幾何v3':>9}{'走査v1':>9}{'全列計':>9}"
+           f"{'Genc':>7}{'Gdec':>7}{'GpkMB':>8}{'Penc':>7}{'Pdec':>7}{'PpkMB':>8}{'検証':>5}")
     say(hdr)
     say("-" * len(hdr))
 
@@ -146,6 +177,7 @@ def main() -> None:
             continue
         with laspy.open(path) as fh:
             hdr_src = fh.header
+            sc, of = list(hdr_src.scales), list(hdr_src.offsets)
             total = hdr_src.point_count
             start = max(0, total // 2 - BLOCK // 2) if off < 0 else off
             if start + BLOCK > total:
@@ -157,13 +189,17 @@ def main() -> None:
                         np.asarray(pts["Z"])], 1).astype(np.int64)
         g = np.asarray(pts["gps_time"]).astype(np.float64)
         sid = np.asarray(pts["point_source_id"]).astype(np.int64)
-        tie = 100.0 * np.sum((sid[1:] == sid[:-1]) & (g[1:] == g[:-1])) / max(1, n - 1)
+        # 走査モデルが実際に見るのは鍵の重複率である。隣接同値率ではない。
+        key = np.stack([sid.astype(np.float64), g], 1)
+        dup_key = 100.0 * (1.0 - len(np.unique(key, axis=0)) / n)
+        dup_pt = int(n - len(np.unique(xyz, axis=0)))   # 重複点の数（可逆判定の前提）
 
         rng = np.random.default_rng(20260920)
         conds = [("恒等", np.arange(n)), ("逆順", np.arange(n)[::-1].copy()),
                  ("Morton", np.argsort(morton3(xyz), kind="stable"))]
         for w in (100, 1000, 10000):
-            if w < n:
+            # w が n に近いと完全ランダムと区別できず、単調性を見かけ上強める。
+            if w * 10 <= n:
                 conds.append((f"窓{w}", block_shuffle(n, w, rng)))
         conds.append(("ランダム1", rng.permutation(n)))
         conds.append(("ランダム2", rng.permutation(n)))
@@ -187,7 +223,7 @@ def main() -> None:
             las = laspy.LasData(h2)
             las.points = pts[idx].copy()
             las.write(str(p))
-            lz = p.stat().st_size * 8.0 / n
+            lz, lzok, lz_enc, lz_dec = laz_geom_bpp(xyz[idx], sc, of)
             gp = tmc13_bits(xyz[idx])
             gb = gp.bytes * 8.0 / n if gp.bytes else float("nan")
             rs = {f: run_pcc(str(p), f) for f in FORCE}
@@ -199,8 +235,15 @@ def main() -> None:
             vals = []
             for f in FORCE:
                 vals.append(rs[f]["bpp"] if rs[f]["avail"] else float("nan"))
-            say(f"{name:<13}{cname:<12}{tie:>6.1f}%{gb:>9.3f}{lz:>9.3f}"
-                f"{vals[0]:>9.3f}{vals[1]:>9.3f}{'ok' if ver else 'NG':>6}")
+            pk = [rs[f]["peak"] for f in FORCE]
+            ver = ver and lzok
+            say(f"{name:<13}{cname:<10}{n:>9}{dup_key:>6.1f}%{dup_pt:>7}"
+                f"{gb:>9.3f}{lz:>9.3f}{vals[0]:>9.3f}{vals[1]:>9.3f}"
+                f"{rs[FORCE[0]]['total']:>9.3f}"
+                f"{gp.enc_s:>7.1f}{gp.dec_s:>7.1f}{gp.peak_mb:>8.0f}"
+                f"{max(r['enc'] for r in rs.values()):>7.1f}"
+                f"{max(r['dec'] for r in rs.values()):>7.1f}{max(pk):>8.0f}"
+                f"{'ok' if ver else 'NG':>5}")
         say()
     if dest is not sys.stdout:
         dest.close()
