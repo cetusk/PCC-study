@@ -34,7 +34,12 @@ def delta(rows: list[dict], block: str, cond: str, key: str) -> float | None:
     """恒等順を基準にした増分 [%]。"""
     b = next((r for r in rows if r["name"] == block and r["cond"] == "恒等"), None)
     x = next((r for r in rows if r["name"] == block and r["cond"] == cond), None)
-    if not b or not x or not b[key]:
+    if not b or not x:
+        return None
+    # nan は真なので `not b[key]` では落ちない。鍵を持たない入力（KITTI/TLS）は
+    # 走査列が nan なので、ここで落とさないと中央値も相関も全部 nan になる。
+    import math
+    if not b[key] or math.isnan(b[key]) or math.isnan(x[key]):
         return None
     return 100.0 * (x[key] / b[key] - 1.0)
 
@@ -66,10 +71,12 @@ def main() -> None:
     print(f"  {'符号器':<8}{'(a) 中央値':>12}{'(a) 最大':>10}{'(b) 最小':>10}{'(b) 最大':>10}{'(b) |Δ|>(a)最大':>16}")
     floors = {}
     for key, lab in COD:
-        d = [abs((delta(rows, b, "ランダム1", key) or 0) - (delta(rows, b, "ランダム2", key) or 0))
-             for b in blocks]
+        d = [abs(u - v) for b in blocks
+             if (u := delta(rows, b, "ランダム1", key)) is not None
+             and (v := delta(rows, b, "ランダム2", key)) is not None]
         rv = [x for b in blocks if (x := delta(rows, b, "逆順", key)) is not None]
-        a, rr = np.asarray(d, float), np.asarray(rv, float)
+        a = np.asarray(d, float) if d else np.zeros(1)
+        rr = np.asarray(rv, float) if rv else np.zeros(1)
         floors[key] = max(a.max(), np.abs(rr).max())
         over = int((np.abs(rr) > a.max()).sum())
         print(f"  {lab:<8}{np.median(a):>12.3f}{a.max():>10.3f}"
@@ -197,9 +204,12 @@ def main() -> None:
     print()
 
     print("=== 走査v1 の増分が実効下限を超えるブロック ===")
-    seed = max(abs((delta(rows, b, "ランダム1", "scan1") or 0)
-                   - (delta(rows, b, "ランダム2", "scan1") or 0)) for b in blocks)
-    revm = max(abs(delta(rows, b, "逆順", "scan1")) for b in blocks)
+    seed = max((abs(u - v) for b in blocks
+                if (u := delta(rows, b, "ランダム1", "scan1")) is not None
+                and (v := delta(rows, b, "ランダム2", "scan1")) is not None),
+               default=0.0)
+    revm = max((abs(x) for b in blocks
+                if (x := delta(rows, b, "逆順", "scan1")) is not None), default=0.0)
     floor = max(seed, revm)
     print(f"  種違いの差の最大 {seed:.3f}%点、逆順の |Δ| 最大 {revm:.3f}%点 "
           f"→ 実効下限 {floor:.3f}%点")
