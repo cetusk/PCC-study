@@ -123,7 +123,11 @@ def main() -> None:
 
     print(f"=== 鍵の重複率との順位相関（独立ファイル単位、鍵重複はファイル内中央値、n = {len(files)}）===")
     dup_a = np.asarray(dup, float)
-    for label, keep in (("全 12 件", dup_a < 101), ("鍵重複 100% の 2 件を除く", dup_a < 100)):
+    nall = int(np.sum(dup_a < 101))
+    ndeg = int(np.sum(dup_a >= 100))
+    for label, keep in ((f"鍵のある全 {nall} 件", dup_a < 101),
+                        (f"鍵重複 100% の {ndeg} 件を除く（残り {nall - ndeg} 件）",
+                         dup_a < 100)):
         print(f"  [{label}]")
         for key, lab in COD:
             v = np.asarray(dlt[key], float)
@@ -158,13 +162,13 @@ def main() -> None:
     print()
     print("  検定は 3 符号器 × 3 単位で 9 本ある。p×9 はボンフェローニ補正後の上限。")
     print()
-    print("  [非縮退 10 件から 1 件ずつ抜いたとき（走査v1）]")
+    print(f"  [非縮退 {nall - ndeg} 件から 1 件ずつ抜いたとき（走査v1）]")
     v = np.asarray(dlt["scan1"], float)
     keep = dup_a < 100
     fa, va = dup_a[keep], v[keep]
     names = [f for f, k in zip(files, keep) if k]
     r0, p0 = spearmanr(fa, va)
-    print(f"    全 10 件  rho = {r0:+.3f}  p = {p0:.4f}")
+    print(f"    全 {len(names)} 件  rho = {r0:+.3f}  p = {p0:.4f}")
     for i, nm in enumerate(names):
         m = np.ones(len(names), bool); m[i] = False
         rr, pp = spearmanr(fa[m], va[m])
