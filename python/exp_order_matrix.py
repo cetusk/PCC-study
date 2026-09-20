@@ -278,13 +278,15 @@ def main() -> None:
     # 途中で落ちたときの再開。出力の 1 列目（13 文字）がブロックの名前なので、
     # そこを見る。ファイル名で照合するとブロック名（"AHN4 _20#0"）と
     # 一致せず、全部やり直しになる。
-    done = set()
+    # 1 行でも出ていれば完了と見なすと、8 条件のうち 3 条件で落ちたブロックが
+    # 再開時に丸ごと飛ばされ、残りは二度と生成されない。条件数で判定する。
+    seen = {}
     if len(sys.argv) > 2 and Path(sys.argv[2]).is_file():
         names = {nm for nm, _, _, _ in FILES}
         for ln in Path(sys.argv[2]).read_text(encoding="utf-8").splitlines():
             lab = ln[:13].strip()
             if lab and (lab in names or lab.split("#")[0] in names):
-                done.add(lab)
+                seen[lab] = seen.get(lab, 0) + 1
 
     # ブロックの一覧を先に作る。1 ファイルから互いに素なブロックを等間隔に取り、
     # ファイル内の分散を測れるようにする。取れないファイルは 1 ブロックのまま。
@@ -303,23 +305,32 @@ def main() -> None:
             step = (total - BLOCK) // (nb - 1)
             st = [i * step for i in range(nb)]
         for bi, x in enumerate(st):
-            blocks.append((name if nb == 1 else f"{name}#{bi}", path, x, kind))
+            nb_pts = min(BLOCK, total - x)
+            # 恒等・逆順・Morton・ランダム×2 に、作れる窓を足したものが期待条件数
+            nexp = 5 + sum(1 for w in (100, 1000, 10000) if w * 10 <= nb_pts)
+            blocks.append((name if nb == 1 else f"{name}#{bi}", path, x, kind, nexp))
     say(f"ブロック {len(blocks)} 個（{sum(1 for b in blocks if '#' in b[0])} 個は"
         f"大きいファイルから {NBLOCK} 分割）")
     say("Genc/Gdec/GpkMB は G-PCC、Lenc/Ldec は幾何のみの LAZ、"
-        "Penc/Pdec/PpkMB は PCC2（2 候補の最大）。")
+        "Penc/Pdec/PpkMB は PCC2（las は 2 候補の最大、鍵の無い入力は 1 候補）。")
+    say("鍵の無い入力（KITTI/TLS）は走査列が nan。全列は属性が全部定数なので"
+        "幾何＋容器の固定費しか含まず、las 行と横断比較できない。")
     say("LAZ は laspy がこのプロセス内で動くのでピークを分離できない。")
     say()
 
+    done = {nm for nm, _, _, _, nexp in blocks if seen.get(nm, 0) >= nexp}
+    if seen and len(done) < len(seen):
+        say(f"途中で切れたブロックを測り直す: "
+            f"{sorted(set(seen) - done)}")
     if DRY:
-        for nm, pa, st, kd in blocks:
-            say(f"  {nm:<14} {kd:<6} 開始 {st:>10}  {pa}")
+        for nm, pa, st, kd, nexp in blocks:
+            say(f"  {nm:<14} {kd:<6} 開始 {st:>10}  条件 {nexp}  {pa}")
         if dest is not sys.stdout:
             dest.close()
         return
 
     tmp = Path(tempfile.mkdtemp())
-    for name, path, start, kind in blocks:
+    for name, path, start, kind, nexp in blocks:
         if name in done:
             continue
         xyz, g, sid, sc, of, pts, hdr_src = read_block(kind, path, start, BLOCK)

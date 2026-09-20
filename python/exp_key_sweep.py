@@ -110,6 +110,7 @@ def dither(sid: np.ndarray, gq: np.ndarray, q: float) -> np.ndarray:
     したところ gps_time の桁（約 5e5、ulp 5.8e-11）より小さくなり、
     中間水準でまったく効いていなかった。
     """
+    dither.stuck, dither.headroom = 0, float("inf")
     if q <= 0:
         return gq.copy()
     key = np.stack([sid.astype(np.float64), gq], 1)

@@ -49,6 +49,9 @@ def check(rows: list[dict]) -> str:
     for r in rows:
         if r["name"] not in files:
             files.append(r["name"])
+    from collections import Counter
+    dupc = Counter(r["name"] + "/" + r["cond"] for r in rows)
+    dups = [k for k, c in dupc.items() if c > 1]
     ng = [r["name"] + "/" + r["cond"] for r in rows if r["ver"] != "ok"]
     miss = []
     for nm in files:
@@ -60,4 +63,5 @@ def check(rows: list[dict]) -> str:
     out = [f"行 {len(rows)} / ブロック {len(files)}"]
     out.append(f"検証 NG {len(ng)} 件" + (f": {ng[:5]}" if ng else ""))
     out.append(f"条件が欠けているブロック {len(miss)} 件" + (f": {miss[:3]}" if miss else ""))
+    out.append(f"重複している行 {len(dups)} 件" + (f": {dups[:5]}" if dups else ""))
     return "\n".join("  " + x for x in out)

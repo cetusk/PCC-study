@@ -147,7 +147,8 @@ def main() -> None:
     ba = np.asarray(bdup, float)
     for key, lab in COD:
         v = np.asarray(bdlt[key], float)
-        ok = ~np.isnan(v)
+        # 鍵を持たない入力は dup_key も nan。Δ 側だけ見ると nan が残って rho が nan になる。
+        ok = (~np.isnan(v)) & (~np.isnan(ba))
         if np.ptp(v[ok]) == 0:
             print(f"    {lab:<8} 定義されない（片方が定数）  (n={int(ok.sum())})")
             continue
@@ -213,16 +214,20 @@ def main() -> None:
     floor = max(seed, revm)
     print(f"  種違いの差の最大 {seed:.3f}%点、逆順の |Δ| 最大 {revm:.3f}%点 "
           f"→ 実効下限 {floor:.3f}%点")
-    over = []
+    over, meas = [], 0
     for b in blocks:
-        v = [delta(rows, b, c, "scan1") for c in ("ランダム1", "ランダム2")]
-        m = float(np.mean([x for x in v if x is not None]))
+        v = [x for c in ("ランダム1", "ランダム2")
+             if (x := delta(rows, b, c, "scan1")) is not None]
+        if not v:
+            continue          # 走査列が無いブロックは分母にも入れない
+        meas += 1
+        m = float(np.mean(v))
         if abs(m) > floor:
             dk = next(r["dup_key"] for r in rows if r["name"] == b)
             over.append((b, dk, m))
     for b, dk, m in sorted(over, key=lambda x: -abs(x[2])):
         print(f"    {b:<13} 鍵重複 {dk:>5.1f}%  Δ {m:+8.2f}%")
-    print(f"  {len(over)} / {len(blocks)} ブロック")
+    print(f"  {len(over)} / {meas} ブロック（走査列が測れたブロックのみ）")
     print()
 
     n = 1_000_000
