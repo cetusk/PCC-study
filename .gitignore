@@ -20,6 +20,7 @@ __pycache__/
 /paper/*
 !/paper/pcc.pdf
 !/paper/coding.pdf
+!/paper/order.pdf
 
 # ---- 符号化の出力
 *.pcc2
