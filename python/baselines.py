@@ -238,6 +238,65 @@ def tmc13_bits(xyz_int: np.ndarray, tmpdir: str | None = None,
     return Result("G-PCC/TMC13 (geom, lossless)", n, b, enc, dec, peak, lossless=ok)
 
 
+def tmc13_decode_order(xyz_int: np.ndarray, tmpdir: str | None = None,
+                       extra: list[str] | None = None) -> np.ndarray | None:
+    """G-PCC が復号時に点を出す順序を返す。
+
+    返り値 `r` は入力添字ごとの出力位置（`r[i]` = 入力の i 番目が出力の何番目か）。
+    多重集合として一致することは検査済みなので、両方を lexsort して突き合わせる。
+    同一座標の点は区別できないが、区別しても置換の費用は変わらない。
+    """
+    n = len(xyz_int)
+    a = (xyz_int - xyz_int.min(0)).astype(np.int64)
+    with tempfile.TemporaryDirectory(dir=tmpdir) as d:
+        d = Path(d)
+        ply, bs, rec = d / "in.ply", d / "o.bin", d / "rec.ply"
+        with open(ply, "wb") as f:
+            f.write(f"ply\nformat binary_little_endian 1.0\nelement vertex {n}\n"
+                    "property float x\nproperty float y\nproperty float z\n"
+                    "end_header\n".encode())
+            f.write(np.ascontiguousarray(a.astype(np.float32)).tobytes())
+        base = [TMC3, "--mode=0", f"--uncompressedDataPath={ply}",
+                f"--compressedStreamPath={bs}", "--trisoupNodeSizeLog2=0",
+                "--mergeDuplicatedPoints=0",
+                "--inferredDirectCodingMode=1", "--neighbourAvailBoundaryLog2=8",
+                "--intra_pred_max_node_size_log2=6", "--planarEnabled=1",
+                "--maxNumQtBtBeforeOt=4", "--minQtbtSizeLog2=0"] + (extra or [])
+        if run_peak(base)[0] != 0 or not bs.exists():
+            return None
+        dcmd = [TMC3, "--mode=1", f"--compressedStreamPath={bs}",
+                f"--reconstructedDataPath={rec}", "--outputBinaryPly=1"]
+        if run_peak(dcmd)[0] != 0 or not rec.exists():
+            return None
+        got = _ply_points(rec)
+    if got is None or len(got) != n:
+        return None
+    si = np.lexsort(a.T)            # 入力を整列させる添字
+    sd = np.lexsort(got.T)          # 出力を整列させる添字
+    out_of_in = np.empty(n, dtype=np.int64)
+    out_of_in[si] = sd              # 整列後に同じ位置に来るもの同士が対応する
+    return out_of_in
+
+
+def _ply_points(path: Path) -> np.ndarray | None:
+    """binary PLY の頂点を出力順のまま整数で返す。"""
+    with open(path, "rb") as f:
+        head = b""
+        while b"end_header" not in head:
+            head += f.readline()
+        cnt = int([l for l in head.split(b"\n")
+                   if l.startswith(b"element vertex")][0].split()[-1])
+        raw = f.read()
+    itemsize = len(raw) // cnt if cnt else 0
+    dt = {12: np.float32, 24: np.float64}.get(itemsize)
+    if dt is None:
+        return None
+    v = np.frombuffer(raw, dtype=dt).reshape(-1, 3)
+    if not np.all(v == np.rint(v)):
+        return None
+    return np.rint(v).astype(np.int64)
+
+
 def _ply_matches(path: Path, ref: np.ndarray) -> bool:
     with open(path, "rb") as f:
         head = b""

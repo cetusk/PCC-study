@@ -17,6 +17,7 @@ import numpy as np
 
 sys.path.insert(0, str(Path(__file__).parent))
 from exp_order_matrix import FILES, BLOCK, NBLOCK, morton3, read_block, total_points
+from baselines import tmc13_decode_order
 
 
 def perm_bits(n: int) -> float:
@@ -48,38 +49,50 @@ def encode_perm(rank: np.ndarray) -> float:
 def main() -> None:
     print("取得順の置換を符号化したときの費用")
     print("多重集合符号器を系列可逆にするために送る必要のある量。")
-    print("基準順は Morton 順（オクツリーが自然に出す順）。")
+    print("基準順は G-PCC の実際の復号出力順（Morton 順とは別物なので参考に併記）。")
     print()
-    print(f"{'ブロック':<14}{'点数':>9}{'log2(n!)/n':>12}{'取得順':>10}"
-          f"{'一様乱数':>10}{'取得順/上界':>12}")
+    print(f"{'ブロック':<14}{'点数':>9}{'log2(n!)/n':>12}{'実出力順':>10}"
+          f"{'Morton':>9}{'一様乱数':>10}{'実/上界':>9}")
     rows = []
     for name, path, off, kind in FILES:
         if not (Path(path).is_file() or (kind == "kitti" and Path(path).is_dir())):
             continue
         total = total_points(kind, path)
+        # 本測定と同じ位置を読む（式を写すのではなく同じ形で書く）
         nb = NBLOCK if total >= BLOCK * NBLOCK else 1
-        st = [0] if nb == 1 else [i * ((total - BLOCK) // (nb - 1)) for i in range(nb)]
+        if nb == 1:
+            st = [max(0, total // 2 - BLOCK // 2) if off < 0 and total > BLOCK else 0]
+        else:
+            step = (total - BLOCK) // (nb - 1)
+            st = [i * step for i in range(nb)]
         for bi, start in enumerate(st):
             xyz, *_ = read_block(kind, path, start, BLOCK)
             n = len(xyz)
             ub = perm_bits(n)
-            # Morton 順に並べたときの、各点の取得順での位置
-            order = np.argsort(morton3(xyz), kind="stable")
-            rank = np.empty(n, dtype=np.int64)
-            rank[order] = np.arange(n)
-            got = encode_perm(rank)
-            rng = np.random.default_rng(20260920)
-            ctl = encode_perm(rng.permutation(n))
             lab = name if nb == 1 else f"{name}#{bi}"
-            print(f"{lab:<14}{n:>9}{ub:>12.3f}{got:>10.3f}{ctl:>10.3f}"
-                  f"{100 * got / ub:>11.1f}%", flush=True)
-            rows.append((lab, n, ub, got, ctl))
+            # Morton 順は「オクツリーが自然に出す順」の近似にすぎず、
+            # 実際の TMC13 の出力順とは一致しない（実測で一致率 0.0%）。
+            order = np.argsort(morton3(xyz), kind="stable")
+            mrank = np.empty(n, dtype=np.int64)
+            mrank[order] = np.arange(n)
+            mgot = encode_perm(mrank)
+            real = tmc13_decode_order(xyz)
+            got = encode_perm(real) if real is not None else float("nan")
+            # 対照の種はブロックごとに変える（同じだと n が同じ行が全部同値になる）
+            rng = np.random.default_rng(20260920 + len(rows))
+            ctl = encode_perm(rng.permutation(n))
+            print(f"{lab:<14}{n:>9}{ub:>12.3f}{got:>10.3f}{mgot:>9.3f}{ctl:>10.3f}"
+                  f"{100 * got / ub:>8.1f}%", flush=True)
+            rows.append((lab, n, ub, got, ctl, mgot))
     if rows:
         print()
-        a = np.array([[r[2], r[3], r[4]] for r in rows])
-        print(f"中央値: 上界 {np.median(a[:, 0]):.3f} / 取得順 {np.median(a[:, 1]):.3f}"
-              f" / 一様乱数 {np.median(a[:, 2]):.3f} bit/点")
-        print(f"取得順は上界の {np.median(a[:, 1] / a[:, 0]) * 100:.1f}%（中央値）")
+        a = np.array([[r[2], r[3], r[4], r[5]] for r in rows])
+        print(f"中央値: 上界 {np.median(a[:, 0]):.3f} / 実出力順 {np.median(a[:, 1]):.3f}"
+              f" / Morton {np.median(a[:, 3]):.3f} / 一様乱数 {np.median(a[:, 2]):.3f} bit/点")
+        print(f"実出力順は上界の {np.median(a[:, 1] / a[:, 0]) * 100:.1f}%（中央値）")
+        print("一様乱数が上界を上回るのは、この符号化経路（階差＋varint＋LZMA）の")
+        print("非効率であって置換の性質ではない。実出力順の値も同じ緩さを含むので、")
+        print("『達成できる下限』ではなく『この符号器が達成した上界』である。")
 
 
 if __name__ == "__main__":

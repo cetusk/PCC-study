@@ -101,7 +101,8 @@ def run_pcc(path: str, force: str) -> dict:
     return out
 
 
-def dither(sid: np.ndarray, gq: np.ndarray, q: float) -> np.ndarray:
+def dither(sid: np.ndarray, gq: np.ndarray, q: float,
+           mode: str = "storage", seed: int = 20260920) -> np.ndarray:
     """量子化幅はそのままに、鍵の単射性だけを回復する。
 
     同じ (psid, gq) を持つ群の中で、点に群内の連番 × eps を足す。
@@ -115,7 +116,12 @@ def dither(sid: np.ndarray, gq: np.ndarray, q: float) -> np.ndarray:
         return gq.copy()
     key = np.stack([sid.astype(np.float64), gq], 1)
     _, inv = np.unique(key, axis=0, return_inverse=True)
-    order = np.lexsort((np.arange(len(inv)), inv))
+    # mode="storage" は群内順位を格納順に取る。これは単射性を戻すだけでなく
+    # 「取得順と整合した鍵」を配るので、恒等順の bpp まで下げてしまう。
+    # mode="random" は群内順位を乱数に取り、単射性だけを戻す対照になる。
+    tie = (np.arange(len(inv)) if mode == "storage"
+           else np.random.default_rng(seed).permutation(len(inv)))
+    order = np.lexsort((tie, inv))
     grp = inv[order]
     idx = np.arange(len(grp))
     start = np.r_[True, grp[1:] != grp[:-1]]
@@ -164,7 +170,9 @@ def measure(pts, gq, orders, hdr, tmp) -> tuple[dict, bool]:
 def main() -> None:
     print("鍵の縮退を制御して掃引する")
     print("入力順は恒等に固定し、gps_time の量子化だけで鍵の重複率を作る。")
-    print("ディザ条件は同じ量子化幅のまま鍵の単射性だけを戻したもの。")
+    print("ディザは同じ量子化幅のまま鍵の単射性を戻す。群内順位の取り方を 2 通り")
+    print("置く: 格納順（取得順と整合）と乱数（単射性だけ）。Δ が両方 0 に落ちれば")
+    print("『Δ の原因は単射性』が言える。恒等 bpp は順位の取り方で動くので使わない。")
     print()
     tmp = Path(tempfile.mkdtemp())
     for label, src in FILES:
@@ -195,8 +203,10 @@ def main() -> None:
             gq0, q, actual = quantize_for(sid, g0, target)
             variants = [("量子化", gq0, actual, 0)]
             if target > 0:
-                gd = dither(sid, gq0, q)
-                variants.append(("ディザ", gd, dup_rate(sid, gd), dither.stuck))
+                gd = dither(sid, gq0, q, "storage")
+                variants.append(("ディザ格納", gd, dup_rate(sid, gd), dither.stuck))
+                gr = dither(sid, gq0, q, "random")
+                variants.append(("ディザ乱数", gr, dup_rate(sid, gr), dither.stuck))
             for vname, gq, rate, stuck in variants:
                 vals, allok = measure(pts, gq, orders, hdr, tmp)
                 b3 = vals[("恒等", "幾何v3")]
@@ -209,7 +219,8 @@ def main() -> None:
                       f"{stuck:>8}{'ok' if allok else 'NG':>6}", flush=True)
         print()
     print("Δ = ランダム置換 / 恒等 の増分。逆順Δ は同じ基準での逆順の増分（引かない）。")
-    print("ディザは量子化幅を変えずに鍵の単射性だけを戻した条件。")
+    print("恒等 bpp は群内順位の取り方に依存するので、水準間で比べてはいけない。")
+    print("比べてよいのは Δ の列だけである。")
 
 
 if __name__ == "__main__":
