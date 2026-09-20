@@ -39,7 +39,15 @@ SHOW = ("raw64", "range", "delta", "幾何v0", "幾何v1", "幾何v2", "幾何v3
 
 
 def morton3(a: np.ndarray) -> np.ndarray:
-    """21 bit ずつ 3 軸を交互に並べた Morton 符号。"""
+    """21 bit ずつ 3 軸を交互に並べた Morton 符号。
+
+    座標を各軸の範囲で 21 bit に正規化してから詰める。生の値をマスクすると
+    範囲が 2^21 を超える軸で上位が黙って捨てられ、空間局所性と無関係な並びになる。
+    """
+    b = a - a.min(0)
+    r = np.maximum(b.max(0), 1)
+    a = ((b.astype(np.float64) * ((1 << 21) - 1)) / r).astype(np.int64)
+
     def spread(v):
         v = v.astype(np.uint64) & np.uint64((1 << 21) - 1)
         v = (v | (v << np.uint64(32))) & np.uint64(0x1F00000000FFFF)
@@ -48,8 +56,7 @@ def morton3(a: np.ndarray) -> np.ndarray:
         v = (v | (v << np.uint64(4)))  & np.uint64(0x10C30C30C30C30C3)
         v = (v | (v << np.uint64(2)))  & np.uint64(0x1249249249249249)
         return v
-    b = a - a.min(0)
-    return spread(b[:, 0]) | (spread(b[:, 1]) << np.uint64(1)) | (spread(b[:, 2]) << np.uint64(2))
+    return spread(a[:, 0]) | (spread(a[:, 1]) << np.uint64(1)) | (spread(a[:, 2]) << np.uint64(2))
 
 
 def run_pcc(path: str) -> dict:
