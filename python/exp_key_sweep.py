@@ -12,7 +12,15 @@ x 軸が制御変数になるので、それらの問題が消え、因果を直
       鍵の重複率 0 / 10 / 25 / 50 / 75 / 100% を人工的に作る。
 
 条件: 各水準で 恒等 / 逆順 / ランダム置換。
-指標: Δ補正 = Δ(ランダム) − Δ(逆順)。逆順はその水準での雑音床である。
+指標: **生の Δ = ランダム置換 / 恒等 の増分**。当初は逆順を雑音床として
+      引いていたが、逆順は `stable_sort` のタイを決定的に逆向きに解く
+      構造化された処置であり雑音ではない（36 節）。逆順は別条件として併記する。
+
+ディザ条件: 量子化は鍵の単射性と走査モデルの時間解像度を同時に壊すので、
+      「鍵だけを壊した」ことにならない。同じ量子化幅のまま、群内の点に
+      量子化幅の 100 万分の 1 の連番を足して**単射性だけを回復**した条件を
+      併せて測る。恒等の bpp が量子化前に戻るなら漂移は時間解像度の劣化であり、
+      Δ(ランダム) が 0 に落ちるなら「単射性が原因」が交絡なしで示せる。
 
 事前に決めたこと（走らせる前に書く）:
   予測 — 走査v1 の Δ補正 は重複率とともに増え、100% で幾何v3 に一致する。
@@ -92,9 +100,65 @@ def run_pcc(path: str, force: str) -> dict:
     return out
 
 
+def dither(sid: np.ndarray, gq: np.ndarray, q: float) -> np.ndarray:
+    """量子化幅はそのままに、鍵の単射性だけを回復する。
+
+    同じ (psid, gq) を持つ群の中で、点に群内の連番 × eps を足す。
+    eps は「1 群が量子化幅を跨がない最大」に取る（q / (最大群サイズ + 2)）。
+    小さすぎると float64 の ulp に埋もれて効かない。実際、当初 q*1e-6 に
+    したところ gps_time の桁（約 5e5、ulp 5.8e-11）より小さくなり、
+    中間水準でまったく効いていなかった。
+    """
+    if q <= 0:
+        return gq.copy()
+    key = np.stack([sid.astype(np.float64), gq], 1)
+    _, inv = np.unique(key, axis=0, return_inverse=True)
+    order = np.lexsort((np.arange(len(inv)), inv))
+    grp = inv[order]
+    idx = np.arange(len(grp))
+    start = np.r_[True, grp[1:] != grp[:-1]]
+    rank = np.empty(len(inv), dtype=np.int64)
+    rank[order] = idx - np.maximum.accumulate(np.where(start, idx, 0))
+    eps = q / (rank.max() + 2)
+    ulp = float(np.spacing(np.abs(gq).max()))
+    if eps < ulp * 4:
+        # 量子化幅が ulp に近すぎて、群を分けるだけの余地が無い
+        return gq.copy()
+    return gq + rank * eps
+
+
+def measure(pts, gq, orders, hdr, tmp) -> tuple[dict, bool]:
+    """与えた gps_time で、各順序・各符号器の bpp を測る。"""
+    vals, allok = {}, True
+    for cond, idx in orders.items():
+        p = tmp / "x.laz"
+        h2 = laspy.LasHeader(version=hdr.version, point_format=hdr.point_format)
+        for v in hdr.vlrs:
+            tn = type(v).__name__
+            if tn.startswith("ExtraBytes") or tn.startswith("Copc"):
+                continue
+            try:
+                v.record_data_bytes()
+            except Exception:
+                continue
+            h2.vlrs.append(v)
+        h2.scales, h2.offsets = hdr.scales, hdr.offsets
+        las = laspy.LasData(h2)
+        las.points = pts[idx].copy()
+        las.gps_time = gq[idx]
+        las.write(str(p))
+        for f in FORCE:
+            r = run_pcc(str(p), f)
+            vals[(cond, f)] = r["bpp"]
+            allok = allok and bool(r["ok"]) and bool(r["det"]) and r["sel"] == f
+        p.unlink()
+    return vals, allok
+
+
 def main() -> None:
     print("鍵の縮退を制御して掃引する")
     print("入力順は恒等に固定し、gps_time の量子化だけで鍵の重複率を作る。")
+    print("ディザ条件は同じ量子化幅のまま鍵の単射性だけを戻したもの。")
     print()
     tmp = Path(tempfile.mkdtemp())
     for label, src in FILES:
@@ -111,47 +175,30 @@ def main() -> None:
         g0 = np.asarray(pts["gps_time"]).astype(np.float64)
         sid = np.asarray(pts["point_source_id"]).astype(np.int64)
         print(f"### {label}  {n} 点  元の鍵の重複率 {dup_rate(sid, g0):.1f}%")
-        print(f"{'目標':>6}{'実際':>8}{'量子化幅':>13}"
-              + "".join(f"{c:>26}" for c in FORCE) + f"{'検証':>6}")
+        print(f"{'目標':>6}{'条件':>8}{'重複率':>8}{'群サイズ':>10}{'量子化幅':>12}"
+              f"{'幾何v3':>9}{'走査v1':>9}{'走査v1 Δ':>10}{'逆順Δ':>9}{'検証':>6}")
         rng = np.random.default_rng(20260920)
         orders = {"恒等": np.arange(n), "逆順": np.arange(n)[::-1].copy(),
                   "ランダム": rng.permutation(n)}
         for target in TARGETS:
-            gq, q, actual = quantize_for(sid, g0, target)
-            vals, allok = {}, True
-            for cond, idx in orders.items():
-                p = tmp / "x.laz"
-                h2 = laspy.LasHeader(version=hdr.version, point_format=hdr.point_format)
-                for v in hdr.vlrs:
-                    tn = type(v).__name__
-                    if tn.startswith("ExtraBytes") or tn.startswith("Copc"):
-                        continue
-                    try:
-                        v.record_data_bytes()
-                    except Exception:
-                        continue
-                    h2.vlrs.append(v)
-                h2.scales, h2.offsets = hdr.scales, hdr.offsets
-                las = laspy.LasData(h2)
-                las.points = pts[idx].copy()
-                las.gps_time = gq[idx]
-                las.write(str(p))
-                for f in FORCE:
-                    r = run_pcc(str(p), f)
-                    vals[(cond, f)] = r["bpp"]
-                    allok = allok and bool(r["ok"]) and bool(r["det"]) and r["sel"] == f
-                p.unlink()
-            cell = []
-            for f in FORCE:
-                b, rv, rd = vals[("恒等", f)], vals[("逆順", f)], vals[("ランダム", f)]
-                d_rand = 100 * (rd / b - 1)
-                d_rev = 100 * (rv / b - 1)
-                cell.append(f"{b:8.3f} Δ{d_rand:+6.1f} 補正{d_rand - d_rev:+6.1f}")
-            print(f"{target:>5.0f}%{actual:>7.1f}%{q:>13.3e}"
-                  + "".join(f"{c:>26}" for c in cell)
-                  + f"{'ok' if allok else 'NG':>6}")
+            gq0, q, actual = quantize_for(sid, g0, target)
+            variants = [("量子化", gq0, actual)]
+            if target > 0:
+                gd = dither(sid, gq0, q)
+                variants.append(("ディザ", gd, dup_rate(sid, gd)))
+            for vname, gq, rate in variants:
+                vals, allok = measure(pts, gq, orders, hdr, tmp)
+                b3 = vals[("恒等", "幾何v3")]
+                b1 = vals[("恒等", "走査v1")]
+                d = 100 * (vals[("ランダム", "走査v1")] / b1 - 1)
+                dr = 100 * (vals[("逆順", "走査v1")] / b1 - 1)
+                grp = 1.0 / max(1e-9, 1.0 - rate / 100.0)
+                print(f"{target:>5.0f}%{vname:>8}{rate:>7.1f}%{grp:>10.1f}{q:>12.2e}"
+                      f"{b3:>9.3f}{b1:>9.3f}{d:>9.1f}%{dr:>8.1f}%"
+                      f"{'ok' if allok else 'NG':>6}", flush=True)
         print()
-    print("Δ = ランダム / 恒等 の増分、補正 = Δ − 逆順の Δ（その水準の雑音床を引く）")
+    print("Δ = ランダム置換 / 恒等 の増分。逆順Δ は同じ基準での逆順の増分（引かない）。")
+    print("ディザは量子化幅を変えずに鍵の単射性だけを戻した条件。")
 
 
 if __name__ == "__main__":
