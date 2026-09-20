@@ -168,12 +168,16 @@ def main() -> None:
     say(hdr)
     say("-" * len(hdr))
 
+    # 途中で落ちたときの再開。出力の 1 列目（13 文字）がブロックの名前なので、
+    # そこを見る。ファイル名で照合するとブロック名（"AHN4 _20#0"）と
+    # 一致せず、全部やり直しになる。
     done = set()
     if len(sys.argv) > 2 and Path(sys.argv[2]).is_file():
+        names = {nm for nm, _, _ in FILES}
         for ln in Path(sys.argv[2]).read_text(encoding="utf-8").splitlines():
-            for nm, _, _ in FILES:
-                if ln.startswith(nm):
-                    done.add(nm)
+            lab = ln[:13].strip()
+            if lab and (lab in names or lab.split("#")[0] in names):
+                done.add(lab)
 
     # ブロックの一覧を先に作る。1 ファイルから互いに素なブロックを等間隔に取り、
     # ファイル内の分散を測れるようにする。取れないファイルは 1 ブロックのまま。
