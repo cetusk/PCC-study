@@ -109,6 +109,27 @@ def main() -> None:
         print(f"  副列の実測増分 = {(p3 - p0):+.2f} bpp")
     print()
 
+    # --- 17・21 節: 少数点の順序から読んだ法則の検定 ---
+    print("== 17・21 節: 順序から読んだ法則の検定 ==")
+    # 17 節: 面外（退避）と 対幾何v3
+    d17 = [("AHN4 _21", 1.93, -12.5), ("AHN4 2000万", 2.06, -2.9),
+           ("autzen-2023", 2.36, -18.9), ("AHN4 _20", 2.18, 2.2),
+           ("workshop", 4.76, 17.4), ("AHN5", 6.52, 1.3), ("AHN3", 19.31, 71.4)]
+    r, pv = spearmanr([a for _, a, _ in d17], [b for _, _, b in d17])
+    print(f"  17 節 面外 対 幾何v3 比      rho={r:+.3f}  p={pv:.4f}  n={len(d17)}")
+    # 21 節: 採用率と (走査v1 − 走査変換)/走査v1
+    d21 = [("AHN4 _21", .528, 18.488, 19.566), ("AHN4 2000万", .520, 21.817, 23.048),
+           ("AHN4 _20", .477, 22.940, 24.133), ("AHN5", .035, 25.614, 25.540),
+           ("autzen-2023", .027, 20.874, 20.849), ("AHN3", .025, 22.491, 22.436),
+           ("workshop", .009, 26.702, 26.671)]
+    r, pv = spearmanr([a for _, a, _, _ in d21],
+                      [100 * (v1 - v5) / v1 for _, _, v1, v5 in d21])
+    print(f"  21 節 採用率 対 当てはめの利得 rho={r:+.3f}  p={pv:.4f}  n={len(d21)}")
+    print("  21 節の 2 群の分離:")
+    for nm, a, v1, v5 in sorted(d21, key=lambda t: -t[1]):
+        print(f"    採用率 {a:.3f}  当てはめの利得 {100 * (v1 - v5) / v1:+6.2f}%  {nm}")
+    print()
+
     # --- 30 節: 順序感度の相関（すべての標本の取り方）---
     print("== 30 節: タイ率との順位相関 ==")
     rows = []
@@ -146,6 +167,17 @@ def main() -> None:
     print("  逆順のファイル別の幅（この研究自身の雑音床）:")
     for c in COD[1:]:
         print(f"    {c:<8} 最小 {min(rev[c]):+.2f}%  最大 {max(rev[c]):+.2f}%")
+    print()
+    print("  窓幅の単調性（窓100 → 窓1000 → 窓10000 → ランダム1）:")
+    wc = ["窓100", "窓1000", "窓10000", "ランダム1"]
+    for i, c in enumerate(COD):
+        bad = []
+        for nm in files:
+            v = [next((r[3][i] for r in rows if r[0] == nm and r[1] == w), None) for w in wc]
+            if all(x is not None for x in v) and not all(v[j] <= v[j + 1] + 1e-9 for j in range(3)):
+                bad.append(nm)
+        print(f"    {c:<8} 単調なファイル {len(files) - len(bad)} / {len(files)}"
+              + (f"  反例: {', '.join(bad)}" if bad else ""))
     print()
     print("  条件ごとの中央値（恒等比 %）:")
     conds2 = ["逆順", "Morton", "窓100", "窓1000", "窓10000", "ランダム1"]
