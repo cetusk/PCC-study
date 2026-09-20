@@ -331,7 +331,8 @@ static void dec_resid(const uint8_t* data, size_t len, size_t n, size_t nc,
 // 裏付けは results/als_scan_structure.md、設計は notes/03_scan_model_codec.md。
 //
 // 復号器が先に持っているもの: point_source_id, gps_time, bit_fields（戻り番号）。
-// そこから走査順（psid と gps の安定ソート）と掃引の切れ目（時刻の隙間 200 ulp）が
+// そこから走査順（psid と gps の安定ソート）と掃引の切れ目（時刻の隙間。しきい値は
+// 発射間隔の中央値の 20 倍で、gps_time から測る）が
 // 再現できるので、順序と区切りには副情報が要らない。
 // 1 掃引に 2 台のスキャナが混ざる場合だけ、どちらの走査線かの標識を送る。
 
