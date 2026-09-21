@@ -2255,23 +2255,32 @@ std::vector<Stream> plan_streams(const Frame& f, bool joint_geom, std::string* l
 
     // 色 3 列が揃っていれば、可逆色変換つきの同時符号化を候補に加える。
     // 色の脱相関と空間予測は独立に効き、重ねると掛け算になる（実測 6.430 対 11.179）。
-    bool color_done = false;
+    // 色 3 列は、可逆色変換つきで**まとめて**符号化したほうが短いことがある。
+    // ただし 3 列を汎用の経路から外すと、参照残差の相手を選ぶ自由が失われる。
+    // **どちらが短いかは測って決める。**まとめた 1 本と、汎用の経路が出す 3 本の
+    // 合計を比べ、短いほうを出す。まとめた側が長ければ何も失わない。
+    //
+    // 以前は「world があるとき」だけこの節に入っていたが、通常の経路は world を
+    // 遅延構築にするので world は空のままで、**この候補は一度も出ていなかった**。
+    // 代わりに節ごと有効にすると、汎用の経路から 3 列を外すことになり、
+    // 15 件中 6 件で伸びた（AHN5 _20 +1.9%、simple1_4 +2.8%）。
     std::vector<std::string> rgb{"red", "green", "blue"};
     size_t s_joint = (size_t)-1;
-    std::vector<size_t> s_chain;
-    if (ctx && ctx->world) {
+    std::vector<size_t> s_rgb, s_chain;
+    if (want_spatial) {
         bool all = true;
         for (const auto& c : rgb) {
             const ColSpec* sp = f.spec(c);
             if (!sp || sp->storage != Storage::Raw || !f.get(c)) all = false;
         }
         if (all) {
-            // 候補 1: 3 列まとめて可逆色変換 + 空間予測
             std::vector<Cand> cc;
             for (uint8_t P : SPS) cc.push_back({C_ATTR_COLOR, {P}});
             s_joint = defer(rgb, cc);
 
-            // 候補 2: blue → green → red の順に、直前の色を参照する鎖
+            // 3 つめの案: blue → green → red の順に、直前の色だけを参照する鎖。
+            // 汎用の経路は参照の相手を見積りで 2 本に絞るので、色どうしの鎖が
+            // そこに入らないことがある。fullwave がそれで、鎖のほうが 0.5% 短い。
             const char* ord[3] = {"blue", "green", "red"};
             for (int i = 0; i < 3; ++i) {
                 std::vector<Cand> cs = cand_attr;
@@ -2289,8 +2298,6 @@ std::vector<Stream> plan_streams(const Frame& f, bool joint_geom, std::string* l
                 }
                 s_chain.push_back(defer({ord[i]}, cs));
             }
-            color_done = true;
-            order.push_back((size_t)-1);       // ここで短いほうを採って出す
         }
     }
 
@@ -2302,7 +2309,6 @@ std::vector<Stream> plan_streams(const Frame& f, bool joint_geom, std::string* l
     auto skip_col = [&](const ColSpec& c) {
         if (joint_geom && c.role == Role::Geometry) return true;
         if (c.storage == Storage::Derived) return true;
-        if (color_done && (c.name == "red" || c.name == "green" || c.name == "blue")) return true;
         for (const auto& e : pre_done) if (e == c.name) return true;
         return false;
     };
@@ -2431,7 +2437,12 @@ std::vector<Stream> plan_streams(const Frame& f, bool joint_geom, std::string* l
                 }
             }
         }
-        order.push_back(defer({c.name}, cs));
+        {
+            size_t slot = defer({c.name}, cs);
+            order.push_back(slot);
+            if (c.name == "red" || c.name == "green" || c.name == "blue")
+                s_rgb.push_back(slot);
+        }
         emitted.push_back(c.name);
     }
 
@@ -2477,12 +2488,34 @@ std::vector<Stream> plan_streams(const Frame& f, bool joint_geom, std::string* l
         }
         out.push_back(std::move(j.out));
     };
+    // 色 3 列の出し方を 3 通りで比べる。0 = 汎用の経路、1 = まとめる、2 = 鎖。
+    int color_pick = 0;
+    if (s_joint != (size_t)-1 && s_rgb.size() == 3 && s_chain.size() == 3) {
+        size_t sep = 0, jnt = jobs[s_joint].out.data.size(), chn = 0;
+        for (size_t c : s_rgb) sep += jobs[c].out.data.size();
+        for (size_t c : s_chain) chn += jobs[c].out.data.size();
+        if (jnt && jnt < sep) { color_pick = 1; sep = jnt; }
+        if (chn && chn < sep) { color_pick = 2; }
+        if (log) {
+            char m[200];
+            snprintf(m, sizeof m,
+                     "  （色 3 列: 別々 %zu / まとめて %zu / 鎖 %zu byte → %s）\n",
+                     sep, jnt, chn,
+                     color_pick == 0 ? "別々" : (color_pick == 1 ? "まとめる" : "鎖"));
+            *log += m;
+        }
+    }
+    bool color_out = false;
     for (size_t k : order) {
-        if (k != (size_t)-1) { emit(jobs[k]); continue; }
-        size_t sep = 0;
-        for (size_t c : s_chain) sep += jobs[c].out.data.size();
-        if (jobs[s_joint].out.data.size() <= sep) emit(jobs[s_joint]);
-        else for (size_t c : s_chain) emit(jobs[c]);
+        if (color_pick && (k == s_rgb[0] || k == s_rgb[1] || k == s_rgb[2])) {
+            if (!color_out) {
+                if (color_pick == 1) emit(jobs[s_joint]);
+                else for (size_t c : s_chain) emit(jobs[c]);
+                color_out = true;
+            }
+            continue;
+        }
+        emit(jobs[k]);
     }
     return out;
 }
