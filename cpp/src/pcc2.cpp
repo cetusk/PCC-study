@@ -1388,15 +1388,40 @@ bool codec_decode(uint16_t id, const std::vector<uint8_t>& param,
 // ---------------------------------------------------------------- 候補を実測して選ぶ
 
 // 参照相手の絞り込み。全対を全点で測ると O(列^2 * 点数) になるので標本で選ぶ。
+// 見積りは 25 万個の差を数えて乱雑さを出す。std::map に 25 万回入れると、
+// これだけで符号化の 2 割を超えた。差は 0 の近くに集まるので、その範囲は
+// 配列で数え、外れ値だけ木に入れる。
+// **足す順は木だけのときと同じ（昇順）**にしてあるので、値は 1 bit も変わらない。
+namespace {
+struct DiffCounter {
+    static constexpr int64_t K = 1 << 14;
+    std::vector<uint32_t> lo;
+    std::map<int64_t, uint32_t> hi;
+    DiffCounter() : lo((size_t)(2 * K), 0) {}
+    inline void reset() { std::fill(lo.begin(), lo.end(), 0u); hi.clear(); }
+    inline void add(int64_t d) {
+        if (d >= -K && d < K) ++lo[(size_t)(d + K)]; else ++hi[d];
+    }
+    double entropy(size_t n) const {
+        double e = 0;
+        auto take = [&](uint32_t c) { double q = (double)c / n; e -= q * std::log2(q); };
+        auto it = hi.begin();
+        for (; it != hi.end() && it->first < -K; ++it) take(it->second);
+        for (size_t i = 0; i < lo.size(); ++i) if (lo[i]) take(lo[i]);
+        for (; it != hi.end(); ++it) take(it->second);
+        return e;
+    }
+};
+}
+static thread_local DiffCounter g_dc;
+
 static double entropy_diff_sample(const std::vector<int64_t>& a,
                                   const std::vector<int64_t>& b, size_t cap) {
     size_t n = std::min({a.size(), b.size(), cap});
     if (!n) return 1e30;
-    std::map<int64_t, uint32_t> h;
-    for (size_t i = 0; i < n; ++i) ++h[a[i] - b[i]];
-    double e = 0;
-    for (const auto& kv : h) { double q = (double)kv.second / n; e -= q * std::log2(q); }
-    return e;
+    g_dc.reset();
+    for (size_t i = 0; i < n; ++i) g_dc.add(a[i] - b[i]);
+    return g_dc.entropy(n);
 }
 
 // 差にさらに空間予測を掛けたあとの乱雑さ。参照の順位付けに使う。
@@ -1411,16 +1436,27 @@ static double entropy_spatial_diff(const std::vector<int64_t>& a,
                                    const std::vector<int32_t>& pred, int P,
                                    size_t n, size_t cap) {
     if (!n || a.size() < n || b.size() < n) return 1e30;
-    std::vector<int64_t> d(n);
-    for (size_t i = 0; i < n; ++i) d[i] = a[i] - b[i];
-    std::vector<int64_t> r;
-    spatial_residual(d, perm, pred, P, n, r);
-    size_t m = std::min(n, cap);
-    std::map<int64_t, uint32_t> h;
-    for (size_t i = 0; i < m; ++i) ++h[r[i]];
-    double e = 0;
-    for (const auto& kv : h) { double q = (double)kv.second / m; e -= q * std::log2(q); }
-    return e;
+    // 符号化順の先頭 m 個だけで足りる。予測子は自分より前の位置しか指さないので、
+    // 先頭を切り出しても残差は全点で計算したものと同じ値になる。
+    const size_t m = std::min(n, cap);
+    std::vector<int64_t> w(m);
+    for (size_t t = 0; t < m; ++t) { int32_t i = perm[t]; w[t] = a[(size_t)i] - b[(size_t)i]; }
+    g_dc.reset();
+    for (size_t t = 0; t < m; ++t) {
+        int64_t p = 0;
+        if (t) {
+            int64_t sum = 0; int c = 0;
+            for (int j = 0; j < P; ++j) {
+                int32_t q = pred[t * (size_t)P + j];
+                if (q < 0) break;
+                sum += w[(size_t)q]; ++c;
+            }
+            p = (c == 0) ? w[t - 1]
+                         : (sum >= 0 ? (sum + c / 2) / c : -((-sum + c / 2) / c));
+        }
+        g_dc.add(w[t] - p);
+    }
+    return g_dc.entropy(m);
 }
 
 std::string cand_name(uint16_t c, const std::vector<uint8_t>& p) {
