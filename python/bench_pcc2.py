@@ -15,7 +15,7 @@ sys.path.insert(0, str(Path(__file__).parent))
 import exp_order_matrix as M
 from runpeak import run
 
-PCC = os.path.abspath("cpp/build/pccnorm")
+PCC = os.environ.get("PCC_BIN") or os.path.abspath("cpp/build/pccnorm")
 TMC3 = os.environ.get("TMC3", os.path.expanduser("~/tools/tmc13/build/tmc3/tmc3"))
 ENV = dict(os.environ)
 ENV["LD_LIBRARY_PATH"] = (os.path.expanduser("~/tools/laszip-install/lib") + ":"
