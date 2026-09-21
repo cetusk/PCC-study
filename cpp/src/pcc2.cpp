@@ -1668,6 +1668,17 @@ Stream best_stream(const Frame& f, const std::vector<std::string>& cols,
 std::vector<Stream> plan_streams(const Frame& f, bool joint_geom, std::string* log,
                                  const CodecCtx* ctx, bool trace_all) {
     std::vector<Stream> out;
+    // 空間予測の近傍表は、最初にそれを呼ぶ列（たいてい intensity）が 1 人で
+    // 背負っている。AHN3 _20 の 100 万点では intensity が 0.35 秒、同じ候補数の
+    // red が 0.12 秒で、差の 0.23 秒がこの構築である。幾何の列を符号化している
+    // 間に裏で作っておけば隠れる。表の中身は変わらないので出力は同じ。
+    std::thread warm;
+    if (ctx && (ctx->world || ctx->want_world))
+        warm = std::thread([ctx, &f] { ctx->ensure(f.n, 1); });
+    struct Joiner {
+        std::thread& t;
+        ~Joiner() { if (t.joinable()) t.join(); }
+    } joiner{warm};
     std::vector<Cand> cand{{C_RAW64, {}}, {C_RANGE, {}}, {C_RANGE_DELTA, {}},
                            {C_RANGE_CTX, {}}, {C_RANGE_CTX2, {}}, {C_RANGE_MED, {}},
                            {C_RANGE_CACHE, {}}};
