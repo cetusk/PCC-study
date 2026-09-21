@@ -1256,9 +1256,12 @@ Stream best_stream(const Frame& f, const std::vector<std::string>& cols,
         const char* e = getenv("PCC_PRESELECT");
         return e ? atol(e) : -1;
     }();
+    // 上位いくつを全点で測るか。1 でも 2 でも 17 件で出力は変わらないが、
+    // 予測子を足す前は 1 だと TLS p1 が伸びた（24.252 → 25.462 bpp）ので、
+    // 余裕を 1 本だけ残す。3 から 2 で符号化が 0.23 s → 0.20 s になる。
     static const size_t PRE_KEEP = [] {
         const char* e = getenv("PCC_PREKEEP");
-        return e ? (size_t)atol(e) : (size_t)3;
+        return e ? (size_t)atol(e) : (size_t)2;
     }();
     size_t PRE_SAMP;
     if (PRE_OPT >= 0) PRE_SAMP = (size_t)PRE_OPT;
