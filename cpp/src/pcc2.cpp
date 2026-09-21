@@ -1933,9 +1933,22 @@ std::vector<Stream> plan_streams(const Frame& f, bool joint_geom, std::string* l
                            {C_RANGE_CTX, {}}, {C_RANGE_CTX2, {}}, {C_RANGE_MED, {}},
                            {C_RANGE_CACHE, {}}};
     // 幾何が揃っていれば、空間予測の候補（予測子 1 / 3 / 5 個）も加える
+    // 予測子の数。既定は 1 / 3 / 5。上に余地が無いかは PCC_SPATIAL_PS で測れる。
+    static const std::vector<uint8_t> SPS = [] {
+        std::vector<uint8_t> v;
+        if (const char* e = getenv("PCC_SPATIAL_PS")) {
+            for (const char* q = e; *q;) {
+                long x = strtol(q, (char**)&q, 10);
+                if (x > 0 && x < 64) v.push_back((uint8_t)x);
+                while (*q && (*q < '0' || *q > '9')) ++q;
+            }
+        }
+        if (v.empty()) v = {1, 3, 5};
+        return v;
+    }();
     std::vector<Cand> cand_attr = cand;
     if (ctx && (ctx->world || ctx->want_world))
-        for (uint8_t P : {1, 3, 5}) cand_attr.push_back({C_ATTR_SPATIAL, {P}});
+        for (uint8_t P : SPS) cand_attr.push_back({C_ATTR_SPATIAL, {P}});
     // 順序の実験では幾何だけが関心で、属性の候補掃引が時間の大半を占める。
     // 絞っても往復検証は全列に掛かるので、検証の強さは落ちない。
     // 幾何より前に置く列（gps_time など）も cand から作るので、ここで一緒に絞られる。
@@ -2079,7 +2092,7 @@ std::vector<Stream> plan_streams(const Frame& f, bool joint_geom, std::string* l
         if (all) {
             // 候補 1: 3 列まとめて可逆色変換 + 空間予測
             std::vector<Cand> cc;
-            for (uint8_t P : {1, 3, 5}) cc.push_back({C_ATTR_COLOR, {P}});
+            for (uint8_t P : SPS) cc.push_back({C_ATTR_COLOR, {P}});
             s_joint = defer(rgb, cc);
 
             // 候補 2: blue → green → red の順に、直前の色を参照する鎖
@@ -2089,7 +2102,9 @@ std::vector<Stream> plan_streams(const Frame& f, bool joint_geom, std::string* l
                 if (i > 0) {
                     std::string ref = ord[i - 1];
                     uint16_t l = (uint16_t)ref.size();
-                    for (uint8_t P : {0, 100, 1, 3, 5}) {
+                    std::vector<uint8_t> cps{0, 100};
+                    cps.insert(cps.end(), SPS.begin(), SPS.end());
+                    for (uint8_t P : cps) {
                         std::vector<uint8_t> pv{P};
                         pv.insert(pv.end(), (uint8_t*)&l, (uint8_t*)&l + 2);
                         pv.insert(pv.end(), ref.begin(), ref.end());
@@ -2230,7 +2245,9 @@ std::vector<Stream> plan_streams(const Frame& f, bool joint_geom, std::string* l
             take(sp);
             for (const auto& ref : refs) {
                 uint16_t l = (uint16_t)ref.size();
-                for (uint8_t P : {0, 100, 1, 3, 5}) {
+                std::vector<uint8_t> ps{0, 100};
+                ps.insert(ps.end(), SPS.begin(), SPS.end());
+                for (uint8_t P : ps) {
                     std::vector<uint8_t> pv{P};
                     pv.insert(pv.end(), (uint8_t*)&l, (uint8_t*)&l + 2);
                     pv.insert(pv.end(), ref.begin(), ref.end());
