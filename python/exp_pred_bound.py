@@ -36,7 +36,7 @@ def H(v: np.ndarray) -> float:
 
 
 def read(lab: str, path: str) -> np.ndarray:
-    kind = "kitti" if "kitti" in path else "las"
+    kind = ("kitti" if "kitti" in path else ("tls" if path.endswith(".csv") else "las"))
     tot = M.total_points(kind, path)
     n = min(N, tot)
     st = max(0, tot // 2 - n // 2)
