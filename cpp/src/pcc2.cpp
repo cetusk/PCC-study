@@ -1476,10 +1476,13 @@ public:
         cv_.notify_all();
         for (auto& t : th_) t.join();
     }
+    // **notify_one にしてはいけない。** 起こされた 1 本が「自分の left はもう 0 だ」と
+    // 判って抜ける待ち手だと、その知らせはそこで消える。仕事は待ち行列に残り、
+    // 他は全員寝たままになる。100 万点で 17 本ぜんぶが futex 待ちになって止まった。
     void add(std::function<void()> f, std::atomic<size_t>& left) {
         left.fetch_add(1, std::memory_order_relaxed);
         { std::lock_guard<std::mutex> lk(m_); q_.emplace_back(std::move(f), &left); }
-        cv_.notify_one();
+        cv_.notify_all();
     }
     // 待つ側は空回りしない。仕事が無ければ寝て、誰かが 1 つ終えたら起こされる。
     // 空回りさせると、自分の列の候補を待つ糸が 10 本以上あるときに、その空回りが
@@ -1490,30 +1493,47 @@ public:
             std::atomic<size_t>* l = nullptr;
             {
                 std::unique_lock<std::mutex> lk(m_);
-                cv_.wait(lk, [&] { return left.load(std::memory_order_acquire) == 0
+                // 期限付きで待つ。知らせを取りこぼしても遅れで済み、止まらない。
+                cv_.wait_for(lk, std::chrono::milliseconds(2),
+                             [&] { return left.load(std::memory_order_acquire) == 0
                                           || !q_.empty(); });
-                if (left.load(std::memory_order_acquire) == 0) return;
+                if (q_.empty() && left.load(std::memory_order_acquire) != 0) continue;
+                if (left.load(std::memory_order_acquire) == 0) {
+                    // 抜けるときに仕事が残っていたら、誰かを必ず起こしてから抜ける。
+                    const bool more = !q_.empty();
+                    lk.unlock();
+                    if (more) cv_.notify_all();
+                    return;
+                }
                 f = std::move(q_.front().first); l = q_.front().second; q_.pop_front();
             }
             f();
-            l->fetch_sub(1, std::memory_order_release);
-            cv_.notify_all();
+            done(l);
         }
     }
 private:
+    // **減らすのは錠の中でなければならない。** left は待ち手の述語が読む。
+    // 錠の外で減らして通知すると、待ち手が述語を偽と判じてから実際に眠るまでの
+    // 隙間に通知が落ちる。待ち手はその眠りから覚めない。
+    // 100 万点で 17 本ぜんぶが futex 待ちになって止まったのがこれである。
+    void done(std::atomic<size_t>* l) {
+        { std::lock_guard<std::mutex> lk(m_); l->fetch_sub(1, std::memory_order_release); }
+        cv_.notify_all();
+    }
     void loop() {
         for (;;) {
             std::function<void()> f;
             std::atomic<size_t>* l = nullptr;
             {
                 std::unique_lock<std::mutex> lk(m_);
-                cv_.wait(lk, [this] { return stop_ || !q_.empty(); });
+                cv_.wait_for(lk, std::chrono::milliseconds(2),
+                             [this] { return stop_ || !q_.empty(); });
                 if (stop_ && q_.empty()) return;
+                if (q_.empty()) continue;
                 f = std::move(q_.front().first); l = q_.front().second; q_.pop_front();
             }
             f();
-            l->fetch_sub(1, std::memory_order_release);
-            cv_.notify_all();
+            done(l);
         }
     }
     std::vector<std::thread> th_;
