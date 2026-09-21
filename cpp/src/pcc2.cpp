@@ -6,6 +6,8 @@
 #include <chrono>
 #include <cmath>
 #include <map>
+#include <mutex>
+#include <set>
 #include <cstdio>
 #include <cstring>
 #include <cstdlib>
@@ -2070,19 +2072,108 @@ bool read_pcc2(const std::string& path, Frame& f, std::string& err) {
     CodecCtx ctx;
     ctx.fr = &f;
     std::vector<double> world;
-    bool world_ready = false;
+
+    // 各ストリームの読み出し位置を先に出す。長さは記述子に入っているので、
+    // 順に復号しなくても位置が決まる。
+    std::vector<size_t> off(ns);
     for (uint32_t i = 0; i < ns; ++i) {
         if (r.p + dlen[i] > r.n) { err = "ストリームが短い"; return false; }
-        std::vector<std::vector<int64_t>> outc;
-        if (!codec_decode(st[i].codec, st[i].param, buf.data() + r.p, dlen[i],
-                          f.n, st[i].cols.size(), outc, err, &ctx)) {
-            err += "（ストリーム " + std::to_string(i) + ": ";
-            for (size_t c = 0; c < st[i].cols.size(); ++c) err += (c ? "+" : "") + st[i].cols[c];
-            err += " / 符号器 " + cand_name(st[i].codec, st[i].param) + "）";
-            return false;
+        off[i] = r.p; r.p += dlen[i];
+    }
+
+    // ストリームが要る列を出す。参照も走査モデルも補助列も、相手の名前は
+    // パラメタに入っている。空間予測は座標（＝幾何の列）が要る。
+    auto names_in = [](const std::vector<uint8_t>& p, size_t q, int cnt,
+                       std::vector<std::string>& out) {
+        for (int k = 0; k < cnt; ++k) {
+            if (q + 2 > p.size()) return;
+            uint16_t l; memcpy(&l, p.data() + q, 2); q += 2;
+            if (q + l > p.size()) return;
+            out.emplace_back((const char*)p.data() + q, l); q += l;
         }
-        for (size_t c = 0; c < st[i].cols.size(); ++c) f.col[st[i].cols[c]] = std::move(outc[c]);
-        r.p += dlen[i];
+    };
+    std::vector<std::vector<std::string>> need(ns);
+    std::vector<char> need_geom(ns, 0);
+    for (uint32_t i = 0; i < ns; ++i) {
+        const uint16_t id = (uint16_t)(st[i].codec & ~C_FSYM_BIT);
+        const auto& p = st[i].param;
+        if (id == C_ATTR_XREF) {
+            names_in(p, 1, 1, need[i]);
+            if (!p.empty() && p[0] != 0 && p[0] != 100) need_geom[i] = 1;
+        } else if (id == C_ATTR_SPATIAL || id == C_ATTR_COLOR) {
+            need_geom[i] = 1;
+        } else if (id == C_GEOM_SCAN) {
+            names_in(p, 1, 3, need[i]);
+        } else if (id == C_GEOM_XYZ && !p.empty() && p[0] == 2) {
+            names_in(p, 1, 1, need[i]);
+        }
+    }
+
+    // **入れ物を先に作ってはいけない。** f.get は「その列がもう有るか」を
+    // 空でないことで判断する符号器があるので、空の入れ物を置くと
+    // 未復号の列が有ることになってしまう（plane などで落ちた）。
+    // 代わりに、書き込むときだけ排他を取る。
+    std::mutex colmu;
+
+    static const size_t NT = [] {
+        if (const char* e = getenv("PCC_THREADS")) { long v = atol(e); if (v > 0) return (size_t)v; }
+        unsigned hw = std::thread::hardware_concurrency();
+        return (size_t)(hw ? hw : 1);
+    }();
+
+    std::vector<char> done(ns, 0);
+    // 定数の列は流れに入らず、容器から先に入っている。それも「有る」に数える。
+    std::set<std::string> have;
+    for (const auto& kv : f.col) have.insert(kv.first);
+    bool world_ready = false;
+    uint32_t left = ns;
+    while (left) {
+        // いま復号できるものを集める
+        std::vector<uint32_t> wave;
+        for (uint32_t i = 0; i < ns; ++i) {
+            if (done[i]) continue;
+            if (need_geom[i] && !world_ready) continue;
+            bool ok = true;
+            for (const auto& c : need[i])
+                if (!c.empty() && !have.count(c)) { ok = false; break; }
+            if (ok) wave.push_back(i);
+        }
+        if (wave.empty()) { err = "ストリームの依存が解けない"; return false; }
+        std::vector<std::string> werr(wave.size());
+        std::vector<char> wok(wave.size(), 0);
+        size_t nt = NT < wave.size() ? NT : wave.size();
+        auto work = [&](size_t a) {
+            uint32_t i = wave[a];
+            std::vector<std::vector<int64_t>> outc;
+            if (!codec_decode(st[i].codec, st[i].param, buf.data() + off[i], dlen[i],
+                              f.n, st[i].cols.size(), outc, werr[a], &ctx)) return;
+            {
+                std::lock_guard<std::mutex> lk(colmu);
+                for (size_t c = 0; c < st[i].cols.size(); ++c)
+                    f.col[st[i].cols[c]] = std::move(outc[c]);
+            }
+            wok[a] = 1;
+        };
+        if (nt <= 1) {
+            for (size_t a = 0; a < wave.size(); ++a) work(a);
+        } else {
+            std::atomic<size_t> next{0};
+            std::vector<std::thread> th; th.reserve(nt);
+            for (size_t t = 0; t < nt; ++t)
+                th.emplace_back([&] { for (size_t a = next++; a < wave.size(); a = next++) work(a); });
+            for (auto& x : th) x.join();
+        }
+        for (size_t a = 0; a < wave.size(); ++a) {
+            uint32_t i = wave[a];
+            if (!wok[a]) {
+                err = werr[a] + "（ストリーム " + std::to_string(i) + ": ";
+                for (size_t c = 0; c < st[i].cols.size(); ++c) err += (c ? "+" : "") + st[i].cols[c];
+                err += " / 符号器 " + cand_name(st[i].codec, st[i].param) + "）";
+                return false;
+            }
+            done[i] = 1; --left;
+            for (const auto& c : st[i].cols) have.insert(c);
+        }
         if (!world_ready && f.get(f.geom[0]) && f.get(f.geom[1]) && f.get(f.geom[2])) {
             frame_world(f, world);
             ctx.world = &world;
