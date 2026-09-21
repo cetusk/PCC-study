@@ -1598,7 +1598,19 @@ Stream best_stream(const Frame& f, const std::vector<std::string>& cols,
     std::vector<std::pair<size_t, Cand>> rank;      // (符号長, 候補) を短い順に
     std::vector<std::vector<uint8_t>> fb; std::vector<std::string> fe;
     std::vector<char> fok;
-    if (par) encode_many(use, cv, ctx, fb, fe, fok, true);
+    // **標本の上で計画を立てているときは打ち切らない。**打ち切った候補は
+    // rank から消え、rank は best.alt（--sample-select が全点で測り直す控え）と
+    // 「空間予測を必ず 1 本残す」保証に使われる。標本で負けた候補が全点で
+    // 勝つことがあるので、控えが欠けると選択が変わる（autzen-2023 で最大
+    // +4.4%、しかも実行ごとに変わった）。標本かどうかは ctx->full で判る。
+    const bool on_sample = ctx && ctx->full;
+    // 打ち切ると --trace の候補一覧が「不可: 最短を超えたので打ち切り」だらけに
+    // なり、どれが落ちるかは実行ごとに変わる。候補を並べて見たいときは 0 にする。
+    static const bool ABORT_ON = [] {
+        const char* e = getenv("PCC_ABORT");
+        return !e || e[0] != '0';
+    }();
+    if (par) encode_many(use, cv, ctx, fb, fe, fok, ABORT_ON && !on_sample);
     for (size_t ui = 0; ui < use.size(); ++ui) {
         const Cand& cd = use[ui];
         std::vector<uint8_t> blob; std::string err;

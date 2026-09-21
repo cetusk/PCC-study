@@ -45,7 +45,8 @@ struct CodecCtx {
     // 参照列の選定だけは全点の統計で行うため、全点の Frame をここに置く。
     const Frame* full = nullptr;
     // 近傍の予測子表は P ごとに違う。候補ごとに作り直すと、1 つの列で
-    // sp(P=1) / sp(P=3) / sp(P=5) …と何度も建て直すことになる（11 列で 30 回超）。
+    // sp(P=1) / sp(P=3) / sp(P=5) …と何度も建て直すことになる
+    // （AHN3 _20 の 14 列では 30 回を超えていた）。
     // P ごとに取っておく。表は n*P の int32 なので 100 万点・P=5 で 20 MB。
     mutable std::vector<int32_t> perm;
     mutable std::map<int, std::vector<int32_t>> pred_by_p;
