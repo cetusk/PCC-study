@@ -208,6 +208,85 @@ static void enc_geom_x(const std::vector<const std::vector<int64_t>*>& cols,
     }
     out = e.finish();
 }
+// 幾何v4 — 直近 W 点のうち最も近い点から予測し、選んだ点を明示的に送る。
+//
+// v0〜v3 の予測子はどれも「格納順で直前の点」に基づく。格納順が空間的に
+// 連続していない入力（取得順でない配布、複数の戻り・チャネルの交互配置）では
+// 直前の点が遠く、差分が大きくなる。実測では格納順の連続性（隣接点の距離 ÷
+// 点間隔）が 1.6 を超えると逐次予測が G-PCC に負けた。
+//
+// **選んだ点は送らなければならない。** 最初に「復号側も直近 W 点を持っている
+// のだから最近傍を選び直せる」と考えて実装したが、最近傍の判定にはこれから
+// 復号する点そのものが要るので成立しない（往復検証が即座に落ちた）。
+// 添字（直前から何点戻るか）を符号化する。残差の減りから添字の費用を引いた
+// 正味は、実測で AHN4 _21 が −7.5、USGS NY が −2.2 bit/点。効かない入力も
+// あるので候補の 1 つとして出し、選択原理に任せる。
+static inline int nn_back(const int64_t* X, const int64_t* Y, const int64_t* Z,
+                          size_t i, size_t w) {
+    size_t a = i > w ? i - w : 0;
+    int64_t bd = INT64_MAX; size_t bj = i - 1;
+    for (size_t j = i; j-- > a; ) {
+        int64_t dx = X[j] - X[i], dy = Y[j] - Y[i], dz = Z[j] - Z[i];
+        int64_t ad = (dx < 0 ? -dx : dx) + (dy < 0 ? -dy : dy) + (dz < 0 ? -dz : dz);
+        if (ad < bd) { bd = ad; bj = j; }      // 同値なら直前に近い方（j が大きい方）
+    }
+    return (int)(i - 1 - bj);                  // 0 が直前の点
+}
+
+static void enc_geom_w(const std::vector<const std::vector<int64_t>*>& cols,
+                       size_t w, std::vector<uint8_t>& out) {
+    size_t n = cols[0]->size();
+    const int64_t *X = cols[0]->data(), *Y = cols[1]->data(), *Z = cols[2]->data();
+    Encoder e;
+    UIntCoder uc(3 * NCTX, 64);
+    UIntCoder ui(NCTX, 8);                     // 添字。文脈は直前の添字
+    int prev_kx = 0, prev_idx = 0;
+    for (size_t i = 0; i < n; ++i) {
+        int back = i ? nn_back(X, Y, Z, i, w) : 0;
+        if (i) ui.encode(e, (uint64_t)back, prev_idx < NCTX ? prev_idx : NCTX - 1);
+        size_t j = i ? i - 1 - (size_t)back : 0;
+        const int64_t p[3] = {i ? X[j] : 0, i ? Y[j] : 0, i ? Z[j] : 0};
+        const int64_t v[3] = {X[i], Y[i], Z[i]};
+        int k[3] = {0, 0, 0};
+        for (int c = 0; c < 3; ++c) {
+            uint64_t z = zigzag(v[c] - p[c]);
+            int ctxc = (c == 0) ? prev_kx : (c == 1 ? k[0] : (k[0] + k[1]) / 2);
+            if (ctxc >= NCTX) ctxc = NCTX - 1;
+            uc.encode(e, z, c * NCTX + ctxc);
+            k[c] = ctx_of(z);
+        }
+        prev_kx = k[0];
+        prev_idx = back;
+    }
+    out = e.finish();
+}
+
+static void dec_geom_w(const uint8_t* data, size_t len, size_t n, size_t w,
+                       std::vector<std::vector<int64_t>>& out) {
+    (void)w;
+    out.assign(3, std::vector<int64_t>(n));
+    Decoder d(data, len);
+    UIntCoder uc(3 * NCTX, 64);
+    UIntCoder ui(NCTX, 8);
+    int prev_kx = 0, prev_idx = 0;
+    for (size_t i = 0; i < n; ++i) {
+        int back = 0;
+        if (i) back = (int)ui.decode(d, prev_idx < NCTX ? prev_idx : NCTX - 1);
+        size_t j = i ? i - 1 - (size_t)back : 0;
+        const int64_t p[3] = {i ? out[0][j] : 0, i ? out[1][j] : 0, i ? out[2][j] : 0};
+        int k[3] = {0, 0, 0};
+        for (int c = 0; c < 3; ++c) {
+            int ctxc = (c == 0) ? prev_kx : (c == 1 ? k[0] : (k[0] + k[1]) / 2);
+            if (ctxc >= NCTX) ctxc = NCTX - 1;
+            uint64_t z = uc.decode(d, c * NCTX + ctxc);
+            out[c][i] = p[c] + unzigzag(z);
+            k[c] = ctx_of(z);
+        }
+        prev_kx = k[0];
+        prev_idx = back;
+    }
+}
+
 static void dec_geom_x(const uint8_t* data, size_t len, size_t n,
                        std::vector<std::vector<int64_t>>& out) {
     out.assign(3, std::vector<int64_t>(n));
@@ -911,7 +990,11 @@ bool codec_encode(uint16_t id, const std::vector<const std::vector<int64_t>*>& c
     case C_RANGE_MED:    enc_geom_med(cols, out); return true;
     case C_GEOM_XYZ: {
         int var = param.empty() ? 0 : param[0];
-        if (var == 2) {
+        if (var == 4) {
+            if (cols.size() != 3) { err = "幾何v4 は 3 軸"; return false; }
+            size_t w = param.size() > 1 ? (size_t)param[1] : 16;
+            enc_geom_w(cols, w ? w : 16, out);
+        } else if (var == 2) {
             const std::vector<int64_t>* a = aux_col(param, ctx);
             if (!a || a->size() < cols[0]->size()) { err = "補助列がない"; return false; }
             enc_geom_aux(cols, *a, out);
@@ -992,7 +1075,11 @@ bool codec_decode(uint16_t id, const std::vector<uint8_t>& param,
     case C_RANGE_MED:    dec_geom_med(data, len, n, ncol, out); return true;
     case C_GEOM_XYZ: {
         int var = param.empty() ? 0 : param[0];
-        if (var == 2) {
+        if (var == 4) {
+            if (ncol != 3) { err = "幾何v4 は 3 軸"; return false; }
+            size_t w = param.size() > 1 ? (size_t)param[1] : 16;
+            dec_geom_w(data, len, n, w ? w : 16, out);
+        } else if (var == 2) {
             const std::vector<int64_t>* a = aux_col(param, ctx);
             if (!a || a->size() < n) { err = "補助列がない"; return false; }
             dec_geom_aux(data, len, n, ncol, *a, out);
@@ -1080,6 +1167,11 @@ std::string cand_name(uint16_t c, const std::vector<uint8_t>& p) {
     }
     case C_GEOM_XYZ:
         if (p.empty() || p[0] == 0) return "幾何v0";
+        if (p[0] == 4) {
+            static char b4[20];
+            snprintf(b4, sizeof b4, "幾何v4W%d", p.size() > 1 ? p[1] : 16);
+            return b4;
+        }
         return p[0] == 1 ? "幾何v1" : (p[0] == 2 ? "幾何v2" : "幾何v3");
     case C_ATTR_SPATIAL: snprintf(b, sizeof b, "sp(P=%d)", p.empty() ? 0 : p[0]); return b;
     case C_ATTR_COLOR:   snprintf(b, sizeof b, "色(P=%d)", p.empty() ? 0 : p[0]); return b;
@@ -1222,7 +1314,10 @@ std::vector<Stream> plan_streams(const Frame& f, bool joint_geom, std::string* l
     if (joint_geom) {
         std::vector<std::string> g{f.geom[0], f.geom[1], f.geom[2]};
         std::vector<Cand> gc{{C_RAW64, {}}, {C_RANGE, {}}, {C_RANGE_DELTA, {}},
-                             {C_GEOM_XYZ, {0}}, {C_GEOM_XYZ, {1}}, {C_GEOM_XYZ, {3}}};
+                             {C_GEOM_XYZ, {0}}, {C_GEOM_XYZ, {1}}, {C_GEOM_XYZ, {3}},
+                             // 直近 W 点の最近傍から予測する。格納順が空間的に
+                             // 連続していない入力で効く（幾何v4 の注記を参照）。
+                             {C_GEOM_XYZ, {4, 4}}, {C_GEOM_XYZ, {4, 16}}};
         if (!aux.empty()) {
             std::vector<uint8_t> pv{2};
             uint16_t l = (uint16_t)aux.size();
