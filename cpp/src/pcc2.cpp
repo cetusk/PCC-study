@@ -459,13 +459,17 @@ const std::vector<int32_t>* CodecCtx::ensure(size_t n, int P,
     // 点数が変わったら作り直す。標本で順位を付けるときに同じ P で呼ばれると、
     // 標本ぶんの表を全点の符号化に使ってしまう。
     auto pit = perm_by_n.find(n);
-    if (pit == perm_by_n.end())
+    if (pit == perm_by_n.end()) {
+        double t0 = now_sec();
         pit = perm_by_n.emplace(n, coding_order(*w, n, "morton")).first;
+        if (getenv("PCC_DPROF"))
+            fprintf(stderr, "        [順序表] %.3fs\n", now_sec() - t0);
+    }
     auto it = pred_by_np.find({n, P});
     if (it == pred_by_np.end()) {
         // 候補が使う P はいつも 1 / 3 / 5 なので、最初の 1 回でまとめて作る。
         // 近傍探索も KdTree の構築も 1 回で済む（P ごとだと 3 回になる）。
-        std::vector<int> Ps{1, 3, 5};
+        std::vector<int> Ps = want_Ps.empty() ? std::vector<int>{1, 3, 5} : want_Ps;
         if (std::find(Ps.begin(), Ps.end(), P) == Ps.end()) Ps.push_back(P);
         std::vector<std::vector<int32_t>> pds;
         double t0 = now_sec();
@@ -1119,7 +1123,10 @@ static bool dec_geom_scan(const std::vector<uint8_t>& param, const uint8_t* data
     p += ll;
     if (!rd64(lr) || p + lr > len) { err = "残差が短い"; return false; }
     std::vector<std::vector<int64_t>> res;
+    double t_a = now_sec();
     if (use_xctx) dec_resid_x(data + p, lr, n, res); else dec_resid(data + p, lr, n, 3, res);
+    if (getenv("PCC_DPROF")) fprintf(stderr, "        [残差復号] %.3fs\n", now_sec() - t_a);
+    t_a = now_sec();
 
     LineSet L;
     L.split.resize(nsw);
@@ -1183,6 +1190,7 @@ static bool dec_geom_scan(const std::vector<uint8_t>& param, const uint8_t* data
             out[0][i] = X; out[1][i] = Y; out[2][i] = z;
         }
     }
+    if (getenv("PCC_DPROF")) fprintf(stderr, "        [復元] %.3fs\n", now_sec() - t_a);
     return true;
 }
 
@@ -2128,6 +2136,19 @@ bool read_pcc2(const std::string& path, Frame& f, std::string& err) {
     // 定数の列は流れに入らず、容器から先に入っている。それも「有る」に数える。
     std::set<std::string> have;
     for (const auto& kv : f.col) have.insert(kv.first);
+    // 流れの一覧から、この容器で実際に使われる P を集めておく。
+    {
+        std::vector<int>& W = const_cast<std::vector<int>&>(ctx.want_Ps);
+        for (uint32_t i = 0; i < ns; ++i) {
+            const uint16_t id = st[i].codec & ~C_FSYM_BIT;
+            if (st[i].param.empty()) continue;
+            if (id != C_ATTR_SPATIAL && id != C_ATTR_COLOR && id != C_ATTR_XREF) continue;
+            int P = st[i].param[0];
+            if (P <= 0 || P == 100) continue;
+            if (std::find(W.begin(), W.end(), P) == W.end()) W.push_back(P);
+        }
+        std::sort(W.begin(), W.end());
+    }
     bool world_ready = false;
     const bool dprof = getenv("PCC_DPROF") != nullptr;
     int wno = 0;

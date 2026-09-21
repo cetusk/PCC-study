@@ -57,6 +57,10 @@ struct CodecCtx {
     mutable std::map<size_t, std::vector<int32_t>> perm_by_n;
     mutable std::map<std::pair<size_t, int>, std::vector<int32_t>> pred_by_np;
     mutable std::mutex mu;        // 候補を並列に符号化するときのため
+    // 符号化は P=1/3/5 を全部試すので全部要る。**復号は選ばれた P しか通らない。**
+    // 復号器は流れの一覧を先に読めるので、そこに出てくる P だけをここに入れる。
+    // 近傍探索の k は max(P)+4 なので、P=3 だけの回では 9 が 7 に下がる。
+    std::vector<int> want_Ps;
     // 順序表と、P に対応する予測子表を返す。作っていなければ作る。
     // 予測子表を返し、perm_out に順序表を入れる（どちらも点数ごとに持つ）。
     const std::vector<int32_t>* ensure(size_t n, int P,
