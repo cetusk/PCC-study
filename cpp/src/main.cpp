@@ -294,6 +294,31 @@ int main(int argc, char** argv) {
             return 0;
         }
 
+        // **決定性の確認を先に済ませる。**これには符号化側の Frame と流れが要る。
+        // 先にやっておけば、復号と読み直しを始める前に符号化側を手放せる。
+        // 後回しにすると、符号化側・復号したもの・読み直したものの 3 つを
+        // 同時に抱えることになる（200 万点・17 列で 1 つ 250 MB）。
+        std::string p2 = outp + ".det";
+        uint64_t b2 = 0;
+        bool det = (used_embed ? write_pcc2(p2, fe, {}, b2, err)
+                               : write_pcc2(p2, f, st, b2, err)) && b2 == bytes;
+        if (det) {
+            FILE* a = fopen(outp.c_str(), "rb"); FILE* b = fopen(p2.c_str(), "rb");
+            std::vector<uint8_t> ba(bytes), bb(bytes);
+            det = a && b && fread(ba.data(), 1, bytes, a) == bytes &&
+                  fread(bb.data(), 1, bytes, b) == bytes && ba == bb;
+            if (a) fclose(a); if (b) fclose(b);
+        }
+        remove(p2.c_str());
+
+        // 以降で使う覚え書きだけ残して、列の実体と流れを手放す。
+        const size_t rep_n = (size_t)f.n, rep_ncol = f.schema.size();
+        const std::string rep_src = f.source_kind, rep_geom = f.geom_repr, rep_plan = f.plan;
+        std::map<std::string, std::vector<int64_t>>().swap(f.col);
+        std::vector<Stream>().swap(st);
+        std::vector<uint8_t>().swap(fe.embed);
+        mem_mark("符号化側を手放した後");
+
         double t2 = now();
         Frame g;
         if (!read_pcc2(outp, g, err)) { fprintf(stderr, "復号失敗: %s\n", err.c_str()); return 1; }
@@ -322,30 +347,16 @@ int main(int argc, char** argv) {
         bool ok = frames_equal(orig, g, diff);
         orig = Frame();
 
-        std::string p2 = outp + ".det";
-        uint64_t b2 = 0;
-        bool det = (used_embed ? write_pcc2(p2, fe, {}, b2, err)
-                               : write_pcc2(p2, f, st, b2, err)) && b2 == bytes;
-        if (det) {
-            FILE* a = fopen(outp.c_str(), "rb"); FILE* b = fopen(p2.c_str(), "rb");
-            std::vector<uint8_t> ba(bytes), bb(bytes);
-            det = a && b && fread(ba.data(), 1, bytes, a) == bytes &&
-                  fread(bb.data(), 1, bytes, b) == bytes && ba == bb;
-            if (a) fclose(a); if (b) fclose(b);
-        }
-        remove(p2.c_str());
-
         printf("入力        %s\n            %zu 点 / 出所 %s / 幾何 %s / 列 %zu\n",
-               path.c_str(), (size_t)f.n, f.source_kind.c_str(), f.geom_repr.c_str(),
-               f.schema.size());
-        if (do_norm && !f.plan.empty()) {
-            Plan pl = Plan::from_json(f.plan);
+               path.c_str(), rep_n, rep_src.c_str(), rep_geom.c_str(), rep_ncol);
+        if (do_norm && !rep_plan.empty()) {
+            Plan pl = Plan::from_json(rep_plan);
             printf("正規化      %s", pl.report().c_str());
             if (pl.ops.empty()) printf("\n");
         }
         printf("ストリーム選択（候補を実際に符号化して最短を採る）\n%s", log.c_str());
-        double bl = f.n ? base_bytes * 8.0 / f.n : 0.0;
-        double ml = f.n ? bytes * 8.0 / f.n : 0.0;
+        double bl = rep_n ? base_bytes * 8.0 / rep_n : 0.0;
+        double ml = rep_n ? bytes * 8.0 / rep_n : 0.0;
         printf("基準 %-7s %10.1f MB  %8.3f bpp\n", is_las ? "LASzip" : "元", base_bytes / 1e6, bl);
         printf("PCC2        %10.1f MB  %8.3f bpp", bytes / 1e6, ml);
         if (base_bytes) printf("   %+.1f%%", 100.0 * (ml / bl - 1.0));
