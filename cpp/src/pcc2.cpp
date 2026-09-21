@@ -127,7 +127,7 @@ static void enc_cols(const std::vector<const std::vector<int64_t>*>& cols, int m
 // bit 長を送る方式では同じ値が何度出ても毎回その桁ぶん払う。直近 K 個の相異なる
 // 差分を表に持ち、当たれば添字だけを送る。外れたら逃げ道として従来どおり送る。
 // 表は移動前置（当たった値を先頭へ）で更新するので副情報は要らない。
-inline constexpr int DCACHE = 64;
+inline constexpr int DCACHE = 1024;
 
 static void enc_cols_cache(const std::vector<const std::vector<int64_t>*>& cols,
                            std::vector<uint8_t>& out) {
