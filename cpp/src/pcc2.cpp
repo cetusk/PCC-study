@@ -1797,6 +1797,26 @@ Stream best_stream(const Frame& f, const std::vector<std::string>& cols,
                         if ((double)pr.first <= best_pre * FAM_THR) use.push_back(pr.second);
                         break;
                     }
+            // **ビット版か記号版かは、標本に決めさせない。**
+            // 族ごとに 1 本しか残さないと、標本が族の中の順位を取り違えたときに
+            // 別の変種の記号版が守られてしまう（AHN4 _20 の 100 万点で、全点なら
+            // 勝つ 走査v1記 が残らず 17.727 → 17.864 bpp に伸びた）。
+            // 決勝に残った候補それぞれについて、対になる版を必ず一緒に測る。
+            // 候補の集合に無い対（PCC_FSYM_PAIR で作らなかったもの）は足さない。
+            {
+                const size_t nsel = use.size();
+                for (size_t i = 0; i < nsel; ++i) {
+                    Cand tw{(uint16_t)(use[i].codec ^ C_FSYM_BIT), use[i].param};
+                    bool in_univ = false;
+                    for (const auto& c : cands)
+                        if (c.codec == tw.codec && c.param == tw.param) { in_univ = true; break; }
+                    if (!in_univ) continue;
+                    bool dup = false;
+                    for (const auto& c : use)
+                        if (c.codec == tw.codec && c.param == tw.param) { dup = true; break; }
+                    if (!dup) use.push_back(tw);
+                }
+            }
         }
     }
 
