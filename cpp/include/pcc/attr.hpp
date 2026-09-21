@@ -37,9 +37,14 @@ void spatial_residual(const std::vector<int64_t>& v, const std::vector<int32_t>&
 bool spatial_residual32(const std::vector<int64_t>& v, const std::vector<int32_t>& perm,
                         const std::vector<int32_t>& pred, int P, size_t n,
                         std::vector<int32_t>& out);
-// 入力そのものを残差で置き換える版。参照残差のように、既に int32 の列があるとき。
-bool spatial_residual32_inplace(std::vector<int32_t>& v, const std::vector<int32_t>& perm,
-                                const std::vector<int32_t>& pred, int P, size_t n);
+// **符号化順に値が並んだ配列を、その場で残差に変える。**
+// predict は自分より前の位置しか見ないので、後ろから計算すれば前はまだ値のまま
+// であり、並べ替え用の作業配列が要らない（200 万点・16 並列で 128 MB）。
+// int32 版は途中で溢れたら偽を返す。そのとき配列の中身は壊れている。
+bool residual_backward32(std::vector<int32_t>& a, const std::vector<int32_t>& pred,
+                         int P, size_t n);
+void residual_backward64(std::vector<int64_t>& a, const std::vector<int32_t>& pred,
+                         int P, size_t n);
 void spatial_restore(const std::vector<int64_t>& res, const std::vector<int32_t>& perm,
                      const std::vector<int32_t>& pred, int P, size_t n,
                      std::vector<int64_t>& out);

@@ -1304,23 +1304,33 @@ bool codec_encode(uint16_t id, const std::vector<const std::vector<int64_t>*>& c
             if (!pdt) { err = "座標がない"; return false; }
         }
         {
+            // **空間予測を掛けるときは、最初から符号化順に差を作る。**
+            // 後から並べ替えると作業配列がもう 1 本要る。
             std::vector<std::vector<int32_t>>& d32 = g_res32;
             d32.resize(1); d32[0].resize(n);
             bool narrow = true;
-            for (size_t i = 0; i < n && narrow; ++i) {
-                int64_t x = (*cols[0])[i] - (*a)[i];
-                if (x < INT32_MIN || x > INT32_MAX) narrow = false;
-                else d32[0][i] = (int32_t)x;
-            }
-            if (narrow && P == 100) {
-                int32_t prev = 0;
-                for (size_t i = 0; i < n && narrow; ++i) {
-                    int64_t r = (int64_t)d32[0][i] - prev;
-                    if (r < INT32_MIN || r > INT32_MAX) narrow = false;
-                    else { prev = d32[0][i]; d32[0][i] = (int32_t)r; }
+            if (P > 0 && P != 100) {
+                for (size_t t = 0; t < n && narrow; ++t) {
+                    size_t i = (size_t)(*pm)[t];
+                    int64_t x = (*cols[0])[i] - (*a)[i];
+                    if (x < INT32_MIN || x > INT32_MAX) narrow = false;
+                    else d32[0][t] = (int32_t)x;
                 }
-            } else if (narrow && P > 0) {
-                narrow = spatial_residual32_inplace(d32[0], *pm, *pdt, P, n);
+                if (narrow) narrow = residual_backward32(d32[0], *pdt, P, n);
+            } else {
+                for (size_t i = 0; i < n && narrow; ++i) {
+                    int64_t x = (*cols[0])[i] - (*a)[i];
+                    if (x < INT32_MIN || x > INT32_MAX) narrow = false;
+                    else d32[0][i] = (int32_t)x;
+                }
+                if (narrow && P == 100) {
+                    int32_t prev = 0;
+                    for (size_t i = 0; i < n && narrow; ++i) {
+                        int64_t r = (int64_t)d32[0][i] - prev;
+                        if (r < INT32_MIN || r > INT32_MAX) narrow = false;
+                        else { prev = d32[0][i]; d32[0][i] = (int32_t)r; }
+                    }
+                }
             }
             if (narrow) {
                 free_scratch64();
@@ -1331,12 +1341,18 @@ bool codec_encode(uint16_t id, const std::vector<const std::vector<int64_t>*>& c
         }
         std::vector<std::vector<int64_t>>& d = g_res;
         d.resize(1); d[0].resize(n);
-        for (size_t i = 0; i < n; ++i) d[0][i] = (*cols[0])[i] - (*a)[i];
-        if (P == 100) {                       // 残差にさらに格納順の 1 次差分を掛ける
-            int64_t prev = 0;
-            for (size_t i = 0; i < n; ++i) { int64_t v = d[0][i]; d[0][i] = v - prev; prev = v; }
-        } else if (P > 0) {
-            spatial_residual(d[0], *pm, *pdt, P, n, d[0]);   // その場で書き換える
+        if (P > 0 && P != 100) {
+            for (size_t t = 0; t < n; ++t) {
+                size_t i = (size_t)(*pm)[t];
+                d[0][t] = (*cols[0])[i] - (*a)[i];
+            }
+            residual_backward64(d[0], *pdt, P, n);
+        } else {
+            for (size_t i = 0; i < n; ++i) d[0][i] = (*cols[0])[i] - (*a)[i];
+            if (P == 100) {                   // 残差にさらに格納順の 1 次差分を掛ける
+                int64_t prev = 0;
+                for (size_t i = 0; i < n; ++i) { int64_t v = d[0][i]; d[0][i] = v - prev; prev = v; }
+            }
         }
         enc_resid(d, out);
         return true;
@@ -1356,11 +1372,12 @@ bool codec_encode(uint16_t id, const std::vector<const std::vector<int64_t>*>& c
             std::vector<std::vector<int64_t>>& res = g_res;
             res.resize(3);
             for (auto& v : res) v.resize(n);
-            for (size_t i = 0; i < n; ++i)
+            for (size_t t = 0; t < n; ++t) {           // 最初から符号化順に作る
+                size_t i = (size_t)(*pm)[t];
                 ycocg_fwd((*cols[0])[i], (*cols[1])[i], (*cols[2])[i],
-                          res[0][i], res[1][i], res[2][i]);
-            for (size_t c = 0; c < 3; ++c)
-                spatial_residual(res[c], *pm, *pdt, P, n, res[c]);
+                          res[0][t], res[1][t], res[2][t]);
+            }
+            for (size_t c = 0; c < 3; ++c) residual_backward64(res[c], *pdt, P, n);
             enc_resid(res, out);
             return true;
         }

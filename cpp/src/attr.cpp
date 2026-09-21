@@ -162,7 +162,6 @@ static inline int64_t predict(const T* w, const std::vector<int32_t>& pred,
 // **多くの列は int32 に収まる**（強度・分類・色・走査角）。収まる間は 32 bit で
 // 持ち、溢れた列だけ 64 bit に移す。並列に走る本数だけ効くので、200 万点・
 // 16 並列で 256 MB の差になる。予測は 64 bit で足すので値は変わらない。
-static thread_local std::vector<int32_t> g_w32;
 static thread_local std::vector<int64_t> g_w64;
 
 // **out は v と同じ配列でよい。**値はいったん w に符号化順で写してから引くので、
@@ -171,23 +170,15 @@ static thread_local std::vector<int64_t> g_w64;
 void spatial_residual(const std::vector<int64_t>& v, const std::vector<int32_t>& perm,
                       const std::vector<int32_t>& pred, int P, size_t n,
                       std::vector<int64_t>& out) {
-    g_w32.resize(n);
-    size_t t = 0;
-    for (; t < n; ++t) {
-        int64_t x = v[(size_t)perm[t]];
-        if (x < INT32_MIN || x > INT32_MAX) break;
-        g_w32[t] = (int32_t)x;
-    }
-    if (t == n) {
-        std::vector<int64_t>().swap(g_w64);          // 広い側は抱えない
-        const int32_t* w = g_w32.data();
+    if (&out != &v) {                    // 並べ替えて入れてから、後ろから引く
         out.resize(n);
-        for (size_t i = 0; i < n; ++i) out[i] = (int64_t)w[i] - predict(w, pred, P, i);
+        for (size_t t = 0; t < n; ++t) out[t] = v[(size_t)perm[t]];
+        residual_backward64(out, pred, P, n);
         return;
     }
+    // 同じ配列のときは在来で並べ替えられないので、作業配列を 1 本だけ使う。
     g_w64.resize(n);
-    for (size_t i = 0; i < t; ++i) g_w64[i] = g_w32[i];
-    for (size_t i = t; i < n; ++i) g_w64[i] = v[(size_t)perm[i]];
+    for (size_t t = 0; t < n; ++t) g_w64[t] = v[(size_t)perm[t]];
     const int64_t* w = g_w64.data();
     out.resize(n);
     for (size_t i = 0; i < n; ++i) out[i] = w[i] - predict(w, pred, P, i);
@@ -198,33 +189,30 @@ void spatial_residual(const std::vector<int64_t>& v, const std::vector<int32_t>&
 bool spatial_residual32(const std::vector<int64_t>& v, const std::vector<int32_t>& perm,
                         const std::vector<int32_t>& pred, int P, size_t n,
                         std::vector<int32_t>& out) {
-    g_w32.resize(n);
+    out.resize(n);
     for (size_t t = 0; t < n; ++t) {
         int64_t x = v[(size_t)perm[t]];
         if (x < INT32_MIN || x > INT32_MAX) return false;
-        g_w32[t] = (int32_t)x;
+        out[t] = (int32_t)x;
     }
-    const int32_t* w = g_w32.data();
-    out.resize(n);
-    for (size_t i = 0; i < n; ++i) {
+    return residual_backward32(out, pred, P, n);
+}
+
+bool residual_backward32(std::vector<int32_t>& a, const std::vector<int32_t>& pred,
+                         int P, size_t n) {
+    int32_t* w = a.data();
+    for (size_t i = n; i-- > 0; ) {
         int64_t r = (int64_t)w[i] - predict(w, pred, P, i);
         if (r < INT32_MIN || r > INT32_MAX) return false;
-        out[i] = (int32_t)r;
+        w[i] = (int32_t)r;
     }
     return true;
 }
 
-bool spatial_residual32_inplace(std::vector<int32_t>& v, const std::vector<int32_t>& perm,
-                                const std::vector<int32_t>& pred, int P, size_t n) {
-    g_w32.resize(n);
-    for (size_t t = 0; t < n; ++t) g_w32[t] = v[(size_t)perm[t]];
-    const int32_t* w = g_w32.data();
-    for (size_t i = 0; i < n; ++i) {
-        int64_t r = (int64_t)w[i] - predict(w, pred, P, i);
-        if (r < INT32_MIN || r > INT32_MAX) return false;
-        v[i] = (int32_t)r;
-    }
-    return true;
+void residual_backward64(std::vector<int64_t>& a, const std::vector<int32_t>& pred,
+                         int P, size_t n) {
+    int64_t* w = a.data();
+    for (size_t i = n; i-- > 0; ) w[i] -= predict(w, pred, P, i);
 }
 
 // **out は res と同じ配列でよい。**1 つめのループが res を最後まで読んでから
