@@ -13,6 +13,13 @@ void build_causal_predictors(const std::vector<double>& xyz, size_t n,
                              const std::vector<int32_t>& perm, int P, int k_search,
                              std::vector<int32_t>& pred);
 
+// 複数の P ぶんを 1 回の近傍探索で作る（木も 1 回だけ建てる）。
+// P ごとに呼んだときと同じ表を返す。
+void build_causal_predictors_multi(const std::vector<double>& xyz, size_t n,
+                                   const std::vector<int32_t>& perm,
+                                   const std::vector<int>& Ps,
+                                   std::vector<std::vector<int32_t>>& preds);
+
 struct AttrResult {
     std::string name;
     double bpp_raw = 0;        // 差分を取らずそのまま符号化

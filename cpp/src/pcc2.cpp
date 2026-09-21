@@ -459,9 +459,16 @@ const std::vector<int32_t>* CodecCtx::ensure(size_t n, int P) const {
     if (perm.empty()) perm = coding_order(*w, n, "morton");
     auto it = pred_by_p.find(P);
     if (it == pred_by_p.end()) {
-        std::vector<int32_t> pd;
-        build_causal_predictors(*w, n, perm, P, P + 4, pd);
-        it = pred_by_p.emplace(P, std::move(pd)).first;
+        // 候補が使う P はいつも 1 / 3 / 5 なので、最初の 1 回でまとめて作る。
+        // 近傍探索も KdTree の構築も 1 回で済む（P ごとだと 3 回になる）。
+        std::vector<int> Ps;
+        if (pred_by_p.empty()) { Ps = {1, 3, 5}; }
+        if (std::find(Ps.begin(), Ps.end(), P) == Ps.end()) Ps.push_back(P);
+        std::vector<std::vector<int32_t>> pds;
+        build_causal_predictors_multi(*w, n, perm, Ps, pds);
+        for (size_t a = 0; a < Ps.size(); ++a)
+            pred_by_p.emplace(Ps[a], std::move(pds[a]));
+        it = pred_by_p.find(P);
     }
     return &it->second;
 }

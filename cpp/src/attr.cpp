@@ -53,6 +53,52 @@ std::vector<int32_t> coding_order(const std::vector<double>& xyz, size_t n,
     return perm;
 }
 
+// 複数の P ぶんの表を 1 回の近傍探索で作る。
+//
+// P ごとに呼ぶと KdTree を毎回建て直し、1 点あたりの近傍探索も P の数だけ走る。
+// P=1/3/5 なら木を 3 回、探索を 3 回である。探索は距離の昇順に返るので、
+// k=9 で引いた先頭 5 つは k=5 で引いた結果と同じものになる。よって 1 回引いて
+// 「先頭 P+4 個の中の先行点を最大 P 個」を P ごとに切り出せば、
+// P ごとに引いたときと **同じ表** が得られる。
+void build_causal_predictors_multi(const std::vector<double>& xyz, size_t n,
+                                   const std::vector<int32_t>& perm,
+                                   const std::vector<int>& Ps,
+                                   std::vector<std::vector<int32_t>>& preds) {
+    if (Ps.empty()) return;
+    int kmax = 0;
+    for (int P : Ps) kmax = std::max(kmax, P + 4);
+    std::vector<int32_t> rank(n);
+    for (size_t t = 0; t < n; ++t) rank[perm[t]] = (int32_t)t;
+    preds.assign(Ps.size(), {});
+    for (size_t a = 0; a < Ps.size(); ++a) preds[a].assign(n * (size_t)Ps[a], -1);
+    KdTree tree(xyz);
+    unsigned nt = std::max(1u, std::thread::hardware_concurrency());
+    std::vector<std::thread> th;
+    for (unsigned w = 0; w < nt; ++w) {
+        th.emplace_back([&, w] {
+            std::vector<int64_t> idx(kmax);
+            std::vector<double> d2(kmax);
+            for (size_t t = w; t < n; t += nt) {
+                if (t == 0) continue;
+                int32_t i = perm[t];
+                tree.knn(&xyz[(size_t)i * 3], kmax, idx.data(), d2.data());
+                for (size_t a = 0; a < Ps.size(); ++a) {
+                    const int P = Ps[a], ks = P + 4;
+                    auto& pred = preds[a];
+                    int got = 0;
+                    for (int j = 0; j < ks && got < P; ++j) {
+                        if (idx[j] < 0) continue;
+                        int32_t r = rank[idx[j]];
+                        if ((size_t)r < t) pred[t * (size_t)P + got++] = r;
+                    }
+                    if (got == 0) pred[t * (size_t)P] = (int32_t)(t - 1);
+                }
+            }
+        });
+    }
+    for (auto& x : th) x.join();
+}
+
 // 符号化順で先行する空間近傍を最大 P 個。全フィールドで使い回す。
 void build_causal_predictors(const std::vector<double>& xyz, size_t n,
                              const std::vector<int32_t>& perm, int P, int k_search,
