@@ -286,14 +286,19 @@ static inline void ycocg_inv(int64_t Y, int64_t Co, int64_t Cg,
 }
 
 // 残差列（すでに残差なので差分は掛けない）をビット数文脈で符号化する
-static void enc_resid(const std::vector<std::vector<int64_t>>& res, std::vector<uint8_t>& out) {
+// 残差の要素型を選べるようにする。走査モデルの残差は座標の差なので
+// 実際には 32 bit に収まる（収まらない点が 1 つでもあれば int64 に落とす）。
+// 400 万点では 3 列 × 4 バイトの節約が 48 MB になる。符号化する値は同じなので
+// 出力は 1 バイトも変わらない。
+template <class T>
+static void enc_resid(const std::vector<std::vector<T>>& res, std::vector<uint8_t>& out) {
     size_t nc = res.size(), n = nc ? res[0].size() : 0;
     Encoder e;
     UIntCoder uc((int)nc * NCTX, 64);
     std::vector<int> ctx(nc, 0);
     for (size_t i = 0; i < n; ++i)
         for (size_t c = 0; c < nc; ++c) {
-            uint64_t z = zigzag(res[c][i]);
+            uint64_t z = zigzag((int64_t)res[c][i]);
             uc.encode(e, z, (int)c * NCTX + ctx[c]);
             ctx[c] = ctx_of(z);
         }
@@ -301,15 +306,16 @@ static void enc_resid(const std::vector<std::vector<int64_t>>& res, std::vector<
 }
 // 走査モデル専用。3 列のうち z（列 2）の文脈を、同じ点の面内・面外の残差の
 // ビット長から作る。幾何v3 が Z に X と Y の平均を使うのと同じ考え方。
-static void enc_resid_x(const std::vector<std::vector<int64_t>>& res, std::vector<uint8_t>& out) {
+template <class T>
+static void enc_resid_x(const std::vector<std::vector<T>>& res, std::vector<uint8_t>& out) {
     size_t n = res[0].size();
     Encoder e;
     UIntCoder uc(3 * NCTX, 64);
     int p0 = 0, p1 = 0;
     for (size_t i = 0; i < n; ++i) {
-        uint64_t a = zigzag(res[0][i]); uc.encode(e, a, 0 * NCTX + p0); int k0 = ctx_of(a);
-        uint64_t b = zigzag(res[1][i]); uc.encode(e, b, 1 * NCTX + p1); int k1 = ctx_of(b);
-        uint64_t c = zigzag(res[2][i]); uc.encode(e, c, 2 * NCTX + (k0 + k1) / 2);
+        uint64_t a = zigzag((int64_t)res[0][i]); uc.encode(e, a, 0 * NCTX + p0); int k0 = ctx_of(a);
+        uint64_t b = zigzag((int64_t)res[1][i]); uc.encode(e, b, 1 * NCTX + p1); int k1 = ctx_of(b);
+        uint64_t c = zigzag((int64_t)res[2][i]); uc.encode(e, c, 2 * NCTX + (k0 + k1) / 2);
         p0 = k0; p1 = k1;
     }
     out = e.finish();
@@ -356,7 +362,11 @@ namespace {
 
 struct ScanCtx {
     std::vector<int32_t> ord;        // 走査順 → 格納順
-    std::vector<int64_t> gps, ret;   // 走査順に並べた値
+    // 時刻は元の列を ord 経由で引く。並べ替えた複製を持つと 400 万点で 32 MB
+    // 余計に要る（値は同じなので、指す先を変えるだけ）。
+    const std::vector<int64_t>* gcol = nullptr;
+    inline int64_t gps(int32_t t) const { return (*gcol)[ord[t]]; }
+    std::vector<uint8_t> ret;        // 走査順の戻り番号（4 ビットしか使わない）
     std::vector<int32_t> swp;        // 掃引の先頭位置（末尾に n）
     int64_t gap_thr = 200;           // 掃引を切る時刻の隙間（データから測る）
 };
@@ -392,11 +402,10 @@ static bool build_scan_ctx(const CodecCtx* ctx, const std::vector<uint8_t>& para
         if ((*s)[a] != (*s)[b]) return (*s)[a] < (*s)[b];
         return (*g)[a] < (*g)[b];
     });
-    sc.gps.resize(n); sc.ret.assign(n, 1);
-    for (size_t t = 0; t < n; ++t) {
-        sc.gps[t] = (*g)[sc.ord[t]];
-        if (r && r->size() >= n) sc.ret[t] = (*r)[sc.ord[t]] & 0x0F;
-    }
+    sc.gcol = g;
+    sc.ret.assign(n, (uint8_t)1);
+    if (r && r->size() >= n)
+        for (size_t t = 0; t < n; ++t) sc.ret[t] = (uint8_t)((*r)[sc.ord[t]] & 0x0F);
     // 掃引の切れ目は時刻の隙間で決める。しきい値は発射間隔の中央値の 20 倍とし、
     // データから測る。gps_time の刻みは記録の仕方で桁が変わる（AHN4 は ulp 単位の
     // 10 刻み、AHN3 は GPS 週秒で約 43000 ulp）ので、定数では片方が必ず壊れる。
@@ -406,7 +415,7 @@ static bool build_scan_ctx(const CodecCtx* ctx, const std::vector<uint8_t>& para
         size_t stride = n > (1u << 21) ? n / (1u << 21) : 1;
         for (size_t t = 1; t < n; t += stride) {
             if ((*s)[sc.ord[t - 1]] != (*s)[sc.ord[t]]) continue;
-            int64_t d = sc.gps[t] - sc.gps[t - 1];
+            int64_t d = sc.gps((int32_t)t) - sc.gps((int32_t)(t - 1));
             if (d > 0) gap.push_back(d);
         }
         int64_t med = 10;
@@ -422,7 +431,7 @@ static bool build_scan_ctx(const CodecCtx* ctx, const std::vector<uint8_t>& para
         bool brk = (t == 0);
         if (!brk) {
             int32_t a = sc.ord[t - 1], b = sc.ord[t];
-            brk = ((*s)[a] != (*s)[b]) || (sc.gps[t] - sc.gps[t - 1] > sc.gap_thr);
+            brk = ((*s)[a] != (*s)[b]) || (sc.gps(t) - sc.gps(t - 1) > sc.gap_thr);
         }
         if (brk) sc.swp.push_back((int32_t)t);
     }
@@ -535,7 +544,7 @@ static bool enc_geom_scan(const std::vector<const std::vector<int64_t>*>& cols,
                 if (use_label && L.label[t] != want) continue;
                 int32_t i = sc.ord[t];
                 bx.push_back(CX[i]); by.push_back(CY[i]); bz.push_back(CZ[i]);
-                bg.push_back(sc.gps[t]);
+                bg.push_back(sc.gps(t));
                 bs.push_back(sa_col && sa_col->size() >= n ? (*sa_col)[i] : 0);
             }
         };
@@ -622,7 +631,24 @@ static bool enc_geom_scan(const std::vector<const std::vector<int64_t>*>& cols,
     if (var == 5)
         for (auto& ln : L.line) { ln.ok = 0; ln.Sz = 0; ln.th0 = 0; ln.om = 0; }
 
-    std::vector<std::vector<int64_t>> res(3, std::vector<int64_t>(n, 0));
+    // 残差は座標の差なので実際には 32 bit に収まる。まず int32 で持ち、
+    // 収まらない点が出たらその列だけ int64 に退避する（符号化する値は同じなので
+    // 出力は 1 バイトも変わらない）。400 万点では 48 MB の節約になる。
+    std::vector<std::vector<int32_t>> res32(3, std::vector<int32_t>(n, 0));
+    std::vector<std::vector<int64_t>> res64;      // 溢れたときだけ使う
+    bool wide = false;
+    auto put_res = [&](int c, size_t t, int64_t v) {
+        if (!wide) {
+            if (v >= INT32_MIN && v <= INT32_MAX) { res32[c][t] = (int32_t)v; return; }
+            // 溢れた。ここまでの分を 64 bit に写してから続ける。
+            res64.assign(3, std::vector<int64_t>(n, 0));
+            for (int cc = 0; cc < 3; ++cc)
+                for (size_t k = 0; k < n; ++k) res64[cc][k] = res32[cc][k];
+            res32.clear(); res32.shrink_to_fit();
+            wide = true;
+        }
+        res64[c][t] = v;
+    };
     // z は「同じ掃引・同じ戻り番号の直前の点」から予測する。
     // その系列がまだ空なら、直前に符号化した任意の点の z を使う（掃引をまたぐ）。
     int64_t last_any = 0;
@@ -640,7 +666,7 @@ static bool enc_geom_scan(const std::vector<const std::vector<int64_t>*>& cols,
             const SweepParam& sp = L.line[li];
             int gidx = (L.split[k] && L.label[t]) ? 1 : 0;
             if (!hg[gidx]) {
-                g0[gidx] = sc.gps[t]; hg[gidx] = true;
+                g0[gidx] = sc.gps(t); hg[gidx] = true;
                 mps[gidx] = MedPred(); mps[gidx].prev = sp.s0;
                 mpo[gidx] = MedPred(); mpo[gidx].prev = sp.off0;
             }
@@ -648,15 +674,15 @@ static bool enc_geom_scan(const std::vector<const std::vector<int64_t>*>& cols,
             int64_t s, off;
             shear_fwd(CX[i], CY[i], sp.t2, sp.sn, s, off);
             int64_t po = mpo[gidx].predict();
-            int64_t ps = sp.ok ? scan_predict(sp, sc.gps[t] - g0[gidx], CZ[i])
+            int64_t ps = sp.ok ? scan_predict(sp, sc.gps(t) - g0[gidx], CZ[i])
                                : mps[gidx].predict();
-            res[0][t] = s - ps;
-            res[1][t] = off - po;
+            put_res(0, (size_t)t, s - ps);
+            put_res(1, (size_t)t, off - po);
             mps[gidx].push(s); mpo[gidx].push(off);
             int r = (int)sc.ret[t] & 15;
             if (!hz[r]) { mz[r] = MedPred(); mz[r].prev = last_any; }
             int64_t pz = use_med ? mz[r].predict() : (hz[r] ? lz[r] : last_any);
-            res[2][t] = CZ[i] - pz;
+            put_res(2, (size_t)t, CZ[i] - pz);
             mz[r].push(CZ[i]);
             lz[r] = CZ[i]; hz[r] = true; last_any = CZ[i];
         }
@@ -699,10 +725,10 @@ static bool enc_geom_scan(const std::vector<const std::vector<int64_t>*>& cols,
     // 走査文脈はここから先で参照しない。400 万点では ord と gps と ret だけで
     // 80 MB あり、残差（3 列 × 8 バイト）と同時に抱えるとピークが立つ。
     sc.ord.clear(); sc.ord.shrink_to_fit();
-    sc.gps.clear(); sc.gps.shrink_to_fit();
     sc.ret.clear(); sc.ret.shrink_to_fit();
     L.label.clear(); L.label.shrink_to_fit();
-    if (use_xctx) enc_resid_x(res, br); else enc_resid(res, br);
+    if (wide) { if (use_xctx) enc_resid_x(res64, br); else enc_resid(res64, br); }
+    else       { if (use_xctx) enc_resid_x(res32, br); else enc_resid(res32, br); }
     mark("残差を符号化");
 
     // PCC_SCAN_DEBUG=1 で内訳を出す。走査モデルが効く規模と効かない規模を
@@ -720,7 +746,8 @@ static bool enc_geom_scan(const std::vector<const std::vector<int64_t>*>& cols,
             for (int32_t t = sc.swp[k2]; t < sc.swp[k2 + 1]; ++t) {
                 bool okl = L.line[line_index(L, k2, (size_t)t)].ok != 0;
                 for (int c = 0; c < 3; ++c)
-                    (okl ? sok : sng)[c] += bitlen(zigzag(res[c][t]));
+                    (okl ? sok : sng)[c] += bitlen(zigzag(
+                        wide ? res64[c][t] : (int64_t)res32[c][t]));
                 if (okl) ++c_ok; else ++c_ng;
             }
         fprintf(stderr,
@@ -832,7 +859,7 @@ static bool dec_geom_scan(const std::vector<uint8_t>& param, const uint8_t* data
             const SweepParam& sp = L.line[li];
             int gidx = (L.split[k] && L.label[t]) ? 1 : 0;
             if (!hg[gidx]) {
-                g0[gidx] = sc.gps[t]; hg[gidx] = true;
+                g0[gidx] = sc.gps(t); hg[gidx] = true;
                 mps[gidx] = MedPred(); mps[gidx].prev = sp.s0;
                 mpo[gidx] = MedPred(); mpo[gidx].prev = sp.off0;
             }
@@ -843,7 +870,7 @@ static bool dec_geom_scan(const std::vector<uint8_t>& param, const uint8_t* data
             mz[r].push(z);
             lz[r] = z; hz[r] = true; last_any = z;
             int64_t po = mpo[gidx].predict();
-            int64_t ps = sp.ok ? scan_predict(sp, sc.gps[t] - g0[gidx], z)
+            int64_t ps = sp.ok ? scan_predict(sp, sc.gps(t) - g0[gidx], z)
                                : mps[gidx].predict();
             int64_t s = res[0][t] + ps, off = res[1][t] + po;
             mps[gidx].push(s); mpo[gidx].push(off);
