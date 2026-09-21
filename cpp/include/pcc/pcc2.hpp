@@ -43,6 +43,7 @@ struct CodecCtx {
     const Frame* full = nullptr;
     mutable std::vector<int32_t> perm, pred;
     mutable int built_P = -1;
+    mutable size_t built_n = 0;   // 標本と全点で表を取り違えないため
     bool ensure(size_t n, int P) const;           // 順序表と予測子表を作る（P ごとに 1 回）
     const std::vector<double>* world_ptr() const; // 無ければ作る
     // 報告する構成を往復検証に通すための指定。空なら通常どおり全候補を実測して選ぶ。
@@ -73,9 +74,12 @@ bool codec_decode(uint16_t id, const std::vector<uint8_t>& param,
                   const CodecCtx* ctx = nullptr);
 
 // 候補を全部実際に符号化して、最も短いものを返す（推定は使わない）
+// preselect: 候補が多いとき、標本で順位を付けてから上位だけを全点で測る。
+// 幾何では bpp が完全に不変のまま 2 倍速くなったが、属性では標本の誤順位で
+// USGS NY が +3.7% 悪化した。サイズが第一なので、幾何だけで使う。
 Stream best_stream(const Frame& f, const std::vector<std::string>& cols,
                    const std::vector<Cand>& candidates, const CodecCtx* ctx = nullptr,
-                   std::string* trace = nullptr);
+                   std::string* trace = nullptr, bool preselect = false);
 std::string cand_name(uint16_t codec, const std::vector<uint8_t>& param);
 
 // 既定の計画: 幾何 3 列を 1 ストリームに、属性は列ごとに、それぞれ実測で選ぶ

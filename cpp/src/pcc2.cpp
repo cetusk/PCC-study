@@ -340,10 +340,13 @@ const std::vector<double>* CodecCtx::world_ptr() const {
 bool CodecCtx::ensure(size_t n, int P) const {
     const std::vector<double>* w = world_ptr();
     if (!w || w->size() < n * 3) return false;
-    if (built_P == P) return true;
+    if (built_P == P && built_n == n) return true;
+    // 点数が変わったら作り直す。標本で順位を付けるときに同じ P で呼ばれると、
+    // 標本ぶんの表を全点の符号化に使ってしまう。
+    if (built_n != n) perm.clear();
     if (perm.empty()) perm = coding_order(*w, n, "morton");
     build_causal_predictors(*w, n, perm, P, P + 4, pred);
-    built_P = P;
+    built_P = P; built_n = n;
     return true;
 }
 
@@ -1191,9 +1194,74 @@ std::string cand_name(uint16_t c, const std::vector<uint8_t>& p) {
 
 Stream best_stream(const Frame& f, const std::vector<std::string>& cols,
                    const std::vector<Cand>& candidates, const CodecCtx* ctx,
-                   std::string* trace) {
+                   std::string* trace, bool preselect) {
     std::vector<const std::vector<int64_t>*> cv;
     for (const auto& c : cols) cv.push_back(f.get(c));
+    // 候補が多いときは、まず先頭の標本で順位を付け、上位だけを全点で測る。
+    // 全候補を全点で符号化すると、幾何だけで 11 候補 × 全点になる。
+    // 標本の 1 位が全点でも 1 位とは限らないので上位 3 つを残す。
+    const size_t ncols_n = (cv.empty() || !cv[0]) ? 0 : cv[0]->size();
+    // 標本は点数に比例させる（固定だと小さい入力で効かず、大きい入力で重い）。
+    // 0 を指定すると事前の順位付けをしない。
+    static const long PRE_OPT = [] {
+        const char* e = getenv("PCC_PRESELECT");
+        return e ? atol(e) : -1;
+    }();
+    static const size_t PRE_KEEP = [] {
+        const char* e = getenv("PCC_PREKEEP");
+        return e ? (size_t)atol(e) : (size_t)3;
+    }();
+    size_t PRE_SAMP;
+    if (PRE_OPT >= 0) PRE_SAMP = (size_t)PRE_OPT;
+    else {
+        PRE_SAMP = ncols_n / 8;
+        if (PRE_SAMP < 20000) PRE_SAMP = 20000;
+        if (PRE_SAMP > 200000) PRE_SAMP = 200000;
+    }
+    std::vector<Cand> use = candidates;
+    if (preselect && PRE_SAMP && candidates.size() > PRE_KEEP + 1 &&
+        ncols_n > PRE_SAMP * 2) {
+        std::vector<std::vector<int64_t>> sub;
+        sub.reserve(cv.size());
+        for (auto* c : cv) sub.emplace_back(c->begin(), c->begin() + PRE_SAMP);
+        std::vector<const std::vector<int64_t>*> scv;
+        for (auto& v : sub) scv.push_back(&v);
+        std::vector<std::pair<size_t, Cand>> pre;
+        for (const auto& cd : candidates) {
+            std::vector<uint8_t> blob; std::string e2;
+            if (!codec_encode(cd.codec, scv, cd.param, blob, e2, ctx)) continue;
+            pre.push_back({blob.size(), cd});
+        }
+        if (pre.size() > PRE_KEEP) {
+            std::sort(pre.begin(), pre.end(),
+                      [](const auto& a, const auto& b) { return a.first < b.first; });
+            use.clear();
+            for (size_t i = 0; i < PRE_KEEP; ++i) use.push_back(pre[i].second);
+            // 標本で系統的に不利になる族は、順位に入らなくても 1 つ残す。
+            //   走査モデル … 掃引の数が減ると当てはめが効かない
+            //                 （AHN3 の走査変換は標本では 6 位以内にも入らないのに
+            //                   全点では 1 位だった）
+            //   空間予測   … 点を間引くと近傍が遠くなる（30 節の nir と同じ理由）
+            //   幾何v4     … 最近傍の当たり方が場所で変わる（AHN4 _21 は
+            //                   先頭 12.5 万点だけ見ると 3 位以内に入らない）
+            auto family = [](const Cand& c) -> int {
+                if (c.codec == C_GEOM_SCAN) return 1;
+                if (c.codec == C_ATTR_SPATIAL || c.codec == C_ATTR_COLOR) return 2;
+                if (c.codec == C_ATTR_XREF && !c.param.empty() &&
+                    c.param[0] != 0 && c.param[0] != 100) return 2;
+                if (c.codec == C_GEOM_XYZ && !c.param.empty() && c.param[0] == 4) return 3;
+                return 0;
+            };
+            for (int fam = 1; fam <= 3; ++fam) {
+                bool have = false;
+                for (const auto& c : use) if (family(c) == fam) have = true;
+                if (have) continue;
+                for (const auto& pr : pre)
+                    if (family(pr.second) == fam) { use.push_back(pr.second); break; }
+            }
+        }
+    }
+
     Stream best; best.cols = cols; best.codec = C_RAW64;
     bool first = true;
     // 標本で順位を付けたとき、全点での 1 位が標本で 3 位まで落ちることがある
@@ -1203,7 +1271,7 @@ Stream best_stream(const Frame& f, const std::vector<std::string>& cols,
         return e ? (size_t)atoi(e) : (size_t)3;
     }();
     std::vector<std::pair<size_t, Cand>> rank;      // (符号長, 候補) を短い順に
-    for (const auto& cd : candidates) {
+    for (const auto& cd : use) {
         std::vector<uint8_t> blob; std::string err;
         if (!codec_encode(cd.codec, cv, cd.param, blob, err, ctx)) {
             if (trace) *trace += "      " + cand_name(cd.codec, cd.param) + " 不可: " + err + "\n";
@@ -1365,7 +1433,7 @@ std::vector<Stream> plan_streams(const Frame& f, bool joint_geom, std::string* l
                 gc.swap(only);
             }
         }
-        emit(best_stream(f, g, gc, ctx, trp));
+        emit(best_stream(f, g, gc, ctx, trp, true));   // 幾何だけ事前選別する
     }
 
     // 色 3 列が揃っていれば、可逆色変換つきの同時符号化を候補に加える。
