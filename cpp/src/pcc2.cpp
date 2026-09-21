@@ -74,6 +74,28 @@ inline int bitlen(uint64_t z) { int k = 0; while (z) { ++k; z >>= 1; } return k;
 // 文脈の数。zigzag は最大 64 bit なので 65 段を 24 段に丸めて使う。
 inline constexpr int NCTX = 24;
 inline int ctx_of(uint64_t z) { int k = bitlen(z); return k >= NCTX ? NCTX - 1 : k; }
+
+// 予測子。いずれも復号済みの点だけから計算できるので副情報は要らない。
+// mode 0 は MedPred そのもの（直近 3 つの差分の中央値）。
+inline int64_t fdiv(int64_t a, int64_t b) {         // 負でも切り捨て方向を揃える
+    int64_t q = a / b;
+    if ((a % b) && ((a < 0) != (b < 0))) --q;
+    return q;
+}
+struct Pred {
+    MedPred m;
+    int64_t q[4] = {0, 0, 0, 0};
+    int k = 0, mode = 0;
+    inline int64_t predict() const {
+        if (mode == 0) return m.predict();
+        if (mode == 2) return m.prev + fdiv(m.predict() - m.prev, 2);
+        // q[0] には最初の点の絶対座標が入る（prev の初期値が 0 のため）。
+        // 4 つ揃っても 1 巡するまでは差分でないので使わない。
+        if (k < 5) return m.predict();
+        return m.prev + fdiv(q[0] + q[1] + q[2] + q[3], 4);
+    }
+    inline void push(int64_t x) { q[k & 3] = x - m.prev; ++k; m.push(x); }
+};
 } // namespace
 
 // ---------------------------------------------------------------- 符号器
@@ -187,11 +209,12 @@ static void dec_geom_aux(const uint8_t* data, size_t len, size_t n, size_t nc,
 // 何ビットだったかを文脈に使い、Z には X と Y の平均を使う。
 // 走査線上では 3 軸の残差の大きさが連動するので、これが効く。
 static void enc_geom_x(const std::vector<const std::vector<int64_t>*>& cols,
-                       std::vector<uint8_t>& out) {
+                       int pmode, std::vector<uint8_t>& out) {
     size_t n = cols[0]->size();
     Encoder e;
     UIntCoder uc(3 * NCTX, 64);
-    MedPred mp[3];
+    Pred mp[3];
+    for (int c = 0; c < 3; ++c) mp[c].mode = pmode;
     int prev_kx = 0;
     for (size_t i = 0; i < n; ++i) {
         int k[3] = {0, 0, 0};
@@ -233,19 +256,32 @@ static inline int nn_back(const int64_t* X, const int64_t* Y, const int64_t* Z,
     return (int)(i - 1 - bj);                  // 0 が直前の点
 }
 
+// tmode 0 は選んだ点そのもの、1 は直近 3 つの差分の中央値を足す、2 はその半分。
+// 差分は格納順で連続する 2 点の差なので、復号側も同じ値を作れる。
+static inline int64_t trend_of(const MedPred& t, int tmode) {
+    // 差分が 3 つ揃うまでは傾きを足さない。MedPred は k<3 のとき d[0] を返すが、
+    // その d[0] は最初の点の絶対座標である（prev の初期値が 0 のため）。
+    if (!tmode || t.k < 3) return 0;
+    int64_t v = t.predict() - t.prev;
+    return tmode == 2 ? fdiv(v, 2) : v;
+}
+
 static void enc_geom_w(const std::vector<const std::vector<int64_t>*>& cols,
-                       size_t w, std::vector<uint8_t>& out) {
+                       size_t w, int tmode, std::vector<uint8_t>& out) {
     size_t n = cols[0]->size();
     const int64_t *X = cols[0]->data(), *Y = cols[1]->data(), *Z = cols[2]->data();
     Encoder e;
     UIntCoder uc(3 * NCTX, 64);
     UIntCoder ui(NCTX, 8);                     // 添字。文脈は直前の添字
+    MedPred tp[3];
     int prev_kx = 0, prev_idx = 0;
     for (size_t i = 0; i < n; ++i) {
         int back = i ? nn_back(X, Y, Z, i, w) : 0;
         if (i) ui.encode(e, (uint64_t)back, prev_idx < NCTX ? prev_idx : NCTX - 1);
         size_t j = i ? i - 1 - (size_t)back : 0;
-        const int64_t p[3] = {i ? X[j] : 0, i ? Y[j] : 0, i ? Z[j] : 0};
+        const int64_t p[3] = {i ? X[j] + trend_of(tp[0], tmode) : 0,
+                              i ? Y[j] + trend_of(tp[1], tmode) : 0,
+                              i ? Z[j] + trend_of(tp[2], tmode) : 0};
         const int64_t v[3] = {X[i], Y[i], Z[i]};
         int k[3] = {0, 0, 0};
         for (int c = 0; c < 3; ++c) {
@@ -257,23 +293,27 @@ static void enc_geom_w(const std::vector<const std::vector<int64_t>*>& cols,
         }
         prev_kx = k[0];
         prev_idx = back;
+        for (int c = 0; c < 3; ++c) tp[c].push(v[c]);
     }
     out = e.finish();
 }
 
-static void dec_geom_w(const uint8_t* data, size_t len, size_t n, size_t w,
+static void dec_geom_w(const uint8_t* data, size_t len, size_t n, size_t w, int tmode,
                        std::vector<std::vector<int64_t>>& out) {
     (void)w;
     out.assign(3, std::vector<int64_t>(n));
     Decoder d(data, len);
     UIntCoder uc(3 * NCTX, 64);
     UIntCoder ui(NCTX, 8);
+    MedPred tp[3];
     int prev_kx = 0, prev_idx = 0;
     for (size_t i = 0; i < n; ++i) {
         int back = 0;
         if (i) back = (int)ui.decode(d, prev_idx < NCTX ? prev_idx : NCTX - 1);
         size_t j = i ? i - 1 - (size_t)back : 0;
-        const int64_t p[3] = {i ? out[0][j] : 0, i ? out[1][j] : 0, i ? out[2][j] : 0};
+        const int64_t p[3] = {i ? out[0][j] + trend_of(tp[0], tmode) : 0,
+                              i ? out[1][j] + trend_of(tp[1], tmode) : 0,
+                              i ? out[2][j] + trend_of(tp[2], tmode) : 0};
         int k[3] = {0, 0, 0};
         for (int c = 0; c < 3; ++c) {
             int ctxc = (c == 0) ? prev_kx : (c == 1 ? k[0] : (k[0] + k[1]) / 2);
@@ -284,15 +324,17 @@ static void dec_geom_w(const uint8_t* data, size_t len, size_t n, size_t w,
         }
         prev_kx = k[0];
         prev_idx = back;
+        for (int c = 0; c < 3; ++c) tp[c].push(out[c][i]);
     }
 }
 
-static void dec_geom_x(const uint8_t* data, size_t len, size_t n,
+static void dec_geom_x(const uint8_t* data, size_t len, size_t n, int pmode,
                        std::vector<std::vector<int64_t>>& out) {
     out.assign(3, std::vector<int64_t>(n));
     Decoder d(data, len);
     UIntCoder uc(3 * NCTX, 64);
-    MedPred mp[3];
+    Pred mp[3];
+    for (int c = 0; c < 3; ++c) mp[c].mode = pmode;
     int prev_kx = 0;
     for (size_t i = 0; i < n; ++i) {
         int k[3] = {0, 0, 0};
@@ -996,14 +1038,14 @@ bool codec_encode(uint16_t id, const std::vector<const std::vector<int64_t>*>& c
         if (var == 4) {
             if (cols.size() != 3) { err = "幾何v4 は 3 軸"; return false; }
             size_t w = param.size() > 1 ? (size_t)param[1] : 16;
-            enc_geom_w(cols, w ? w : 16, out);
+            enc_geom_w(cols, w ? w : 16, param.size() > 2 ? param[2] : 0, out);
         } else if (var == 2) {
             const std::vector<int64_t>* a = aux_col(param, ctx);
             if (!a || a->size() < cols[0]->size()) { err = "補助列がない"; return false; }
             enc_geom_aux(cols, *a, out);
         } else if (var == 3) {
             if (cols.size() != 3) { err = "幾何v3 は 3 軸"; return false; }
-            enc_geom_x(cols, out);
+            enc_geom_x(cols, param.size() > 1 ? param[1] : 0, out);
         } else if (var == 1) enc_geom_med(cols, out);
         else enc_cols(cols, 2, out);
         return true;
@@ -1081,14 +1123,14 @@ bool codec_decode(uint16_t id, const std::vector<uint8_t>& param,
         if (var == 4) {
             if (ncol != 3) { err = "幾何v4 は 3 軸"; return false; }
             size_t w = param.size() > 1 ? (size_t)param[1] : 16;
-            dec_geom_w(data, len, n, w ? w : 16, out);
+            dec_geom_w(data, len, n, w ? w : 16, param.size() > 2 ? param[2] : 0, out);
         } else if (var == 2) {
             const std::vector<int64_t>* a = aux_col(param, ctx);
             if (!a || a->size() < n) { err = "補助列がない"; return false; }
             dec_geom_aux(data, len, n, ncol, *a, out);
         } else if (var == 3) {
             if (ncol != 3) { err = "幾何v3 は 3 軸"; return false; }
-            dec_geom_x(data, len, n, out);
+            dec_geom_x(data, len, n, param.size() > 1 ? param[1] : 0, out);
         } else if (var == 1) dec_geom_med(data, len, n, ncol, out);
         else dec_cols(data, len, n, ncol, 2, out);
         return true;
@@ -1172,8 +1214,15 @@ std::string cand_name(uint16_t c, const std::vector<uint8_t>& p) {
         if (p.empty() || p[0] == 0) return "幾何v0";
         if (p[0] == 4) {
             static char b4[20];
-            snprintf(b4, sizeof b4, "幾何v4W%d", p.size() > 1 ? p[1] : 16);
+            int tm = p.size() > 2 ? p[2] : 0;
+            snprintf(b4, sizeof b4, "幾何v4W%d%s", p.size() > 1 ? p[1] : 16,
+                     tm == 0 ? "" : (tm == 1 ? "傾" : "傾半"));
             return b4;
+        }
+        if (p[0] == 3 && p.size() > 1 && p[1]) {
+            static char b3[20];
+            snprintf(b3, sizeof b3, "幾何v3%s", p[1] == 1 ? "平均4" : "半");
+            return b3;
         }
         return p[0] == 1 ? "幾何v1" : (p[0] == 2 ? "幾何v2" : "幾何v3");
     case C_ATTR_SPATIAL: snprintf(b, sizeof b, "sp(P=%d)", p.empty() ? 0 : p[0]); return b;
@@ -1198,7 +1247,7 @@ Stream best_stream(const Frame& f, const std::vector<std::string>& cols,
     std::vector<const std::vector<int64_t>*> cv;
     for (const auto& c : cols) cv.push_back(f.get(c));
     // 候補が多いときは、まず先頭の標本で順位を付け、上位だけを全点で測る。
-    // 全候補を全点で符号化すると、幾何だけで 11 候補 × 全点になる。
+    // 全候補を全点で符号化すると、幾何だけで十数候補 × 全点になる。
     // 標本の 1 位が全点でも 1 位とは限らないので上位 3 つを残す。
     const size_t ncols_n = (cv.empty() || !cv[0]) ? 0 : cv[0]->size();
     // 標本は点数に比例させる（固定だと小さい入力で効かず、大きい入力で重い）。
@@ -1383,9 +1432,15 @@ std::vector<Stream> plan_streams(const Frame& f, bool joint_geom, std::string* l
         std::vector<std::string> g{f.geom[0], f.geom[1], f.geom[2]};
         std::vector<Cand> gc{{C_RAW64, {}}, {C_RANGE, {}}, {C_RANGE_DELTA, {}},
                              {C_GEOM_XYZ, {0}}, {C_GEOM_XYZ, {1}}, {C_GEOM_XYZ, {3}},
+                             // 予測子だけを差し替えた 幾何v3。副情報は増えない。
+                             // 直近 4 つの差分の平均は TLS と AHN3 で、中央値の
+                             // 半分は autzen-2023 で残差が短かった（符号化前の見積り）。
+                             {C_GEOM_XYZ, {3, 1}}, {C_GEOM_XYZ, {3, 2}},
                              // 直近 W 点の最近傍から予測する。格納順が空間的に
                              // 連続していない入力で効く（幾何v4 の注記を参照）。
-                             {C_GEOM_XYZ, {4, 4}}, {C_GEOM_XYZ, {4, 16}}};
+                             {C_GEOM_XYZ, {4, 4}}, {C_GEOM_XYZ, {4, 16}},
+                             // 選んだ点に局所の傾きを足す。副情報は増えない。
+                             {C_GEOM_XYZ, {4, 4, 1}}};
         if (!aux.empty()) {
             std::vector<uint8_t> pv{2};
             uint16_t l = (uint16_t)aux.size();
