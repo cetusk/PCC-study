@@ -7,6 +7,8 @@
 //   * 恒等符号器 RAW64 を必ず候補に含めるので、器の長さは有限で閉じる
 #pragma once
 #include <cstdint>
+#include <map>
+#include <mutex>
 #include <string>
 #include <vector>
 #include "pcc/frame.hpp"
@@ -42,10 +44,15 @@ struct CodecCtx {
     // 勝者が候補に入らないことがある（AHN3 の nir が実際にそうだった）。
     // 参照列の選定だけは全点の統計で行うため、全点の Frame をここに置く。
     const Frame* full = nullptr;
-    mutable std::vector<int32_t> perm, pred;
-    mutable int built_P = -1;
+    // 近傍の予測子表は P ごとに違う。候補ごとに作り直すと、1 つの列で
+    // sp(P=1) / sp(P=3) / sp(P=5) …と何度も建て直すことになる（11 列で 30 回超）。
+    // P ごとに取っておく。表は n*P の int32 なので 100 万点・P=5 で 20 MB。
+    mutable std::vector<int32_t> perm;
+    mutable std::map<int, std::vector<int32_t>> pred_by_p;
     mutable size_t built_n = 0;   // 標本と全点で表を取り違えないため
-    bool ensure(size_t n, int P) const;           // 順序表と予測子表を作る（P ごとに 1 回）
+    mutable std::mutex mu;        // 候補を並列に符号化するときのため
+    // 順序表と、P に対応する予測子表を返す。作っていなければ作る。
+    const std::vector<int32_t>* ensure(size_t n, int P) const;
     const std::vector<double>* world_ptr() const; // 無ければ作る
     // 報告する構成を往復検証に通すための指定。空なら通常どおり全候補を実測して選ぶ。
     std::string force_geom;                       // X+Y+Z をこの候補名に固定する

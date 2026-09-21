@@ -449,17 +449,21 @@ const std::vector<double>* CodecCtx::world_ptr() const {
     return world_own.empty() ? nullptr : &world_own;
 }
 
-bool CodecCtx::ensure(size_t n, int P) const {
+const std::vector<int32_t>* CodecCtx::ensure(size_t n, int P) const {
+    std::lock_guard<std::mutex> lk(mu);
     const std::vector<double>* w = world_ptr();
-    if (!w || w->size() < n * 3) return false;
-    if (built_P == P && built_n == n) return true;
+    if (!w || w->size() < n * 3) return nullptr;
     // 点数が変わったら作り直す。標本で順位を付けるときに同じ P で呼ばれると、
     // 標本ぶんの表を全点の符号化に使ってしまう。
-    if (built_n != n) perm.clear();
+    if (built_n != n) { perm.clear(); pred_by_p.clear(); built_n = n; }
     if (perm.empty()) perm = coding_order(*w, n, "morton");
-    build_causal_predictors(*w, n, perm, P, P + 4, pred);
-    built_P = P; built_n = n;
-    return true;
+    auto it = pred_by_p.find(P);
+    if (it == pred_by_p.end()) {
+        std::vector<int32_t> pd;
+        build_causal_predictors(*w, n, perm, P, P + 4, pd);
+        it = pred_by_p.emplace(P, std::move(pd)).first;
+    }
+    return &it->second;
 }
 
 // 可逆な輝度・色差変換 YCoCg-R。各段は u <- u ± floor(v/2) の形で、
@@ -1228,9 +1232,10 @@ bool codec_encode(uint16_t id, const std::vector<const std::vector<int64_t>*>& c
             int64_t prev = 0;
             for (size_t i = 0; i < n; ++i) { int64_t v = d[0][i]; d[0][i] = v - prev; prev = v; }
         } else if (P > 0) {
-            if (!ctx->ensure(n, P)) { err = "座標がない"; return false; }
+            const std::vector<int32_t>* pdt = ctx->ensure(n, P);
+            if (!pdt) { err = "座標がない"; return false; }
             std::vector<int64_t> r;
-            spatial_residual(d[0], ctx->perm, ctx->pred, P, n, r);
+            spatial_residual(d[0], ctx->perm, *pdt, P, n, r);
             d[0] = std::move(r);
         }
         enc_resid(d, out);
@@ -1241,7 +1246,8 @@ bool codec_encode(uint16_t id, const std::vector<const std::vector<int64_t>*>& c
         if (!ctx || param.empty()) { err = "空間予測に必要な副次情報がない"; return false; }
         int P = param[0];
         size_t n = cols[0]->size();
-        if (!ctx->ensure(n, P)) { err = "座標がない"; return false; }
+        const std::vector<int32_t>* pdt = ctx->ensure(n, P);
+            if (!pdt) { err = "座標がない"; return false; }
         std::vector<std::vector<int64_t>> src;
         if (id == C_ATTR_COLOR) {
             if (cols.size() != 3) { err = "色は 3 列でなければならない"; return false; }
@@ -1254,7 +1260,7 @@ bool codec_encode(uint16_t id, const std::vector<const std::vector<int64_t>*>& c
         }
         std::vector<std::vector<int64_t>> res(src.size());
         for (size_t c = 0; c < src.size(); ++c)
-            spatial_residual(src[c], ctx->perm, ctx->pred, P, n, res[c]);
+            spatial_residual(src[c], ctx->perm, *pdt, P, n, res[c]);
         enc_resid(res, out);
         return true;
     }
@@ -1310,9 +1316,10 @@ bool codec_decode(uint16_t id, const std::vector<uint8_t>& param,
             int64_t acc = 0;
             for (size_t i = 0; i < n; ++i) { acc += d[0][i]; d[0][i] = acc; }
         } else if (P > 0) {
-            if (!ctx->ensure(n, P)) { err = "座標がない"; return false; }
+            const std::vector<int32_t>* pdt = ctx->ensure(n, P);
+            if (!pdt) { err = "座標がない"; return false; }
             std::vector<int64_t> r;
-            spatial_restore(d[0], ctx->perm, ctx->pred, P, n, r);
+            spatial_restore(d[0], ctx->perm, *pdt, P, n, r);
             d[0] = std::move(r);
         }
         out.assign(1, std::vector<int64_t>(n));
@@ -1323,12 +1330,13 @@ bool codec_decode(uint16_t id, const std::vector<uint8_t>& param,
     case C_ATTR_COLOR: {
         if (!ctx || param.empty()) { err = "空間予測に必要な副次情報がない"; return false; }
         int P = param[0];
-        if (!ctx->ensure(n, P)) { err = "座標がない"; return false; }
+        const std::vector<int32_t>* pdt = ctx->ensure(n, P);
+            if (!pdt) { err = "座標がない"; return false; }
         std::vector<std::vector<int64_t>> res;
         dec_resid(data, len, n, ncol, res);
         std::vector<std::vector<int64_t>> src(ncol);
         for (size_t c = 0; c < ncol; ++c)
-            spatial_restore(res[c], ctx->perm, ctx->pred, P, n, src[c]);
+            spatial_restore(res[c], ctx->perm, *pdt, P, n, src[c]);
         if (id == C_ATTR_COLOR) {
             if (ncol != 3) { err = "色は 3 列でなければならない"; return false; }
             out.assign(3, std::vector<int64_t>(n));
@@ -1453,7 +1461,13 @@ Stream best_stream(const Frame& f, const std::vector<std::string>& cols,
     // 並列にしてよいのは幾何の候補だけである（属性の候補は CodecCtx の
     // 可変メンバを作る）。標本で順位を付けることと、並列に符号化することは
     // 別の話なので、旗を分ける。
-    const bool par = preselect;
+    // 属性の候補も並列にしてよいか。CodecCtx の可変メンバ（順序表・予測子表・
+    // world）は排他で守られ、P ごとに取ってあるので読むだけになった。
+    static const bool PAR_ALL = [] {
+        const char* e = getenv("PCC_PAR_ATTR");
+        return !e || e[0] != '0';
+    }();
+    const bool par = preselect || PAR_ALL;
     if (PRE_ATTR) preselect = true;
     std::vector<const std::vector<int64_t>*> cv;
     for (const auto& c : cols) cv.push_back(f.get(c));
