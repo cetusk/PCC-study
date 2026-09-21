@@ -55,6 +55,39 @@ std::vector<int32_t> coding_order(const std::vector<double>& xyz, size_t n,
         }
         key[i] = (part1by2(c[0]) << 2) | (part1by2(c[1]) << 1) | part1by2(c[2]);
     }
+    // **鍵が重複しなければ、並べ替えの手順によらず並びは一意に決まる。**
+    // そのときだけ並列に並べ替える。重複があれば従来どおり順に並べ替える
+    // （手順で tie の解け方が変わり、出力が動いてしまうため。17 件中 3 件で
+    // 実際に動き、red-rocks が +0.031% 伸びた）。
+    std::vector<std::pair<uint64_t, int32_t>> kp(n);
+    for (size_t i = 0; i < n; ++i) kp[i] = {key[i], (int32_t)i};
+    unsigned nt = std::max(1u, std::thread::hardware_concurrency());
+    while (nt > 1 && n / nt < 32768) nt >>= 1;
+    if (nt > 1) {
+        std::vector<size_t> cut(nt + 1);
+        for (unsigned w = 0; w <= nt; ++w) cut[w] = n * w / nt;
+        std::vector<std::thread> th;
+        for (unsigned w = 0; w < nt; ++w)
+            th.emplace_back([&, w] { std::sort(kp.begin() + cut[w], kp.begin() + cut[w + 1]); });
+        for (auto& x : th) x.join();
+        for (unsigned step = 1; step < nt; step <<= 1) {
+            std::vector<std::thread> mt;
+            for (unsigned w = 0; w + step < nt; w += step * 2)
+                mt.emplace_back([&, w, step] {
+                    unsigned hi = std::min(nt, w + step * 2);
+                    std::inplace_merge(kp.begin() + cut[w], kp.begin() + cut[w + step],
+                                       kp.begin() + cut[hi]);
+                });
+            for (auto& x : mt) x.join();
+        }
+        bool tie = false;
+        for (size_t i = 1; i < n && !tie; ++i) if (kp[i - 1].first == kp[i].first) tie = true;
+        if (!tie) {
+            for (size_t i = 0; i < n; ++i) perm[i] = kp[i].second;
+            return perm;
+        }
+    }
+    std::vector<std::pair<uint64_t, int32_t>>().swap(kp);
     std::sort(perm.begin(), perm.end(),
               [&](int32_t a, int32_t b) { return key[a] < key[b]; });
     return perm;
