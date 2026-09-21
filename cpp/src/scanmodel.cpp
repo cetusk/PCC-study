@@ -158,6 +158,20 @@ void split_two_lines(const int64_t* X, const int64_t* Y, size_t n,
     if (c1 < 10 || n - c1 < 10) label.assign(n, 0);
 }
 
+// 当てはめの内側は点ごとに tan を呼ぶ。角度は [-45, 45] 度に打ち切ってあるので
+// libm の引数還元は要らない。Cephes の |x| < pi/4 用の有理式をそのまま使う。
+// 誤差は倍精度の丸め程度で、当てはめの結果は実質変わらない（bpp で確認する）。
+static inline double tan_small(double x) {
+    const double P0 = -1.30936939181383777646e4, P1 = 1.15351664838587416140e6,
+                 P2 = -1.79565251976484877988e7;
+    const double Q1 = 1.36812963470692954678e4, Q2 = -1.32089234440210967447e6,
+                 Q3 = 2.50083801823357915839e7, Q4 = -5.38695755929454629881e7;
+    double z = x * x;
+    if (z < 1e-14) return x;
+    return x + x * z * (((P0 * z + P1) * z + P2) /
+                        ((((z + Q1) * z + Q2) * z + Q3) * z + Q4));
+}
+
 SweepParam fit_scan_line(const int64_t* X, const int64_t* Y, const int64_t* Z,
                          const int64_t* gps, const int64_t* sa, size_t n,
                          FitDiag* diag) {
@@ -168,7 +182,7 @@ SweepParam fit_scan_line(const int64_t* X, const int64_t* Y, const int64_t* Z,
     principal_axis(X, Y, n, dx, dy, cx, cy);
     double th = std::atan2(dy, dx);
     th -= M_PI * std::round(th / M_PI);                 // (-90, 90] に畳む
-    p.t2 = (int64_t)llround(std::tan(-th / 2) * ((int64_t)1 << SCAN_SH));
+    p.t2 = (int64_t)llround(tan_small(-th / 2) * ((int64_t)1 << SCAN_SH));
     p.sn = (int64_t)llround(std::sin(-th) * ((int64_t)1 << SCAN_SH));
 
     std::vector<int64_t> s(n), off(n);
@@ -200,7 +214,7 @@ SweepParam fit_scan_line(const int64_t* X, const int64_t* Y, const int64_t* Z,
     double th0 = (sa_ - om * sw) / n;
     double tmin = 1e18, tmax = -1e18, smin = 1e18, smax = -1e18, zmean = 0;
     for (size_t i = 0; i < n; ++i) {
-        double t = std::tan(ang[i]);
+        double t = tan_small(ang[i]);
         tmin = std::min(tmin, t); tmax = std::max(tmax, t);
         smin = std::min(smin, sf[i]); smax = std::max(smax, sf[i]);
         zmean += zz[i];
@@ -219,7 +233,7 @@ SweepParam fit_scan_line(const int64_t* X, const int64_t* Y, const int64_t* Z,
     auto cost_of = [&](double S0, double SZ, double TH, double OM) {
         double c = 0;
         for (size_t i = 0; i < n; ++i) {
-            double r = sf[i] - (S0 + (SZ - zz[i]) * std::tan(clamp_th(TH + OM * shot[i])));
+            double r = sf[i] - (S0 + (SZ - zz[i]) * tan_small(clamp_th(TH + OM * shot[i])));
             c += r * r;
         }
         return c;
@@ -230,7 +244,7 @@ SweepParam fit_scan_line(const int64_t* X, const int64_t* Y, const int64_t* Z,
     {
         double A00 = 0, A01 = 0, A11 = 0, b0 = 0, b1 = 0;
         for (size_t i = 0; i < n; ++i) {
-            double T = std::tan(clamp_th(th0 + om * shot[i]));
+            double T = tan_small(clamp_th(th0 + om * shot[i]));
             double y = sf[i] + zz[i] * T;
             A00 += 1; A01 += T; A11 += T * T; b0 += y; b1 += y * T;
         }
@@ -267,7 +281,7 @@ SweepParam fit_scan_line(const int64_t* X, const int64_t* Y, const int64_t* Z,
         for (size_t i = 0; i < n; ++i) {
             double raw = th0 + om * shot[i];
             bool cl = (raw > TH_LIM || raw < -TH_LIM);       // 打ち切られた点は角度の勾配が 0
-            double T = std::tan(clamp_th(raw));
+            double T = tan_small(clamp_th(raw));
             double dz = Sz - zz[i];
             double r = sf[i] - (s0 + dz * T);
             double w = cl ? 0.0 : dz * (1.0 + T * T);
@@ -311,7 +325,7 @@ SweepParam fit_scan_line(const int64_t* X, const int64_t* Y, const int64_t* Z,
         if (diag) {
             double bb = 0;
             for (size_t i = 0; i < n; ++i)
-                bb += blen_d(sf[i] - (s0 + (Sz - zz[i]) * std::tan(clamp_th(th0 + om * shot[i]))));
+                bb += blen_d(sf[i] - (s0 + (Sz - zz[i]) * tan_small(clamp_th(th0 + om * shot[i]))));
             for (int j = it; j < FIT_ITERS; ++j) diag->iter_bits[j] = bb / n;
         }
         if (!stepped) break;
