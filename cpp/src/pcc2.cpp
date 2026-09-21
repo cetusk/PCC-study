@@ -9,6 +9,7 @@
 #include <cstdio>
 #include <cstring>
 #include <cstdlib>
+#include <array>
 #include <atomic>
 #include <thread>
 
@@ -740,10 +741,18 @@ static bool enc_geom_scan(const std::vector<const std::vector<int64_t>*>& cols,
         dump_raw = fopen(rp.c_str(), "w");
         if (dump_raw) fprintf(dump_raw, "# x\ty\tz\tshot_ulp\tscan_angle\n");
     }
-    for (size_t k = 0; k < nsw; ++k) {
+    // 掃引ごとの当てはめは互いに独立である（触るのは自分の区間の L.label と
+    // L.split[k] だけ）。結果を一度配列に貯め、L.line への追加だけを後で順に
+    // 行えば、並列にしても出力は 1 本のときと同じになる。
+    std::vector<std::array<SweepParam, 2>> sp_out(nsw);
+    std::vector<int> nl_out(nsw, 1);
+    // warm が真のときだけ thin_hist に積む。並列に回す間は基準が決まっており、
+    // 共有の vector に push_back すると壊れる（実際に double free を出した）。
+    auto do_sweep = [&](size_t k, bool warm, std::vector<int64_t>& bx, std::vector<int64_t>& by,
+                        std::vector<int64_t>& bz, std::vector<int64_t>& bg,
+                        std::vector<int64_t>& bs) {
         int32_t a = sc.swp[k], b = sc.swp[k + 1];
         size_t m = (size_t)(b - a);
-        L.line_of_sweep[k] = (int32_t)L.line.size();
         auto gather = [&](uint8_t want, bool use_label) {
             bx.clear(); by.clear(); bz.clear(); bg.clear(); bs.clear();
             for (int32_t t = a; t < b; ++t) {
@@ -770,14 +779,7 @@ static bool enc_geom_scan(const std::vector<const std::vector<int64_t>*>& cols,
         // 標識は 1 点 1 bit を上限として見込む（実際は文脈符号化でこれより安い）。
         SweepParam two[2];
         FitDiag fd2[2];
-        if (SPLIT_THIN > 0 && sp_r0 < 1e17) {
-            thin_hist.push_back(sp_r0);
-            if (thin_gate < 0 && thin_hist.size() >= 200) {
-                std::vector<double> v = thin_hist;
-                std::nth_element(v.begin(), v.begin() + v.size() / 2, v.end());
-                thin_gate = v[v.size() / 2] * SPLIT_THIN;
-            }
-        }
+        if (warm && SPLIT_THIN > 0 && sp_r0 < 1e17) thin_hist.push_back(sp_r0);
         if (m >= 40 && (thin_gate < 0 || sp_r0 > thin_gate)) {
             std::vector<uint8_t> lab;
             split_two_lines(bx.data(), by.data(), m, lab);
@@ -806,9 +808,11 @@ static bool enc_geom_scan(const std::vector<const std::vector<int64_t>*>& cols,
         }
 
         int nl = L.split[k] ? 2 : 1;
+        nl_out[k] = nl;
         for (int g = 0; g < nl; ++g) {
             SweepParam sp = L.split[k] ? two[g] : one;
             FitDiag fd = L.split[k] ? fd2[g] : fd1;
+            sp_out[k][g] = sp;
             if (dump) gather((uint8_t)g, L.split[k] != 0);
             if (dump && !bx.empty()) {
                 size_t id = L.line.size();
@@ -832,8 +836,44 @@ static bool enc_geom_scan(const std::vector<const std::vector<int64_t>*>& cols,
                                 (long long)(bg[i] - bg[0]), (long long)bs[i]);
                 }
             }
-            L.line.push_back(sp);
         }
+    };
+
+    // 先頭 200 本（足切りの基準が決まるまで）は順に回す。
+    size_t kwarm = nsw < 200 ? nsw : (size_t)200;
+    if (dump) kwarm = nsw;                       // 書き出しは順序に依るので並列にしない
+    for (size_t k = 0; k < kwarm; ++k) do_sweep(k, true, bx, by, bz, bg, bs);
+    if (SPLIT_THIN > 0 && !thin_hist.empty()) {
+        std::vector<double> v = thin_hist;
+        std::nth_element(v.begin(), v.begin() + v.size() / 2, v.end());
+        thin_gate = v[v.size() / 2] * SPLIT_THIN;
+    }
+    if (kwarm < nsw) {
+        static const size_t NT = [] {
+            if (const char* e = getenv("PCC_THREADS")) { long v = atol(e); if (v > 0) return (size_t)v; }
+            unsigned hw = std::thread::hardware_concurrency();
+            return (size_t)(hw ? hw : 1);
+        }();
+        size_t nt = NT;
+        if (nt > nsw - kwarm) nt = nsw - kwarm;
+        if (nt <= 1) {
+            for (size_t k = kwarm; k < nsw; ++k) do_sweep(k, false, bx, by, bz, bg, bs);
+        } else {
+            std::atomic<size_t> next{kwarm};
+            std::vector<std::thread> th;
+            th.reserve(nt);
+            for (size_t t = 0; t < nt; ++t)
+                th.emplace_back([&] {
+                    std::vector<int64_t> lx, ly, lz2, lg, ls;
+                    for (size_t k = next++; k < nsw; k = next++)
+                        do_sweep(k, false, lx, ly, lz2, lg, ls);
+                });
+            for (auto& x : th) x.join();
+        }
+    }
+    for (size_t k = 0; k < nsw; ++k) {
+        L.line_of_sweep[k] = (int32_t)L.line.size();
+        for (int g = 0; g < nl_out[k]; ++g) L.line.push_back(sp_out[k][g]);
     }
 
     mark("走査線の分割と当てはめ");
