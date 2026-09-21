@@ -1,0 +1,684 @@
+<title>どの点群圧縮を選ぶか</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=IBM+Plex+Sans+JP:wght@400;500;600&display=swap">
+<style>
+  :root {
+    --bg:        #f2f5f6;
+    --panel:     #ffffff;
+    --panel-2:   #e9eef0;
+    --ink:       #101619;
+    --ink-2:     #4b585e;
+    --ink-3:     #78868d;
+    --rule:      #d7dfe2;
+    --rule-2:    #bcc8cd;
+
+    --gpcc:      #2a78d6;
+    --laz:       #eb6834;
+    --pcc2:      #1baf7a;
+
+    --part-minor:#a6b2b8;
+    --part-major:#2c3a41;
+
+    --sans: "IBM Plex Sans JP", "Hiragino Sans", "Noto Sans JP", system-ui, sans-serif;
+    --mono: "IBM Plex Mono", ui-monospace, SFMono-Regular, Menlo, monospace;
+
+    --s1: .5rem; --s2: .875rem; --s3: 1.25rem; --s4: 2rem; --s5: 3.25rem;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      --bg:        #101416;
+      --panel:     #181e21;
+      --panel-2:   #202529;
+      --ink:       #eef2f3;
+      --ink-2:     #a6b3b9;
+      --ink-3:     #7a868c;
+      --rule:      #293034;
+      --rule-2:    #3a4348;
+      --gpcc:      #3987e5;
+      --laz:       #d95926;
+      --pcc2:      #199e70;
+      --part-minor:#57646a;
+      --part-major:#cbd6da;
+    }
+  }
+  :root[data-theme="dark"] {
+    --bg:        #101416;
+    --panel:     #181e21;
+    --panel-2:   #202529;
+    --ink:       #eef2f3;
+    --ink-2:     #a6b3b9;
+    --ink-3:     #7a868c;
+    --rule:      #293034;
+    --rule-2:    #3a4348;
+    --gpcc:      #3987e5;
+    --laz:       #d95926;
+    --pcc2:      #199e70;
+    --part-minor:#57646a;
+    --part-major:#cbd6da;
+  }
+
+  body {
+    background: var(--bg);
+    color: var(--ink);
+    font-family: var(--sans);
+    font-size: 15px;
+    line-height: 1.75;
+    -webkit-font-smoothing: antialiased;
+  }
+  .wrap {
+    max-width: 1060px;
+    margin-inline: auto;
+    padding-inline: 20px;
+    padding-block: var(--s5) var(--s5);
+    display: flex;
+    flex-direction: column;
+    gap: var(--s5);
+  }
+  .prose { max-width: 66ch; }
+
+  h1, h2, h3 { text-wrap: balance; margin: 0; font-weight: 600; letter-spacing: -.01em; }
+  h1 { font-size: clamp(1.85rem, 1.2rem + 2.4vw, 2.6rem); line-height: 1.25; }
+  h2 { font-size: 1.32rem; line-height: 1.4; }
+  h3 { font-size: 1.02rem; }
+  p  { margin: 0; }
+
+  .eyebrow {
+    font-family: var(--mono);
+    font-size: .72rem;
+    font-weight: 500;
+    letter-spacing: .13em;
+    text-transform: uppercase;
+    color: var(--ink-3);
+  }
+  .lede { color: var(--ink-2); font-size: 1.04rem; }
+  .note { color: var(--ink-3); font-size: .86rem; line-height: 1.7; }
+  b, strong { font-weight: 600; }
+  .num { font-family: var(--mono); font-variant-numeric: tabular-nums; }
+
+  header { display: flex; flex-direction: column; gap: var(--s3); }
+  .keyrow { display: flex; flex-wrap: wrap; gap: var(--s1) var(--s3); align-items: center; }
+  .key { display: inline-flex; align-items: center; gap: .5rem; font-size: .84rem; color: var(--ink-2); }
+  .key i { width: 11px; height: 11px; border-radius: 3px; display: inline-block; flex: none; }
+
+  section { display: flex; flex-direction: column; gap: var(--s3); }
+  .sechead { display: flex; flex-direction: column; gap: .35rem; max-width: 70ch; }
+
+  /* 結論 */
+  .verdict { display: flex; flex-direction: column; gap: 2px; }
+  .vrow {
+    display: grid;
+    grid-template-columns: 13rem 9rem 1fr;
+    gap: var(--s3);
+    align-items: baseline;
+    background: var(--panel);
+    padding: var(--s2) var(--s3);
+    border-left: 3px solid var(--rule-2);
+  }
+  .vrow:first-child { border-radius: 6px 6px 0 0; }
+  .vrow:last-child  { border-radius: 0 0 6px 6px; }
+  .vrow.pick { border-left-color: var(--pcc2); }
+  .vrow.alt  { border-left-color: var(--laz); }
+  .vrow.out  { border-left-color: var(--rule-2); }
+  .vrow dt { color: var(--ink-2); font-size: .92rem; }
+  .vrow .pickname { font-weight: 600; font-size: 1.05rem; }
+  .vrow .why { color: var(--ink-2); font-size: .9rem; }
+  @media (max-width: 720px) {
+    .vrow { grid-template-columns: 1fr; gap: .25rem; }
+  }
+
+  figure { margin: 0; display: flex; flex-direction: column; gap: var(--s2); }
+  .chart {
+    background: var(--panel);
+    border: 1px solid var(--rule);
+    border-radius: 8px;
+    padding: var(--s3) var(--s3) var(--s2);
+    position: relative;
+  }
+  .chart svg { display: block; width: 100%; height: auto; overflow: visible; }
+  figcaption { color: var(--ink-3); font-size: .82rem; line-height: 1.65; max-width: 72ch; }
+
+  .tip {
+    position: absolute;
+    pointer-events: none;
+    background: var(--ink);
+    color: var(--bg);
+    font-family: var(--mono);
+    font-size: .74rem;
+    line-height: 1.5;
+    padding: .4rem .55rem;
+    border-radius: 5px;
+    white-space: pre;
+    opacity: 0;
+    transition: opacity .1s;
+    z-index: 5;
+  }
+  .tip.on { opacity: 1; }
+
+  .stats { display: grid; grid-template-columns: repeat(auto-fit, minmax(190px, 1fr)); gap: 2px; }
+  .stat { background: var(--panel); padding: var(--s3); display: flex; flex-direction: column; gap: .3rem; }
+  .stat:first-child { border-radius: 6px 0 0 6px; }
+  .stat:last-child { border-radius: 0 6px 6px 0; }
+  .stat .v { font-family: var(--mono); font-size: 1.7rem; font-weight: 500; letter-spacing: -.02em; }
+  .stat .k { font-size: .82rem; color: var(--ink-2); }
+  .stat .s { font-size: .78rem; color: var(--ink-3); }
+  @media (max-width: 720px) {
+    .stat:first-child { border-radius: 6px 6px 0 0; }
+    .stat:last-child { border-radius: 0 0 6px 6px; }
+  }
+
+  details {
+    background: var(--panel);
+    border: 1px solid var(--rule);
+    border-radius: 8px;
+    padding: var(--s2) var(--s3);
+  }
+  summary { cursor: pointer; font-size: .9rem; color: var(--ink-2); }
+  summary:focus-visible { outline: 2px solid var(--pcc2); outline-offset: 3px; border-radius: 3px; }
+  .tablebox { overflow-x: auto; margin-top: var(--s2); }
+  table { border-collapse: collapse; font-size: .82rem; width: 100%; }
+  th, td { padding: .38rem .7rem; text-align: right; white-space: nowrap; border-bottom: 1px solid var(--rule); }
+  th:first-child, td:first-child { text-align: left; }
+  thead th { color: var(--ink-3); font-weight: 500; font-size: .76rem; }
+  td.n { font-family: var(--mono); font-variant-numeric: tabular-nums; }
+
+  .caveat { display: grid; grid-template-columns: 1fr 1fr; gap: 2px; }
+  .cav { background: var(--panel); padding: var(--s3); display: flex; flex-direction: column; gap: .35rem; }
+  .cav h3 { font-size: .95rem; }
+  .cav p { font-size: .88rem; color: var(--ink-2); }
+  @media (max-width: 720px) { .caveat { grid-template-columns: 1fr; } }
+
+  footer { border-top: 1px solid var(--rule); padding-top: var(--s3); }
+  @media (prefers-reduced-motion: reduce) { * { transition: none !important; } }
+</style>
+
+<div class="wrap">
+
+  <header>
+    <p class="eyebrow">可逆点群圧縮・実測比較 / 2026-09-21</p>
+    <h1>どの点群圧縮を選ぶか</h1>
+    <p class="lede prose">
+      航空・車載・地上の LiDAR 15 ファイル、各ファイルの<b>中央 200 万点</b>（足りない
+      ものは全点）を、G-PCC・LASzip・本手法（PCC2）で符号化して測った。すべて可逆で、
+      往復検証とスレッド数を変えた決定性の確認を通っている。単位は
+      <span class="num">bpp</span>（1 点あたり bit）。<b>サイズは規模でほとんど動かないが、
+      速度とメモリは動く</b>ので、20 万点の値も併記する。
+    </p>
+    <div class="keyrow">
+      <span class="key"><i style="background:var(--gpcc)"></i>G-PCC（幾何のみ）</span>
+      <span class="key"><i style="background:var(--laz)"></i>LASzip / LAZ</span>
+      <span class="key"><i style="background:var(--pcc2)"></i>PCC2（本手法）</span>
+    </div>
+  </header>
+
+  <section>
+    <div class="sechead">
+      <p class="eyebrow">結論</p>
+      <h2>ファイル 1 本を丸ごと小さくしたいなら、選択肢は 2 つしかない</h2>
+    </div>
+    <dl class="verdict">
+      <div class="vrow pick">
+        <dt>サイズだけを重く見る</dt>
+        <dd class="pickname" style="color:var(--pcc2)">PCC2</dd>
+        <dd class="why">end-to-end で <span class="num">−12.1%</span>（15 ファイル中 15 件で小さい）。ただし符号化に <span class="num">15.5</span> 倍の時間と <span class="num">9.3</span> 倍のメモリを払う。</dd>
+      </div>
+      <div class="vrow alt">
+        <dt>速度・メモリ・互換性</dt>
+        <dd class="pickname" style="color:var(--laz)">LASzip</dd>
+        <dd class="why">最も速く、最も軽く、全次元が戻り、どこでも読める。<b>いま LAS を配るならこれ。</b></dd>
+      </div>
+      <div class="vrow out">
+        <dt>ファイル 1 本を丸ごと</dt>
+        <dd class="pickname" style="color:var(--ink-3)">G-PCC は候補外</dd>
+        <dd class="why">幾何しか符号化しない。属性が bit の中央値 <span class="num">59.2%</span> を占めるので、単体では成立しない。</dd>
+      </div>
+    </dl>
+  </section>
+
+  <section>
+    <div class="sechead">
+      <p class="eyebrow">前提 01</p>
+      <h2>なぜ G-PCC が候補から外れるのか</h2>
+      <p class="prose" style="color:var(--ink-2)">
+        LiDAR ファイルの bit は、座標より属性（強度・分類・時刻・色・戻り番号…）のほうが多い。
+        G-PCC は座標しか符号化しないので、<b>ファイルの 6 割に手が出ない</b>。使うなら属性の
+        符号器を別に用意することになり、その時点で性能は組み合わせた相手次第になる。
+      </p>
+    </div>
+    <figure>
+      <div class="chart" id="c-share"><div class="tip"></div></div>
+      <figcaption>
+        LASzip が使う bit の内訳。濃い側が属性。中央値 <span class="num">59.2%</span>、
+        幅 <span class="num">27.7〜71.9%</span>。<b>色を持たない 4 件が、割合の下位 4 件と
+        正確に一致する。</b>色を持つファイルはどれも符号長の半分以上を属性に使う。
+      </figcaption>
+    </figure>
+  </section>
+
+  <section>
+    <div class="sechead">
+      <p class="eyebrow">結果 01</p>
+      <h2>end-to-end のサイズ — 全 15 件で PCC2 が小さい</h2>
+      <p class="prose" style="color:var(--ink-2)">
+        PCC2 はまだ一部の次元を読んでいない（下の但し書き）。
+        <b>その次元を LASzip が符号化するのに使っている bit をそのまま足して</b>見積もっても、
+        すべてのファイルで小さい。欠けが効くのは <span class="num">fullwave</span>（元の 50.9%）と
+        <span class="num">extra</span>（15.7%）の 2 件だけで、残り 13 件では中央値 0.2% にすぎない。
+      </p>
+    </div>
+    <figure>
+      <div class="chart" id="c-e2e"><div class="tip"></div></div>
+      <figcaption>
+        元の .laz に対して小さくなった割合。棒が長いほど良い。中央値 <span class="num">−12.1%</span>。
+      </figcaption>
+    </figure>
+    <div class="stats">
+      <div class="stat">
+        <span class="v" style="color:var(--pcc2)">15 / 15</span>
+        <span class="k">PCC2 が小さかったファイル</span>
+        <span class="s">欠けた次元の費用を足した後</span>
+      </div>
+      <div class="stat">
+        <span class="v">−12.1%</span>
+        <span class="k">中央値</span>
+        <span class="s">幅 −35.7% 〜 −5.5%</span>
+      </div>
+      <div class="stat">
+        <span class="v">0.2%</span>
+        <span class="k">欠けた次元が占める割合</span>
+        <span class="s">13 件の中央値。残り 2 件は 15.7% と 50.9%</span>
+      </div>
+    </div>
+  </section>
+
+  <section>
+    <div class="sechead">
+      <p class="eyebrow">結果 02</p>
+      <h2>優位は幾何ではなく属性から来ている</h2>
+      <p class="prose" style="color:var(--ink-2)">
+        同じ入力を全列と幾何のみで測り、差を属性ぶんとした。
+        <b>属性の優位は幾何の 2 倍あり、しかも全ファイルで勝っている。</b>
+        幾何だけを見れば 3 方式は横並びで、そこだけを見て優劣は言えない。
+      </p>
+    </div>
+    <figure>
+      <div class="chart" id="c-split"><div class="tip"></div></div>
+      <figcaption>
+        LASzip に対して縮んだ割合。右へ長いほど良い。左に出た棒は負けたもの。
+        幾何は <span class="num">13/15</span> で中央値 <span class="num">−9.2%</span>、
+        属性は <span class="num">15/15</span> で中央値 <span class="num">−18.1%</span>。
+      </figcaption>
+    </figure>
+    <p class="note prose">
+      効いているのは、幾何を先に復号してその順序と近傍を属性の予測に使うこと（空間予測）と、
+      既出の列との残差を候補に持つこと（参照残差）である。どちらも「幾何が先に復号されている
+      容器」だから書ける仕掛けで、G-PCC にも LAZ にも無い。
+    </p>
+  </section>
+
+  <section>
+    <div class="sechead">
+      <p class="eyebrow">結果 03</p>
+      <h2>3 つの軸 — サイズで勝ち、速度は相手次第、メモリで負ける</h2>
+      <p class="prose" style="color:var(--ink-2)">
+        3 方式を並べられるのは幾何だけなので、この節は幾何のみ・符号化のみ。
+        比は <b>ファイルごとに取ってから中央値</b>を出している。
+      </p>
+    </div>
+    <figure>
+      <div class="chart" id="c-axes"><div class="tip"></div></div>
+      <figcaption>
+        <span class="num">1.0</span> の線が相手と同等。左が良い。
+        サイズは G-PCC と互角で LASzip より 9% 小さい。速度は G-PCC よりやや速く、
+        LASzip より 11 倍遅い。メモリはどちらにも負け、規模が大きいほど開く。
+      </figcaption>
+    </figure>
+    <p class="note prose">
+      属性込みで測ると、符号化は LASzip の <span class="num">15.5</span> 倍、復号は
+      <span class="num">8.7</span> 倍になる。符号化が重いのは<b>候補を全部符号化して最短を採る</b>
+      ためで、復号は選ばれた 1 本しか通らない。<b>復号の比は規模で倍になる</b>
+      （20 万点では 4.3 倍）。点数に比例して増える近傍表が効くためで、
+      <b>速度を述べるときは規模が要る</b>。
+    </p>
+  </section>
+
+  <section>
+    <div class="sechead">
+      <p class="eyebrow">但し書き</p>
+      <h2>まだ LAZ の置き換えではない</h2>
+    </div>
+    <div class="caveat">
+      <div class="cav">
+        <h3>読まない次元がある</h3>
+        <p>
+          <b>15 ファイル中 13 件</b>で、元の LAS の次元が 1 つ以上戻らない。
+          走査方向・飛行線の端・走査機の番号のビット、分類のフラグ、波形の 7 種、
+          拡張バイトの一部、そして VLR。「全列一致」の検証は
+          <b>PCC2 が列として持ったものしか見ない</b>ので、ここは検証を素通りする。
+        </p>
+      </div>
+      <div class="cav">
+        <h3>メモリが退行している</h3>
+        <p>
+          100 万点・幾何のみで <span class="num">68 MB → 230 MB</span>（4.5 倍）に増えた。
+          200 万点では G-PCC の <span class="num">5.4</span> 倍になる。
+          原因は 3 か所まで特定済みで、うち 1 つ（使う列が 1 つも無いのに近傍表を作る）は
+          <b>サイズも速度も犠牲にせず約 80 MB 戻せる</b>。未着手。
+        </p>
+      </div>
+    </div>
+    <p class="note prose">
+      サイズの利得（end-to-end で −12.1%）は、この 2 つを直す工事に見合う大きさである。
+      逆に言えば、直すまでは「LASzip より 10% 小さい研究用の符号器」であって、
+      配布形式の置き換えではない。
+    </p>
+  </section>
+
+  <section>
+    <div class="sechead">
+      <p class="eyebrow">測り方</p>
+      <h2>数値の出どころ</h2>
+    </div>
+    <details>
+      <summary>全データ（表で見る）</summary>
+      <div class="tablebox">
+        <table id="tbl">
+          <thead>
+            <tr>
+              <th>データ</th>
+              <th>LASzip 全体</th>
+              <th>PCC2 読む列</th>
+              <th>欠けの費用</th>
+              <th>PCC2 埋めた</th>
+              <th>対 LASzip</th>
+              <th>属性の割合</th>
+              <th>幾何の縮み</th>
+              <th>属性の縮み</th>
+            </tr>
+          </thead>
+          <tbody></tbody>
+        </table>
+      </div>
+    </details>
+    <p class="note prose">
+      標本は各ファイルの中央 200 万点（足りないものは全点。20 万点でも測って併記、
+      規模依存を見た測定は 50 万〜400 万点）。
+      比較の基準は「PCC2 が読む列だけを書き直した LAZ」で、両側が同じ値を詰めている。
+      「欠けの費用」は元の .laz とその基準 LAZ の差で、3 件で負になるのは基準を書く
+      LAZ 書き出しが元より効率が悪いためであり、費用が負なのではない（0 として扱った）。
+      測り直しは <span class="num">bench_all.py</span> / <span class="num">bench_three.py</span> /
+      <span class="num">bench_split.py</span> / <span class="num">bench_e2e.py</span> /
+      <span class="num">bench_cover.py</span>。
+    </p>
+  </section>
+
+  <footer>
+    <p class="note">
+      可逆性の確認: 往復検証 15/15、<span class="num">PCC_THREADS</span> を 1/3/7/16 と
+      変えて出力が md5 で一致 17/17。測定機は 16 コア、GPU と学習モデルは使っていない。
+    </p>
+  </footer>
+</div>
+
+<script>
+(function () {
+  "use strict";
+
+  /* 中央 200 万点（足りないものは全点）。end-to-end の「欠けの費用」は
+     20 万点で測った割合をそのまま当てている（次元の構成は規模で変わらない）。 */
+  var E2E = [
+    ["AHN4 _20",     69.782, 44.750, 0.139,  44.889, -35.7],
+    ["AHN4 _21",     77.390, 52.997, 0.102,  53.099, -31.4],
+    ["extra",       218.471,133.671,34.208, 167.879, -23.2],
+    ["plane",        16.844, 12.484, 0.155,  12.639, -25.0],
+    ["workshop",     36.398, 30.314, 0.000,  30.314, -16.7],
+    ["fullwave",    149.503, 54.798,76.023, 130.821, -12.5],
+    ["vegetation",   49.845, 43.568, 0.000,  43.568, -12.6],
+    ["USGS NY",      39.583, 34.797, 0.000,  34.797, -12.1],
+    ["red-rocks",    20.747, 18.534, 0.012,  18.546, -10.6],
+    ["autzen-2023",  67.599, 60.791, 0.000,  60.791, -10.1],
+    ["autzen_trim",  43.507, 39.381, 0.373,  39.754,  -8.6],
+    ["USGS AK",      35.460, 32.228, 0.074,  32.302,  -8.9],
+    ["simple1_4",    17.661, 16.601, 0.069,  16.670,  -5.6],
+    ["AHN5 _20",     59.082, 53.797, 0.077,  53.874,  -8.8],
+    ["AHN3 _20",     53.658, 50.593, 0.119,  50.712,  -5.5]
+  ];
+  var SHARE = {
+    "extra":71.9, "AHN4 _20":69.1, "fullwave":61.8, "red-rocks":61.0,
+    "autzen-2023":60.2, "AHN3 _20":59.5, "AHN4 _21":59.4, "plane":59.2,
+    "simple1_4":57.4, "AHN5 _20":55.1, "autzen_trim":51.4, "vegetation":50.1,
+    "workshop":45.6, "USGS AK":28.8, "USGS NY":27.7
+  };
+  var SPLIT = {
+    "AHN3 _20":[-3.0,-8.1], "AHN4 _20":[-15.7,-44.8], "AHN4 _21":[-19.1,-39.2],
+    "AHN5 _20":[-3.4,-13.4], "USGS AK":[-8.0,-11.9], "USGS NY":[-9.8,-18.2],
+    "autzen-2023":[-6.1,-12.6], "autzen_trim":[-0.4,-18.0], "workshop":[-15.9,-18.1],
+    "red-rocks":[-13.3,-9.0], "extra":[-9.2,-34.6], "simple1_4":[1.1,-11.3],
+    "plane":[-9.7,-35.9], "vegetation":[0.0,-25.2], "fullwave":[-9.4,-35.3]
+  };
+  var AXES = [
+    { k: "サイズ", unit: "bpp",   g: 1.00, l: 0.91 },
+    { k: "速度",   unit: "秒",     g: 0.92, l: 10.94 },
+    { k: "メモリ", unit: "ピーク MB", g: 5.44, l: 9.33 }
+  ];
+
+  var NS = "http://www.w3.org/2000/svg";
+  /* fill / stroke / font-family は style で渡す。presentation 属性に書いた
+     var() は解決されないため（属性は CSS の値として構文解析されない）。 */
+  var VIA_STYLE = { fill: 1, stroke: 1, "font-family": 1 };
+  function el(n, a) {
+    var e = document.createElementNS(NS, n);
+    for (var k in a) {
+      if (a[k] === null || a[k] === undefined) continue;
+      if (VIA_STYLE[k]) e.style.setProperty(k, a[k]);
+      else e.setAttribute(k, a[k]);
+    }
+    return e;
+  }
+  function txt(x, y, s, o) {
+    o = o || {};
+    var t = el("text", {
+      x: x, y: y,
+      "text-anchor": o.anchor || "start",
+      "dominant-baseline": o.base || "middle",
+      "font-family": o.mono ? "var(--mono)" : "var(--sans)",
+      "font-size": o.size || 11,
+      "font-weight": o.weight || 400,
+      "letter-spacing": o.ls || 0,
+      fill: o.fill || "var(--ink-3)"
+    });
+    t.textContent = s;
+    return t;
+  }
+
+  function mount(id, w, h) {
+    var box = document.getElementById(id);
+    var svg = el("svg", { viewBox: "0 0 " + w + " " + h, role: "img" });
+    box.insertBefore(svg, box.firstChild);
+    return { box: box, svg: svg, tip: box.querySelector(".tip") };
+  }
+
+  function hookTip(ctx, node, text) {
+    function show(ev) {
+      ctx.tip.textContent = text;
+      ctx.tip.classList.add("on");
+      var r = ctx.box.getBoundingClientRect();
+      var x = ev.clientX - r.left + 12, y = ev.clientY - r.top - 8;
+      var tw = ctx.tip.offsetWidth;
+      if (x + tw > r.width - 6) x = ev.clientX - r.left - tw - 12;
+      ctx.tip.style.left = Math.max(4, x) + "px";
+      ctx.tip.style.top = Math.max(4, y) + "px";
+    }
+    node.addEventListener("pointermove", show);
+    node.addEventListener("pointerenter", show);
+    node.addEventListener("pointerleave", function () { ctx.tip.classList.remove("on"); });
+  }
+
+  /* ---- 属性の割合（積み上げ） ---- */
+  (function () {
+    var rows = Object.keys(SHARE).map(function (k) { return [k, SHARE[k]]; });
+    var L = 96, R = 16, T = 26, rowH = 22, H = T + rows.length * rowH + 14, W = 780;
+    var ctx = mount("c-share", W, H);
+    var bw = W - L - R;
+
+    ctx.svg.appendChild(txt(L, 12, "0%", { size: 10, mono: true }));
+    ctx.svg.appendChild(txt(L + bw / 2, 12, "50%", { size: 10, mono: true, anchor: "middle" }));
+    ctx.svg.appendChild(txt(L + bw, 12, "100%", { size: 10, mono: true, anchor: "end" }));
+    var mid = el("line", { x1: L + bw / 2, y1: T - 6, x2: L + bw / 2, y2: H - 12,
+                           stroke: "var(--rule-2)", "stroke-width": 1, "stroke-dasharray": "2 3" });
+    ctx.svg.appendChild(mid);
+
+    rows.forEach(function (r, i) {
+      var y = T + i * rowH, bh = 13;
+      var gW = bw * (100 - r[1]) / 100, aW = bw * r[1] / 100;
+      var g = el("rect", { x: L, y: y, width: Math.max(0, gW - 2), height: bh, rx: 3, fill: "var(--part-minor)" });
+      var a = el("rect", { x: L + gW, y: y, width: Math.max(0, aW), height: bh, rx: 3, fill: "var(--part-major)" });
+      ctx.svg.appendChild(g); ctx.svg.appendChild(a);
+      ctx.svg.appendChild(txt(L - 10, y + bh / 2, r[0], { anchor: "end", size: 11, fill: "var(--ink-2)" }));
+      ctx.svg.appendChild(txt(L + gW + aW - 6, y + bh / 2, r[1].toFixed(1) + "%",
+        { anchor: "end", size: 10, mono: true, weight: 500, fill: "var(--bg)" }));
+      var hit = el("rect", { x: L, y: y - 3, width: bw, height: rowH - 2, fill: "transparent" });
+      hookTip(ctx, hit, r[0] + "\n属性 " + r[1].toFixed(1) + "%  幾何 " + (100 - r[1]).toFixed(1) + "%");
+      ctx.svg.appendChild(hit);
+    });
+
+    var lg = el("g", {});
+    [["幾何", "var(--part-minor)"], ["属性", "var(--part-major)"]].forEach(function (d, i) {
+      var x = L + i * 76;
+      lg.appendChild(el("rect", { x: x, y: H - 10, width: 10, height: 10, rx: 2, fill: d[1] }));
+      lg.appendChild(txt(x + 15, H - 5, d[0], { size: 11, fill: "var(--ink-2)" }));
+    });
+    ctx.svg.appendChild(lg);
+  })();
+
+  /* ---- end-to-end ---- */
+  (function () {
+    var L = 96, R = 58, T = 26, rowH = 24, H = T + E2E.length * rowH + 10, W = 780;
+    var ctx = mount("c-e2e", W, H);
+    var bw = W - L - R, max = 36;
+
+    [0, 9, 18, 27, 36].forEach(function (v) {
+      var x = L + bw * v / max;
+      ctx.svg.appendChild(el("line", { x1: x, y1: T - 8, x2: x, y2: H - 8,
+        stroke: "var(--rule)", "stroke-width": 1 }));
+      ctx.svg.appendChild(txt(x, 12, v === 0 ? "0" : "−" + v + "%", { size: 10, mono: true, anchor: "middle" }));
+    });
+
+    E2E.forEach(function (r, i) {
+      var y = T + i * rowH, bh = 14, v = -r[5];
+      var w = bw * v / max;
+      var bar = el("rect", { x: L, y: y, width: Math.max(2, w), height: bh, rx: 4,
+        fill: "var(--pcc2)" });
+      ctx.svg.appendChild(bar);
+      ctx.svg.appendChild(txt(L - 10, y + bh / 2, r[0], { anchor: "end", size: 11, fill: "var(--ink-2)" }));
+      ctx.svg.appendChild(txt(L + w + 8, y + bh / 2, "−" + v.toFixed(1) + "%",
+        { size: 10.5, mono: true, weight: 500, fill: "var(--ink)" }));
+      var hit = el("rect", { x: L, y: y - 4, width: bw + R - 6, height: rowH - 2, fill: "transparent" });
+      hookTip(ctx, hit, r[0] + "\nLASzip   " + r[1].toFixed(3) + " bpp\nPCC2     " +
+        r[4].toFixed(3) + " bpp\n  読む列 " + r[2].toFixed(3) + " + 欠け " + r[3].toFixed(3));
+      ctx.svg.appendChild(hit);
+    });
+  })();
+
+  /* ---- 幾何 vs 属性 ---- */
+  (function () {
+    var keys = Object.keys(SPLIT).sort(function (a, b) { return SPLIT[a][1] - SPLIT[b][1]; });
+    var L = 96, R = 54, T = 26, rowH = 30, H = T + keys.length * rowH + 16, W = 780;
+    var ctx = mount("c-split", W, H);
+    var lo = -5, hi = 46, span = hi - lo;
+    var bw = W - L - R;
+    function X(v) { return L + bw * (v - lo) / span; }
+
+    [-5, 0, 10, 20, 30, 40].forEach(function (v) {
+      var x = X(v), zero = v === 0;
+      ctx.svg.appendChild(el("line", { x1: x, y1: T - 8, x2: x, y2: H - 14,
+        stroke: zero ? "var(--rule-2)" : "var(--rule)", "stroke-width": 1 }));
+      ctx.svg.appendChild(txt(x, 12, v === 0 ? "0" : (v < 0 ? "+" + (-v) : "−" + v) + "%",
+        { size: 10, mono: true, anchor: "middle" }));
+    });
+
+    keys.forEach(function (k, i) {
+      var y = T + i * rowH, bh = 11, d = SPLIT[k];
+      [[d[0], "var(--part-minor)", 0], [d[1], "var(--part-major)", bh + 2]].forEach(function (p) {
+        var v = -p[0], x0 = X(0), x1 = X(v);
+        var yy = y + p[2];
+        ctx.svg.appendChild(el("rect", {
+          x: Math.min(x0, x1), y: yy, width: Math.max(2, Math.abs(x1 - x0)), height: bh, rx: 3, fill: p[1]
+        }));
+        ctx.svg.appendChild(txt(Math.max(x0, x1) + 7, yy + bh / 2,
+          (v >= 0 ? "−" : "+") + Math.abs(v).toFixed(1) + "%",
+          { size: 9.5, mono: true, fill: "var(--ink-2)" }));
+      });
+      ctx.svg.appendChild(txt(L - 10, y + bh + 1, k, { anchor: "end", size: 11, fill: "var(--ink-2)" }));
+      var hit = el("rect", { x: 0, y: y - 5, width: W, height: rowH - 2, fill: "transparent" });
+      hookTip(ctx, hit, k + "\n幾何 " + d[0].toFixed(1) + "%\n属性 " + d[1].toFixed(1) + "%");
+      ctx.svg.appendChild(hit);
+    });
+
+    var lg = el("g", {});
+    [["幾何", "var(--part-minor)"], ["属性", "var(--part-major)"]].forEach(function (d, i) {
+      var x = L + i * 76;
+      lg.appendChild(el("rect", { x: x, y: H - 12, width: 10, height: 10, rx: 2, fill: d[1] }));
+      lg.appendChild(txt(x + 15, H - 7, d[0], { size: 11, fill: "var(--ink-2)" }));
+    });
+    ctx.svg.appendChild(lg);
+  })();
+
+  /* ---- 3 つの軸 ---- */
+  (function () {
+    var W = 780, step = 250, T = 42, H = 178;
+    var ctx = mount("c-axes", W, H);
+    var max = 11, bw = 150;
+
+    AXES.forEach(function (a, i) {
+      var x0 = i * step + 50;
+      function X(v) { return x0 + bw * Math.min(v, max) / max; }
+
+      ctx.svg.appendChild(txt(x0 - 44, 11, a.k, { size: 12, weight: 600, fill: "var(--ink)" }));
+      ctx.svg.appendChild(txt(x0 - 44, 25, a.unit, { size: 9.5, mono: true }));
+
+      var one = X(1);
+      ctx.svg.appendChild(el("line", { x1: one, y1: T - 12, x2: one, y2: T + 82,
+        stroke: "var(--rule-2)", "stroke-width": 1 }));
+      ctx.svg.appendChild(txt(one, T + 94, "1.0 = 同等", { size: 9, mono: true, anchor: "middle" }));
+
+      [["対 G-PCC", a.g, "var(--gpcc)"], ["対 LASzip", a.l, "var(--laz)"]].forEach(function (d, j) {
+        var y = T + 6 + j * 40, bh = 16;
+        var w = X(d[1]) - x0;
+        ctx.svg.appendChild(el("rect", { x: x0, y: y, width: Math.max(3, w), height: bh, rx: 4, fill: d[2] }));
+        ctx.svg.appendChild(txt(x0 - 6, y + bh / 2, d[0], { anchor: "end", size: 10, fill: "var(--ink-2)" }));
+        ctx.svg.appendChild(txt(x0 + w + 7, y + bh / 2, d[1].toFixed(2) + "x",
+          { size: 10.5, mono: true, weight: 500, fill: "var(--ink)" }));
+        var hit = el("rect", { x: x0 - 44, y: y - 6, width: step - 10, height: 34, fill: "transparent" });
+        hookTip(ctx, hit, a.k + " / " + d[0] + "\nPCC2 は " + d[1].toFixed(2) + " 倍" +
+          (d[1] < 1 ? "（良い）" : d[1] > 1.05 ? "（悪い）" : "（互角）"));
+        ctx.svg.appendChild(hit);
+      });
+    });
+    ctx.svg.appendChild(txt(0, H - 6, "幾何のみ・符号化のみ。ファイルごとに比を取ってからの中央値。",
+      { size: 10, fill: "var(--ink-3)" }));
+  })();
+
+  /* ---- 表 ---- */
+  (function () {
+    var tb = document.querySelector("#tbl tbody");
+    E2E.forEach(function (r) {
+      var s = SPLIT[r[0]], sh = SHARE[r[0]];
+      var tr = document.createElement("tr");
+      var cells = [
+        [r[0], false],
+        [r[1].toFixed(3), true], [r[2].toFixed(3), true], [r[3].toFixed(3), true],
+        [r[4].toFixed(3), true], [r[5].toFixed(1) + "%", true], [sh.toFixed(1) + "%", true],
+        [s[0].toFixed(1) + "%", true], [s[1].toFixed(1) + "%", true]
+      ];
+      cells.forEach(function (c) {
+        var td = document.createElement("td");
+        if (c[1]) td.className = "n";
+        td.textContent = c[0];
+        tr.appendChild(td);
+      });
+      tb.appendChild(tr);
+    });
+  })();
+})();
+</script>
