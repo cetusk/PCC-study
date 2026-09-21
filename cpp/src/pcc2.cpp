@@ -710,6 +710,19 @@ static bool enc_geom_scan(const std::vector<const std::vector<int64_t>*>& cols,
 
     std::vector<int64_t> bx, by, bz, bg, bs;
     const auto* sa_col = ctx->fr->get("scan_angle");
+    // 走査線を 2 本に分ける試みは、掃引ごとに EM と当てはめ 2 回を回すので重い。
+    // 分けるべき掃引は主軸から見た散らばり（thinness）が大きい。先頭 200 本の
+    // 中央値を基準にして、その C 倍を超える掃引だけ試す。C はファイルの座標の
+    // 刻みに依らない。**この足切りは符号化側だけの判断**で、分けた結果は
+    // 流れに書かれるので復号側には影響しない。
+    static const double SPLIT_THIN = [] {
+        const char* e = getenv("PCC_SPLIT_THIN");
+        // 1.5 は掃引で決めた。17 件すべてで bpp が変わらない上限であり、
+        // 走査変換 1 本が AHN3 _20 で 0.09 → 0.08 s、AHN4 _20 で 0.10 → 0.08 s になる。
+        return e ? atof(e) : 1.5;              // 0 なら足切りしない
+    }();
+    std::vector<double> thin_hist;
+    double thin_gate = -1.0;
     if (prof) fprintf(stderr, "    [走査] 掃引 %zu 本\n", nsw);
     // PCC_SCAN_DUMP=<path> を付けたときだけ、走査線ごとの当てはめの様子を書き出す。
     // 符号化の結果には影響しない。
@@ -757,7 +770,15 @@ static bool enc_geom_scan(const std::vector<const std::vector<int64_t>*>& cols,
         // 標識は 1 点 1 bit を上限として見込む（実際は文脈符号化でこれより安い）。
         SweepParam two[2];
         FitDiag fd2[2];
-        if (m >= 40) {
+        if (SPLIT_THIN > 0 && sp_r0 < 1e17) {
+            thin_hist.push_back(sp_r0);
+            if (thin_gate < 0 && thin_hist.size() >= 200) {
+                std::vector<double> v = thin_hist;
+                std::nth_element(v.begin(), v.begin() + v.size() / 2, v.end());
+                thin_gate = v[v.size() / 2] * SPLIT_THIN;
+            }
+        }
+        if (m >= 40 && (thin_gate < 0 || sp_r0 > thin_gate)) {
             std::vector<uint8_t> lab;
             split_two_lines(bx.data(), by.data(), m, lab);
             size_t c1 = 0; for (auto v : lab) c1 += v;
