@@ -13,6 +13,12 @@
 #include <thread>
 #include <algorithm>
 #include <cmath>
+#include <chrono>
+
+static double now_sec() {
+    using namespace std::chrono;
+    return duration<double>(steady_clock::now().time_since_epoch()).count();
+}
 
 namespace pcc {
 
@@ -71,7 +77,10 @@ void build_causal_predictors_multi(const std::vector<double>& xyz, size_t n,
     for (size_t t = 0; t < n; ++t) rank[perm[t]] = (int32_t)t;
     preds.assign(Ps.size(), {});
     for (size_t a = 0; a < Ps.size(); ++a) preds[a].assign(n * (size_t)Ps[a], -1);
+    double tb = now_sec();
     KdTree tree(xyz);
+    if (getenv("PCC_DPROF")) fprintf(stderr, "        [木] %.3fs\n", now_sec() - tb);
+    tb = now_sec();
     unsigned nt = std::max(1u, std::thread::hardware_concurrency());
     std::vector<std::thread> th;
     for (unsigned w = 0; w < nt; ++w) {
@@ -97,6 +106,7 @@ void build_causal_predictors_multi(const std::vector<double>& xyz, size_t n,
         });
     }
     for (auto& x : th) x.join();
+    if (getenv("PCC_DPROF")) fprintf(stderr, "        [探索] %.3fs\n", now_sec() - tb);
 }
 
 // 符号化順で先行する空間近傍を最大 P 個。全フィールドで使い回す。

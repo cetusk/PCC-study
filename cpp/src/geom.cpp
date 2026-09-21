@@ -4,6 +4,8 @@
 #include <random>
 #include <algorithm>
 #include <cstring>
+#include <cstdlib>
+#include <thread>
 #include <cstdio>
 
 namespace pcc {
@@ -19,9 +21,24 @@ using Tree = nanoflann::KDTreeSingleIndexAdaptor<
 
 struct KdTree::Impl { Cloud c; Tree* t = nullptr; };
 
+// 木の構築は 1 コアしか使わない。復号では近傍表が時間の 34% を占め、その中でも
+// 構築が探索の 2 倍あった（30 万点で 木 0.030s / 探索 0.015s）。
+// nanoflann の並列構築は分割の判断が点の範囲だけで決まるので、**同じ木**を返す。
+static unsigned build_threads() {
+    static const unsigned nt = [] {
+        if (const char* e = getenv("PCC_THREADS")) { long v = atol(e); if (v > 0) return (unsigned)v; }
+        unsigned hw = std::thread::hardware_concurrency();
+        return hw ? hw : 1u;
+    }();
+    return nt;
+}
+
 KdTree::KdTree(const std::vector<double>& xyz) : p_(new Impl), n_(xyz.size() / 3) {
     p_->c.p = &xyz;
-    p_->t = new Tree(3, p_->c, nanoflann::KDTreeSingleIndexAdaptorParams(16));
+    p_->t = new Tree(3, p_->c,
+                     nanoflann::KDTreeSingleIndexAdaptorParams(
+                         16, nanoflann::KDTreeSingleIndexAdaptorFlags::None,
+                         build_threads()));
     p_->t->buildIndex();
 }
 KdTree::~KdTree() { delete p_->t; delete p_; }

@@ -468,7 +468,10 @@ const std::vector<int32_t>* CodecCtx::ensure(size_t n, int P,
         std::vector<int> Ps{1, 3, 5};
         if (std::find(Ps.begin(), Ps.end(), P) == Ps.end()) Ps.push_back(P);
         std::vector<std::vector<int32_t>> pds;
+        double t0 = now_sec();
         build_causal_predictors_multi(*w, n, pit->second, Ps, pds);
+        if (getenv("PCC_DPROF"))
+            fprintf(stderr, "      [近傍表 n=%zu] %.3fs\n", n, now_sec() - t0);
         for (size_t a = 0; a < Ps.size(); ++a)
             pred_by_np.emplace(std::make_pair(n, Ps[a]), std::move(pds[a]));
         it = pred_by_np.find({n, P});
@@ -2126,6 +2129,9 @@ bool read_pcc2(const std::string& path, Frame& f, std::string& err) {
     std::set<std::string> have;
     for (const auto& kv : f.col) have.insert(kv.first);
     bool world_ready = false;
+    const bool dprof = getenv("PCC_DPROF") != nullptr;
+    int wno = 0;
+    double dsum = 0;
     uint32_t left = ns;
     while (left) {
         // いま復号できるものを集める
@@ -2141,9 +2147,11 @@ bool read_pcc2(const std::string& path, Frame& f, std::string& err) {
         if (wave.empty()) { err = "ストリームの依存が解けない"; return false; }
         std::vector<std::string> werr(wave.size());
         std::vector<char> wok(wave.size(), 0);
+        std::vector<double> wsec(wave.size(), 0.0);
         size_t nt = NT < wave.size() ? NT : wave.size();
         auto work = [&](size_t a) {
             uint32_t i = wave[a];
+            double t0 = now_sec();
             std::vector<std::vector<int64_t>> outc;
             if (!codec_decode(st[i].codec, st[i].param, buf.data() + off[i], dlen[i],
                               f.n, st[i].cols.size(), outc, werr[a], &ctx)) return;
@@ -2152,6 +2160,7 @@ bool read_pcc2(const std::string& path, Frame& f, std::string& err) {
                 for (size_t c = 0; c < st[i].cols.size(); ++c)
                     f.col[st[i].cols[c]] = std::move(outc[c]);
             }
+            wsec[a] = now_sec() - t0;
             wok[a] = 1;
         };
         if (nt <= 1) {
@@ -2162,6 +2171,25 @@ bool read_pcc2(const std::string& path, Frame& f, std::string& err) {
             for (size_t t = 0; t < nt; ++t)
                 th.emplace_back([&] { for (size_t a = next++; a < wave.size(); a = next++) work(a); });
             for (auto& x : th) x.join();
+        }
+        if (dprof) {
+            double wmax = 0;
+            for (size_t a = 0; a < wave.size(); ++a) wmax = std::max(wmax, wsec[a]);
+            fprintf(stderr, "  [波 %d] %zu 本  最長 %.3fs\n", wno, wave.size(), wmax);
+            std::vector<size_t> ord(wave.size());
+            for (size_t a = 0; a < wave.size(); ++a) ord[a] = a;
+            std::sort(ord.begin(), ord.end(),
+                      [&](size_t x, size_t y) { return wsec[x] > wsec[y]; });
+            for (size_t j = 0; j < ord.size(); ++j) {
+                uint32_t i = wave[ord[j]];
+                std::string nm;
+                for (size_t c = 0; c < st[i].cols.size(); ++c)
+                    nm += (c ? "+" : "") + st[i].cols[c];
+                fprintf(stderr, "      %-24s %-22s %7.3fs\n", nm.c_str(),
+                        cand_name(st[i].codec, st[i].param).c_str(), wsec[ord[j]]);
+            }
+            dsum += wmax;
+            ++wno;
         }
         for (size_t a = 0; a < wave.size(); ++a) {
             uint32_t i = wave[a];
@@ -2180,6 +2208,7 @@ bool read_pcc2(const std::string& path, Frame& f, std::string& err) {
             world_ready = true;
         }
     }
+    if (dprof) fprintf(stderr, "  [波の合計] %.3fs（%d 波）\n", dsum, wno);
     return true;
 }
 
