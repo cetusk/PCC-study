@@ -9,6 +9,8 @@
 #include <cstdio>
 #include <cstring>
 #include <cstdlib>
+#include <atomic>
+#include <thread>
 
 namespace pcc {
 
@@ -1311,6 +1313,38 @@ std::string cand_name(uint16_t c, const std::vector<uint8_t>& p) {
     return "?";
 }
 
+// 候補は互いに独立に符号化できる。幾何の候補だけを並列に回す。
+// 属性の候補は CodecCtx の可変メンバ（順序表・予測子表・world）を作るので
+// 同時に走らせられない。幾何の候補が触るのは復号済みの列だけである。
+// 出力は候補の順に並べ直してから比べるので、選ばれる符号器は並列でも変わらない。
+static void encode_many(const std::vector<Cand>& cs,
+                        const std::vector<const std::vector<int64_t>*>& cv,
+                        const CodecCtx* ctx, std::vector<std::vector<uint8_t>>& blobs,
+                        std::vector<std::string>& errs, std::vector<char>& ok) {
+    const size_t m = cs.size();
+    blobs.assign(m, {}); errs.assign(m, std::string()); ok.assign(m, 0);
+    static const size_t NT = [] {
+        if (const char* e = getenv("PCC_THREADS")) { long v = atol(e); if (v > 0) return (size_t)v; }
+        unsigned hw = std::thread::hardware_concurrency();
+        return (size_t)(hw ? hw : 1);
+    }();
+    size_t nt = NT < m ? NT : m;
+    if (nt <= 1) {
+        for (size_t i = 0; i < m; ++i)
+            ok[i] = codec_encode(cs[i].codec, cv, cs[i].param, blobs[i], errs[i], ctx) ? 1 : 0;
+        return;
+    }
+    std::atomic<size_t> next{0};
+    std::vector<std::thread> th;
+    th.reserve(nt);
+    for (size_t t = 0; t < nt; ++t)
+        th.emplace_back([&] {
+            for (size_t i = next++; i < m; i = next++)
+                ok[i] = codec_encode(cs[i].codec, cv, cs[i].param, blobs[i], errs[i], ctx) ? 1 : 0;
+        });
+    for (auto& x : th) x.join();
+}
+
 Stream best_stream(const Frame& f, const std::vector<std::string>& cols,
                    const std::vector<Cand>& candidates, const CodecCtx* ctx,
                    std::string* trace, bool preselect) {
@@ -1348,12 +1382,12 @@ Stream best_stream(const Frame& f, const std::vector<std::string>& cols,
         for (auto* c : cv) sub.emplace_back(c->begin(), c->begin() + PRE_SAMP);
         std::vector<const std::vector<int64_t>*> scv;
         for (auto& v : sub) scv.push_back(&v);
+        std::vector<std::vector<uint8_t>> sb; std::vector<std::string> se;
+        std::vector<char> sok;
+        encode_many(candidates, scv, ctx, sb, se, sok);
         std::vector<std::pair<size_t, Cand>> pre;
-        for (const auto& cd : candidates) {
-            std::vector<uint8_t> blob; std::string e2;
-            if (!codec_encode(cd.codec, scv, cd.param, blob, e2, ctx)) continue;
-            pre.push_back({blob.size(), cd});
-        }
+        for (size_t t = 0; t < candidates.size(); ++t)
+            if (sok[t]) pre.push_back({sb[t].size(), candidates[t]});
         if (pre.size() > PRE_KEEP) {
             std::sort(pre.begin(), pre.end(),
                       [](const auto& a, const auto& b) { return a.first < b.first; });
@@ -1374,12 +1408,23 @@ Stream best_stream(const Frame& f, const std::vector<std::string>& cols,
                 if (c.codec == C_GEOM_XYZ && !c.param.empty() && c.param[0] == 4) return 3;
                 return 0;
             };
+            // 族の保護は無条件だと重い。走査モデルは全点で 1 本 0.09 s かかり、
+            // 既定の符号化時間の半分近くを占める。標本での符号長が最良から
+            // 離れすぎている族は、全点で測っても勝たないと見て落とす。
+            static const double FAM_THR = [] {
+                const char* e = getenv("PCC_FAMTHR");
+                return e ? atof(e) : 1e9;
+            }();
+            const double best_pre = (double)pre[0].first;
             for (int fam = 1; fam <= 3; ++fam) {
                 bool have = false;
                 for (const auto& c : use) if (family(c) == fam) have = true;
                 if (have) continue;
                 for (const auto& pr : pre)
-                    if (family(pr.second) == fam) { use.push_back(pr.second); break; }
+                    if (family(pr.second) == fam) {
+                        if ((double)pr.first <= best_pre * FAM_THR) use.push_back(pr.second);
+                        break;
+                    }
             }
         }
     }
@@ -1393,9 +1438,16 @@ Stream best_stream(const Frame& f, const std::vector<std::string>& cols,
         return e ? (size_t)atoi(e) : (size_t)3;
     }();
     std::vector<std::pair<size_t, Cand>> rank;      // (符号長, 候補) を短い順に
-    for (const auto& cd : use) {
+    std::vector<std::vector<uint8_t>> fb; std::vector<std::string> fe;
+    std::vector<char> fok;
+    if (preselect) encode_many(use, cv, ctx, fb, fe, fok);
+    for (size_t ui = 0; ui < use.size(); ++ui) {
+        const Cand& cd = use[ui];
         std::vector<uint8_t> blob; std::string err;
-        if (!codec_encode(cd.codec, cv, cd.param, blob, err, ctx)) {
+        bool got;
+        if (preselect) { got = fok[ui] != 0; blob = std::move(fb[ui]); err = fe[ui]; }
+        else got = codec_encode(cd.codec, cv, cd.param, blob, err, ctx);
+        if (!got) {
             if (trace) *trace += "      " + cand_name(cd.codec, cd.param) + " 不可: " + err + "\n";
             continue;
         }
