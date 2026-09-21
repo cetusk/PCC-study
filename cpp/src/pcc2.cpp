@@ -1440,6 +1440,21 @@ static void encode_many(const std::vector<Cand>& cs,
 Stream best_stream(const Frame& f, const std::vector<std::string>& cols,
                    const std::vector<Cand>& candidates, const CodecCtx* ctx,
                    std::string* trace, bool preselect) {
+    // 属性の列にも事前選別を掛けるか。49 節では全列 bpp が +3.7% 悪化したので
+    // 幾何だけにしたが、候補も残す本数も変わったので測り直せるようにしておく。
+    // **既定では掛けない。** 全列の符号化時間は 15 件の中央値で 34% 縮むが、
+    // 回帰試験（先頭 30 万点・全列）では USGS NY が +4.5%、AHN4 _20 が +2.7%、
+    // AHN3 _20 が +1.7% 伸びる。標本（中央 20 万点）では +0.12% しか出ないので、
+    // どの標本で測るかで結論が変わる。サイズが第一なので掛けない。
+    static const bool PRE_ATTR = [] {
+        const char* e = getenv("PCC_PRESELECT_ATTR");
+        return e && e[0] == '1';
+    }();
+    // 並列にしてよいのは幾何の候補だけである（属性の候補は CodecCtx の
+    // 可変メンバを作る）。標本で順位を付けることと、並列に符号化することは
+    // 別の話なので、旗を分ける。
+    const bool par = preselect;
+    if (PRE_ATTR) preselect = true;
     std::vector<const std::vector<int64_t>*> cv;
     for (const auto& c : cols) cv.push_back(f.get(c));
     // 候補が多いときは、まず先頭の標本で順位を付け、上位だけを全点で測る。
@@ -1476,7 +1491,15 @@ Stream best_stream(const Frame& f, const std::vector<std::string>& cols,
         for (auto& v : sub) scv.push_back(&v);
         std::vector<std::vector<uint8_t>> sb; std::vector<std::string> se;
         std::vector<char> sok;
-        encode_many(candidates, scv, ctx, sb, se, sok);
+        if (par) {
+            encode_many(candidates, scv, ctx, sb, se, sok);
+        } else {
+            sb.assign(candidates.size(), {}); se.assign(candidates.size(), std::string());
+            sok.assign(candidates.size(), 0);
+            for (size_t t = 0; t < candidates.size(); ++t)
+                sok[t] = codec_encode(candidates[t].codec, scv, candidates[t].param,
+                                      sb[t], se[t], ctx) ? 1 : 0;
+        }
         std::vector<std::pair<size_t, Cand>> pre;
         for (size_t t = 0; t < candidates.size(); ++t)
             if (sok[t]) pre.push_back({sb[t].size(), candidates[t]});
@@ -1532,12 +1555,12 @@ Stream best_stream(const Frame& f, const std::vector<std::string>& cols,
     std::vector<std::pair<size_t, Cand>> rank;      // (符号長, 候補) を短い順に
     std::vector<std::vector<uint8_t>> fb; std::vector<std::string> fe;
     std::vector<char> fok;
-    if (preselect) encode_many(use, cv, ctx, fb, fe, fok);
+    if (par) encode_many(use, cv, ctx, fb, fe, fok);
     for (size_t ui = 0; ui < use.size(); ++ui) {
         const Cand& cd = use[ui];
         std::vector<uint8_t> blob; std::string err;
         bool got;
-        if (preselect) { got = fok[ui] != 0; blob = std::move(fb[ui]); err = fe[ui]; }
+        if (par) { got = fok[ui] != 0; blob = std::move(fb[ui]); err = fe[ui]; }
         else got = codec_encode(cd.codec, cv, cd.param, blob, err, ctx);
         if (!got) {
             if (trace) *trace += "      " + cand_name(cd.codec, cd.param) + " 不可: " + err + "\n";
@@ -1649,14 +1672,14 @@ std::vector<Stream> plan_streams(const Frame& f, bool joint_geom, std::string* l
     if (joint_geom) {
         std::vector<std::string> g{f.geom[0], f.geom[1], f.geom[2]};
         std::vector<Cand> gc{{C_RAW64, {}}, {C_RANGE, {}}, {C_RANGE_DELTA, {}},
-                             {C_GEOM_XYZ, {1}}, {C_GEOM_XYZ, {3}},
+                             {C_GEOM_XYZ, {0}}, {C_GEOM_XYZ, {1}}, {C_GEOM_XYZ, {3}},
                              // 予測子だけを差し替えた 幾何v3。副情報は増えない。
                              // 直近 4 つの差分の平均は TLS と AHN3 で、中央値の
                              // 半分は autzen-2023 で残差が短かった（符号化前の見積り）。
                              {C_GEOM_XYZ, {3, 1}}, {C_GEOM_XYZ, {3, 2}},
                              // 直近 W 点の最近傍から予測する。格納順が空間的に
                              // 連続していない入力で効く（幾何v4 の注記を参照）。
-                             {C_GEOM_XYZ, {4, 4}},
+                             {C_GEOM_XYZ, {4, 4}}, {C_GEOM_XYZ, {4, 16}},
                              // 選んだ点に局所の傾きを足す。副情報は増えない。
                              {C_GEOM_XYZ, {4, 4, 1}}};
         if (!aux.empty()) {
@@ -1687,7 +1710,7 @@ std::vector<Stream> plan_streams(const Frame& f, bool joint_geom, std::string* l
             // （results/scan_model_fitting.md 16・32 節）。v3 が v1 を上回るのは
             // 1 件ではなく 2 件で、vegetation の 0.31% は誤差では片づかない。
             // PCC_ALL_VARIANTS=1 で測り直して決め直すこと。
-            std::vector<uint8_t> vars{5};
+            std::vector<uint8_t> vars{1, 5};
             if (const char* e = getenv("PCC_ALL_VARIANTS"))
                 if (e[0] == '1') vars = {1, 2, 3, 4, 5};
             for (uint8_t v : vars) {
