@@ -1428,6 +1428,7 @@ bool codec_decode(uint16_t id, const std::vector<uint8_t>& param,
         const std::vector<int64_t>* a = aux_col(param, ctx);
         if (!a || a->size() < n) { err = "参照列がない"; return false; }
         int P = param[0];
+        // 配列は 1 本で足りる。残差 → 復元 → 参照列を足す、をその場で行う。
         std::vector<std::vector<int64_t>> d;
         dec_resid(data, len, n, 1, d);
         if (P == 100) {
@@ -1437,12 +1438,10 @@ bool codec_decode(uint16_t id, const std::vector<uint8_t>& param,
             const std::vector<int32_t>* pm = nullptr;
             const std::vector<int32_t>* pdt = ctx->ensure(n, P, &pm);
             if (!pdt) { err = "座標がない"; return false; }
-            std::vector<int64_t> r;
-            spatial_restore(d[0], *pm, *pdt, P, n, r);
-            d[0] = std::move(r);
+            spatial_restore(d[0], *pm, *pdt, P, n, d[0]);
         }
-        out.assign(1, std::vector<int64_t>(n));
-        for (size_t i = 0; i < n; ++i) out[0][i] = d[0][i] + (*a)[i];
+        for (size_t i = 0; i < n; ++i) d[0][i] += (*a)[i];
+        out = std::move(d);
         return true;
     }
     case C_ATTR_SPATIAL:
@@ -1454,16 +1453,17 @@ bool codec_decode(uint16_t id, const std::vector<uint8_t>& param,
             if (!pdt) { err = "座標がない"; return false; }
         std::vector<std::vector<int64_t>> res;
         dec_resid(data, len, n, ncol, res);
-        std::vector<std::vector<int64_t>> src(ncol);
         for (size_t c = 0; c < ncol; ++c)
-            spatial_restore(res[c], *pm, *pdt, P, n, src[c]);
+            spatial_restore(res[c], *pm, *pdt, P, n, res[c]);   // その場で復元する
         if (id == C_ATTR_COLOR) {
             if (ncol != 3) { err = "色は 3 列でなければならない"; return false; }
-            out.assign(3, std::vector<int64_t>(n));
-            for (size_t i = 0; i < n; ++i)
-                ycocg_inv(src[0][i], src[1][i], src[2][i],
-                          out[0][i], out[1][i], out[2][i]);
-        } else out = std::move(src);
+            // 3 つとも読んでから書く。同じ配列に書き戻すため。
+            for (size_t i = 0; i < n; ++i) {
+                int64_t Y = res[0][i], Co = res[1][i], Cg = res[2][i];
+                ycocg_inv(Y, Co, Cg, res[0][i], res[1][i], res[2][i]);
+            }
+        }
+        out = std::move(res);
         return true;
     }
     }

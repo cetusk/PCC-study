@@ -227,6 +227,9 @@ bool spatial_residual32_inplace(std::vector<int32_t>& v, const std::vector<int32
     return true;
 }
 
+// **out は res と同じ配列でよい。**1 つめのループが res を最後まで読んでから
+// 2 つめのループが out に書く。復号は流れごとに配列を取るので、依存の波で
+// 同時に走る本数だけ効く。
 void spatial_restore(const std::vector<int64_t>& res, const std::vector<int32_t>& perm,
                      const std::vector<int32_t>& pred, int P, size_t n,
                      std::vector<int64_t>& out) {
