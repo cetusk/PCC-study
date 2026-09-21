@@ -1750,6 +1750,13 @@ Stream best_stream(const Frame& f, const std::vector<std::string>& cols,
             //   空間予測   … 点を間引くと近傍が遠くなる（30 節の nir と同じ理由）
             //   幾何v4     … 最近傍の当たり方が場所で変わる（AHN4 _21 は
             //                   先頭 12.5 万点だけ見ると 3 位以内に入らない）
+            //   記号版   … 多値の模型は馴染むのに点数が要る（2.5 万点の標本では
+            //                 実力より悪く見える。AHN4 _20 の走査v1記が実際にそう）
+            // **族の判定から記号版の旗を外してはいけない。** 外すと、記号版が
+            // 上位に入ったときに「その族はもう居る」と判じて非記号版の代表を
+            // 足さなくなる。AHN3 _20 の先頭 30 万点で、全点なら勝つ 幾何v4W4 が
+            // 決勝に残らず 21.315 → 21.328 bpp に伸びた。
+            // 記号版かどうかは族と直交する軸なので、下で別に 1 本残す。
             auto family = [](const Cand& c) -> int {
                 if (c.codec == C_GEOM_SCAN) return 1;
                 if (c.codec == C_ATTR_SPATIAL || c.codec == C_ATTR_COLOR) return 2;
@@ -1776,6 +1783,15 @@ Stream best_stream(const Frame& f, const std::vector<std::string>& cols,
                         break;
                     }
             }
+            // 記号版かどうかは族と直交する軸なので、別に 1 本残す。
+            bool have_fsym = false;
+            for (const auto& c : use) if (c.codec & C_FSYM_BIT) have_fsym = true;
+            if (!have_fsym)
+                for (const auto& pr : pre)
+                    if (pr.second.codec & C_FSYM_BIT) {
+                        if ((double)pr.first <= best_pre * FAM_THR) use.push_back(pr.second);
+                        break;
+                    }
         }
     }
 
@@ -1971,14 +1987,15 @@ std::vector<Stream> plan_streams(const Frame& f, bool joint_geom, std::string* l
                 pv.insert(pv.end(), nm.begin(), nm.end());
             };
             add("gps_time"); add("point_source_id"); add(ret);
-            // v2（z を中央値予測）と v3（z の文脈を面内・面外から作る）と v4 は
-            // 既定では出さない。ただし**その根拠だった集計は誤りだった**
-            // （results/scan_model_fitting.md 16・32 節）。v3 が v1 を上回るのは
-            // 1 件ではなく 2 件で、vegetation の 0.31% は誤差では片づかない。
-            // PCC_ALL_VARIANTS=1 で測り直して決め直すこと。
-            std::vector<uint8_t> vars{1, 5};
+            // v2（z を中央値予測）と v3（z の文脈を面内・面外から作る）と v4 も出す。
+            // 以前は既定で外していたが、**その根拠だった集計は誤りだった**
+            // （results/scan_model_fitting.md 16・32 節）。測り直したところ、
+            // 記号版を標本から守るようにした上で全部出すと、悪化が 1 件も無く
+            // AHN4 _21 −0.13% / AHN5 _20 −0.25% / fullwave −0.28% が縮んだ。
+            // 代償は符号化が 10.9 倍 → 12.7 倍。サイズが第一なので出す。
+            std::vector<uint8_t> vars{1, 2, 3, 4, 5};
             if (const char* e = getenv("PCC_ALL_VARIANTS"))
-                if (e[0] == '1') vars = {1, 2, 3, 4, 5};
+                if (e[0] == '0') vars = {1, 5};
             for (uint8_t v : vars) {
                 std::vector<uint8_t> q = pv; q[0] = v;
                 gc.push_back({C_GEOM_SCAN, q});
