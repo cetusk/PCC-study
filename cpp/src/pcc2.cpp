@@ -1876,8 +1876,10 @@ std::vector<Stream> plan_streams(const Frame& f, bool joint_geom, std::string* l
     const double t_plan0 = now_sec();
     const size_t NT = pool_threads();
     std::unique_ptr<Pool> pool;
+    Pool* const prev_pool = g_pool;
     if (NT > 1) { pool.reset(new Pool(NT)); g_pool = pool.get(); }
-    struct PoolGuard { ~PoolGuard() { g_pool = nullptr; } } pool_guard;
+    // 入れ子で呼ばれても外側のプールを消さないように、元の値に戻す。
+    struct PoolGuard { Pool* p; ~PoolGuard() { g_pool = p; } } pool_guard{prev_pool};
     std::vector<Job> jobs;
     std::vector<size_t> order;                 // 出す順。SIZE_MAX は色の判定の位置
     auto defer = [&](std::vector<std::string> cs, std::vector<Cand> cd,
