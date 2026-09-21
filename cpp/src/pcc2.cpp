@@ -2138,7 +2138,13 @@ std::vector<Stream> plan_streams(const Frame& f, bool joint_geom, std::string* l
                 if (it != escore.end()) sc.push_back({it->second, e});
             }
             std::sort(sc.begin(), sc.end());
-            for (size_t i = 0; i < sc.size() && i < 2; ++i) {
+            // 参照の相手を何本まで候補にするか。既定は 2 本。
+            // 絞りが何を犠牲にしているかは PCC_XREF_KEEP を大きくして測れる。
+            static const size_t XKEEP = [] {
+                const char* e = getenv("PCC_XREF_KEEP");
+                return e ? (size_t)atol(e) : (size_t)2;
+            }();
+            for (size_t i = 0; i < sc.size() && i < XKEEP; ++i) {
                 uint16_t l = (uint16_t)sc[i].second.size();
                 for (uint8_t P : {0, 100, 1, 3, 5}) {
                     std::vector<uint8_t> pv{P};
