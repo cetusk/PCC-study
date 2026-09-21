@@ -1417,10 +1417,15 @@ std::string cand_name(uint16_t c, const std::vector<uint8_t>& p) {
 // 属性の候補は CodecCtx の可変メンバ（順序表・予測子表・world）を作るので
 // 同時に走らせられない。幾何の候補が触るのは復号済みの列だけである。
 // 出力は候補の順に並べ直してから比べるので、選ばれる符号器は並列でも変わらない。
+// abort が真のときだけ、最短を超えた候補を打ち切る。
+// **事前選別の標本では打ち切ってはいけない。**打ち切った候補は順位表から
+// 消えるので、族の保護が「その族が 1 本も無い」と見て守れなくなる。
+// 17 件のうち 1 件で、走査変換が標本で打ち切られて選ばれなくなった。
 static void encode_many(const std::vector<Cand>& cs,
                         const std::vector<const std::vector<int64_t>*>& cv,
                         const CodecCtx* ctx, std::vector<std::vector<uint8_t>>& blobs,
-                        std::vector<std::string>& errs, std::vector<char>& ok) {
+                        std::vector<std::string>& errs, std::vector<char>& ok,
+                        bool abort_long) {
     const size_t m = cs.size();
     blobs.assign(m, {}); errs.assign(m, std::string()); ok.assign(m, 0);
     static const size_t NT = [] {
@@ -1430,17 +1435,41 @@ static void encode_many(const std::vector<Cand>& cs,
     }();
     size_t nt = NT < m ? NT : m;
     if (nt <= 1) {
-        for (size_t i = 0; i < m; ++i)
-            ok[i] = codec_encode(cs[i].codec, cv, cs[i].param, blobs[i], errs[i], ctx) ? 1 : 0;
+        std::atomic<size_t> best{(size_t)-1};
+        enc_best = abort_long ? &best : nullptr;
+        for (size_t i = 0; i < m; ++i) {
+            try {
+                ok[i] = codec_encode(cs[i].codec, cv, cs[i].param, blobs[i], errs[i], ctx) ? 1 : 0;
+            } catch (const EncAbort&) {
+                ok[i] = 0; errs[i] = "最短を超えたので打ち切り"; blobs[i].clear();
+            }
+            if (ok[i] && blobs[i].size() < best.load(std::memory_order_relaxed))
+                best.store(blobs[i].size(), std::memory_order_relaxed);
+        }
+        enc_best = nullptr;
         return;
     }
     std::atomic<size_t> next{0};
+    std::atomic<size_t> best{(size_t)-1};
     std::vector<std::thread> th;
     th.reserve(nt);
     for (size_t t = 0; t < nt; ++t)
         th.emplace_back([&] {
-            for (size_t i = next++; i < m; i = next++)
-                ok[i] = codec_encode(cs[i].codec, cv, cs[i].param, blobs[i], errs[i], ctx) ? 1 : 0;
+            enc_best = abort_long ? &best : nullptr;
+            for (size_t i = next++; i < m; i = next++) {
+                try {
+                    ok[i] = codec_encode(cs[i].codec, cv, cs[i].param, blobs[i], errs[i], ctx) ? 1 : 0;
+                } catch (const EncAbort&) {
+                    ok[i] = 0; errs[i] = "最短を超えたので打ち切り"; blobs[i].clear();
+                }
+                if (ok[i]) {
+                    size_t b = best.load(std::memory_order_relaxed);
+                    while (blobs[i].size() < b &&
+                           !best.compare_exchange_weak(b, blobs[i].size(),
+                                                       std::memory_order_relaxed)) {}
+                }
+            }
+            enc_best = nullptr;
         });
     for (auto& x : th) x.join();
 }
@@ -1506,7 +1535,7 @@ Stream best_stream(const Frame& f, const std::vector<std::string>& cols,
         std::vector<std::vector<uint8_t>> sb; std::vector<std::string> se;
         std::vector<char> sok;
         if (par) {
-            encode_many(candidates, scv, ctx, sb, se, sok);
+            encode_many(candidates, scv, ctx, sb, se, sok, false);
         } else {
             sb.assign(candidates.size(), {}); se.assign(candidates.size(), std::string());
             sok.assign(candidates.size(), 0);
@@ -1569,7 +1598,7 @@ Stream best_stream(const Frame& f, const std::vector<std::string>& cols,
     std::vector<std::pair<size_t, Cand>> rank;      // (符号長, 候補) を短い順に
     std::vector<std::vector<uint8_t>> fb; std::vector<std::string> fe;
     std::vector<char> fok;
-    if (par) encode_many(use, cv, ctx, fb, fe, fok);
+    if (par) encode_many(use, cv, ctx, fb, fe, fok, true);
     for (size_t ui = 0; ui < use.size(); ++ui) {
         const Cand& cd = use[ui];
         std::vector<uint8_t> blob; std::string err;

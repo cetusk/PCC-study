@@ -4,6 +4,7 @@
 // 可逆圧縮では符号化側と復号側で丸めが 1 ビットでも違えば復号が破綻するため、
 // 浮動小数は一切使わず、確率状態も 16bit 整数で持つ。
 #pragma once
+#include <atomic>
 #include <cstdint>
 #include <vector>
 #include <cstddef>
@@ -26,6 +27,12 @@ struct BitModel {
         else if (p0 >= PROB_ONE) p0 = PROB_ONE - 1;
     }
 };
+
+// 候補を符号化している途中で、既に見つかっている最短を超えたら打ち切る。
+// 超えた候補は最短にはなり得ないので、打ち切っても選ばれる符号器は変わらない。
+// スレッドごとに「いまの最短」への参照を置く（候補は並列に符号化される）。
+struct EncAbort {};
+inline thread_local const std::atomic<size_t>* enc_best = nullptr;
 
 // LZMA 方式。キャリーは cache / cache_size で伝播させる。
 class Encoder {
@@ -53,6 +60,8 @@ private:
         }
         ++cache_size_;
         low_ = (low_ << 8) & 0xFFFFFFFFull;
+        if (enc_best && out_.size() > enc_best->load(std::memory_order_relaxed))
+            throw EncAbort{};
     }
     uint64_t low_ = 0;
     uint32_t range_ = 0xFFFFFFFFu;
