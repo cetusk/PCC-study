@@ -1,16 +1,20 @@
-"""5 軸で全符号器を比べる — bpp / 符号化 / 復号 / ピーク / 可逆性。
+"""サイズ・速度・メモリーを 1 回の実行でまとめて比べる。
 
-同じ仕事をさせる。G-PCC は幾何しか符号化しないので、入力は X/Y/Z だけにする。
-走査モデルは鍵（時刻・飛行線）を入力として要るので、その 2 列を足した入力を
-別に作る（鍵は走査モデルへの入力であって符号化の対象ではない）。
+指標の優先順位は「可逆を前提に、サイズ > 速度 > メモリ」。その順に並べる。
+別々の台の数字を継ぎ合わせると条件が揃わないので、1 ファイルにつき 1 回だけ
+符号化して、そこから全部の値を採る。
 
-計測は runpeak の補助プロセスに任せる。親からの fork で測ると、親のメモリが
-子の RSS に乗って符号器の値にならない。
+基準は LASzip。**生の .laz と比べてはいけない。**PCC2 が読まない次元（走査方向
+や飛行線の端のビット、波形の 7 種など）が .laz には入っているので、生の大きさと
+比べると PCC2 が不当に有利になる。pccnorm が出す「基準 LASzip」は、PCC2 が
+読んだ列だけを書き直した LAZ なので、両側が同じ値を詰めている。
+
+LASzip は CLI が無くライブラリなので、ピーク RSS だけは外から測れない。
+メモリーは G-PCC と比べる別表（bench_mem.py）にする。
+どの次元が戻らないかは bench_cover.py で数える。
 """
 from __future__ import annotations
-import os
-import sys
-import tempfile
+import os, re, sys, tempfile, time
 from pathlib import Path
 import numpy as np
 import laspy
@@ -18,104 +22,89 @@ import laspy
 sys.path.insert(0, str(Path(__file__).parent))
 import exp_order_matrix as M
 from runpeak import run
-from bench_pcc2 import PCC, TMC3, ENV, GFLAGS, write_ply
+from bench_pcc2 import PCC, ENV
+from bench_size import INPUTS
 
-PY = sys.executable
-LAZIO = str(Path(__file__).parent / "lazio.py")
-FILES = [("AHN4 _20", "data/raw/ahn4/31HZ1_20.LAZ"),
-         ("AHN3 _20", "data/raw/ahn3/31HZ1_20.LAZ"),
-         ("AHN5 _20", "data/raw/ahn5/31HZ1_20.LAZ"),
-         ("USGS NY", "data/raw/usgs/NY_ClintonEssex_2014.laz"),
-         ("USGS AK", "data/raw/usgs/AK_Kenai_2008_000001.laz"),
-         ("autzen-2023", "data/raw/extrabytes/autzen_2023_autzen-2023.copc.laz"),
-         ("workshop", "data/raw/extrabytes/workshop_TM_551_101.laz")]
+N = int(os.environ.get("BENCH_N", "200000"))
+REP = int(os.environ.get("BENCH_REP", "2"))
+LAS = [i for i in INPUTS if i[2] == "las"]
 
 
-def one(path: str, n: int, tmp: Path) -> dict:
-    total = M.total_points("las", path)
-    start = max(0, total // 2 - n // 2) if total > n else 0
-    xyz, g, sid, sc, of, pts, hdr = M.read_block("las", path, start, n)
-    m = len(xyz)
-    out = {}
+def main():
+    rows = []
+    for lab, path, kind in LAS:
+        tmp = Path(tempfile.mkdtemp())
+        try:
+            tot = M.total_points(kind, path)
+            n = min(N, tot)
+            st = max(0, tot // 2 - n // 2)
+            xyz, g, sid, sc, of, pts, hdr = M.read_block(kind, path, st, n)
+            src = tmp / "a.laz"
+            we = []
+            for _ in range(REP):
+                t0 = time.perf_counter()
+                M.write_las(src, xyz, sc, of, pts, hdr)
+                we.append(time.perf_counter() - t0)
+            rd = []
+            for _ in range(REP):
+                t0 = time.perf_counter()
+                d = laspy.read(str(src))
+                _ = np.asarray(d.X)[0]
+                rd.append(time.perf_counter() - t0)
+            enc = dec = None
+            peak = 0.0
+            bl = bp = float("nan")
+            for _ in range(REP):
+                r = run([PCC, "pack", str(src), str(tmp / "o.pcc2"), "--no-fallback"], ENV)
+                e = re.search(r"enc ([0-9.]+)s / dec ([0-9.]+)s", r["out"])
+                if not e:
+                    continue
+                q = re.search(r"基準 LASzip\s+\S+ MB\s+([0-9.]+) bpp", r["out"])
+                w = re.search(r"^PCC2\s+\S+ MB\s+([0-9.]+) bpp", r["out"], re.M)
+                if q and w: bl, bp = float(q.group(1)), float(w.group(1))
+                enc = float(e.group(1)) if enc is None else min(enc, float(e.group(1)))
+                dec = float(e.group(2)) if dec is None else min(dec, float(e.group(2)))
+                peak = max(peak, r["peak_mb"])
+            rows.append({
+                "lab": lab, "n": n, "laz": bl, "pcc": bp,
+                "wenc": min(we), "wdec": min(rd), "enc": enc, "dec": dec, "peak": peak,
+            })
+        finally:
+            for q in tmp.glob("*"):
+                q.unlink()
+            tmp.rmdir()
 
-    # --- G-PCC（幾何のみ）
-    ply = tmp / "g.ply"
-    write_ply(ply, xyz)
-    bs = tmp / "g.bin"
-    e = run([TMC3, "--mode=0", f"--uncompressedDataPath={ply}",
-             f"--compressedStreamPath={bs}"] + GFLAGS, ENV)
-    d = run([TMC3, "--mode=1", f"--compressedStreamPath={bs}",
-             f"--reconstructedDataPath={tmp / 'rec.ply'}", "--outputBinaryPly=1"], ENV)
-    out["G-PCC"] = (bs.stat().st_size * 8.0 / m, e["sec"], d["sec"],
-                    e["peak_mb"], d["peak_mb"])
+    print(f"標本 {N} 点。全列。各 {REP} 回の最小。基準は LASzip（同じ列）。\n")
+    print("== サイズ（第一指標）==")
+    print(f"{'データ':<13}{'点':>8}{'LASzip bpp':>11}{'PCC2 bpp':>10}{'差':>9}")
+    for r in rows:
+        a, b = r["laz"], r["pcc"]
+        print(f"{r['lab']:<13}{r['n']:>8}{a:>11.3f}{b:>10.3f}{(b-a)/a*100:>8.1f}%")
+    d = np.array([(r["pcc"] - r["laz"]) / r["laz"] * 100 for r in rows])
+    print(f"\n  PCC2 が小さい {int((d<0).sum())}/{len(d)}   中央値 {np.median(d):+.1f}%"
+          f"   四分位 [{np.percentile(d,25):+.1f}, {np.percentile(d,75):+.1f}]"
+          f"   幅 {d.min():+.1f}〜{d.max():+.1f}\n")
 
-    # --- LAZ（幾何のみ）
-    npy = tmp / "a.npy"
-    np.save(npy, xyz)
-    lz = tmp / "a.laz"
-    e = run([PY, LAZIO, "enc", str(npy), str(lz)], ENV)
-    d = run([PY, LAZIO, "dec", str(lz), str(tmp / "b.npy")], ENV)
-    out["LAZ"] = (lz.stat().st_size * 8.0 / m, e["sec"], d["sec"],
-                  e["peak_mb"], d["peak_mb"])
+    print("== 速度（第二指標）==")
+    print(f"{'データ':<13}{'LASzip 符号':>12}{'PCC2 符号':>10}{'比':>7}"
+          f"{'LASzip 復号':>12}{'PCC2 復号':>10}{'比':>7}")
+    for r in rows:
+        re_, rd_ = r["enc"] / r["wenc"], r["dec"] / r["wdec"]
+        print(f"{r['lab']:<13}{r['wenc']:>12.3f}{r['enc']:>10.3f}{re_:>6.1f}x"
+              f"{r['wdec']:>12.3f}{r['dec']:>10.3f}{rd_:>6.1f}x")
+    for nm, k, w in (("符号化", "enc", "wenc"), ("復号", "dec", "wdec")):
+        v = np.array([r[k] / r[w] for r in rows])
+        print(f"\n  {nm} PCC2/LASzip  中央値 {np.median(v):.1f}x"
+              f"  四分位 [{np.percentile(v,25):.1f}, {np.percentile(v,75):.1f}]"
+              f"  幅 {v.min():.1f}〜{v.max():.1f}")
 
-    # --- PCC2
-    geom = tmp / "geom.laz"
-    M.write_las(geom, xyz, sc, of, None, None)
-    h = laspy.LasHeader(version="1.4", point_format=6)
-    h.scales, h.offsets = sc, of
-    las = laspy.LasData(h)
-    las.X, las.Y, las.Z = xyz[:, 0], xyz[:, 1], xyz[:, 2]
-    las.gps_time, las.point_source_id = g, sid
-    key = tmp / "key.laz"
-    las.write(str(key))
-    for lab, src, force in (("幾何v3", geom, "幾何v3"), ("走査v1", key, "走査v1")):
-        pc2 = tmp / "o.pcc2"
-        e = run([PCC, "pack", str(src), str(pc2), "--force-geom", force,
-                 "--fast-attr", "--no-fallback", "--no-verify"], ENV)
-        bpp = float("nan")
-        for ln in e["out"].splitlines():
-            if ln.startswith("  X+Y+Z") and ln.split()[1] == force:
-                bpp = float(ln.split()[2])
-        d = run([PCC, "unpack", str(pc2), str(tmp / "back.laz")], ENV)
-        out[lab] = (bpp, e["sec"], d["sec"], e["peak_mb"], d["peak_mb"])
-    for p in tmp.glob("*"):
-        p.unlink()
-    return out
-
-
-def main() -> None:
-    n = int(sys.argv[1]) if len(sys.argv) > 1 else 1_000_000
-    tmp = Path(tempfile.mkdtemp())
-    keys = ("G-PCC", "LAZ", "幾何v3", "走査v1")
-    agg = {k: [] for k in keys}
-    print(f"幾何のみ、{n} 点。符号化は検証と決定性の二度書きを含まない。")
-    print(f"{'データ':<13}{'符号器':<9}{'bpp':>9}{'enc 秒':>9}{'dec 秒':>9}"
-          f"{'enc MB':>9}{'dec MB':>9}")
-    for lab, path in FILES:
-        if not Path(path).is_file():
-            print(f"{lab:<13} 入力が無い")
-            continue
-        r = one(path, n, tmp)
-        for k in keys:
-            v = r[k]
-            agg[k].append(v)
-            print(f"{lab if k == keys[0] else '':<13}{k:<9}"
-                  f"{v[0]:>9.3f}{v[1]:>9.2f}{v[2]:>9.2f}{v[3]:>9.0f}{v[4]:>9.0f}")
-    print("-" * 68)
-    print(f"{'中央値':<13}{'':<9}{'bpp':>9}{'enc 秒':>9}{'dec 秒':>9}{'enc MB':>9}{'dec MB':>9}")
-    base = np.median(np.array(agg["G-PCC"]), axis=0)
-    for k in keys:
-        a = np.median(np.array(agg[k]), axis=0)
-        print(f"{'':<13}{k:<9}" + "".join(
-            f"{a[i]:>9.3f}" if i == 0 else f"{a[i]:>9.2f}" if i < 3 else f"{a[i]:>9.0f}"
-            for i in range(5)))
-    print()
-    print("G-PCC を 100 としたとき（小さいほど良い）")
-    print(f"{'':<13}{'':<9}{'bpp':>9}{'enc':>9}{'dec':>9}{'enc MB':>9}{'dec MB':>9}")
-    for k in keys[1:]:
-        a = np.median(np.array(agg[k]), axis=0)
-        print(f"{'':<13}{k:<9}" + "".join(f"{100 * a[i] / base[i]:>9.0f}" for i in range(5)))
-    tmp.rmdir()
+    print("\n== メモリー（第三指標）==")
+    print(f"{'データ':<13}{'点':>8}{'PCC2 ピーク MB':>15}{'1 点あたり byte':>16}")
+    for r in rows:
+        print(f"{r['lab']:<13}{r['n']:>8}{r['peak']:>15.0f}{r['peak']*1e6/r['n']:>16.0f}")
+    p = np.array([r["peak"] * 1e6 / r["n"] for r in rows])
+    print(f"\n  1 点あたり 中央値 {np.median(p):.0f} byte"
+          f"  幅 {p.min():.0f}〜{p.max():.0f}")
 
 
 if __name__ == "__main__":
