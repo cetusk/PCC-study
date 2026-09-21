@@ -605,16 +605,39 @@ static bool scan_names(const std::vector<uint8_t>& p, std::string& g,
     return rd(g) && rd(s) && rd(r);
 }
 
-static bool build_scan_ctx(const CodecCtx* ctx, const std::vector<uint8_t>& param,
-                           size_t n, ScanCtx& sc, std::string& err) {
+struct ScanCache {
+    std::mutex mu;
+    std::map<std::string, std::shared_ptr<const ScanCtx>> by_key;
+};
+
+// 走査モデルの文脈を作る。**同じ列名・同じ点数なら中身は同じ**なので、
+// 変種ごとに作り直さずに共有する。走査順の安定ソートが 1 回で済み、
+// 同じ配列を候補の本数だけ抱えることもなくなる。
+static std::shared_ptr<const ScanCtx> build_scan_ctx(
+        const CodecCtx* ctx, const std::vector<uint8_t>& param,
+        size_t n, std::string& err) {
     std::string ng, np, nr;
-    if (!scan_names(param, ng, np, nr)) { err = "走査モデルの列名が壊れている"; return false; }
-    if (!ctx || !ctx->fr) { err = "副次情報がない"; return false; }
+    if (!scan_names(param, ng, np, nr)) { err = "走査モデルの列名が壊れている"; return nullptr; }
+    if (!ctx || !ctx->fr) { err = "副次情報がない"; return nullptr; }
+    const std::string key = ng + "\x1f" + np + "\x1f" + nr + "\x1f" + std::to_string(n);
+    std::shared_ptr<ScanCache> cache;
+    {
+        std::lock_guard<std::mutex> lk(ctx->mu);
+        if (!ctx->scan_cache) ctx->scan_cache = std::make_shared<ScanCache>();
+        cache = std::static_pointer_cast<ScanCache>(ctx->scan_cache);
+    }
+    {
+        std::lock_guard<std::mutex> lk(cache->mu);
+        auto it = cache->by_key.find(key);
+        if (it != cache->by_key.end()) return it->second;
+    }
+    auto made = std::make_shared<ScanCtx>();
+    ScanCtx& sc = *made;
     const auto* g = ctx->fr->get(ng);
     const auto* s = ctx->fr->get(np);
     const auto* r = nr.empty() ? nullptr : ctx->fr->get(nr);
     if (!g || !s || g->size() < n || s->size() < n) {
-        err = "gps_time / point_source_id が先に復号されていない"; return false;
+        err = "gps_time / point_source_id が先に復号されていない"; return nullptr;
     }
     sc.ord.resize(n);
     for (size_t i = 0; i < n; ++i) sc.ord[i] = (int32_t)i;
@@ -656,7 +679,13 @@ static bool build_scan_ctx(const CodecCtx* ctx, const std::vector<uint8_t>& para
         if (brk) sc.swp.push_back((int32_t)t);
     }
     sc.swp.push_back((int32_t)n);
-    return true;
+    {
+        std::lock_guard<std::mutex> lk(cache->mu);
+        auto it = cache->by_key.find(key);
+        if (it != cache->by_key.end()) return it->second;   // 競って作った。先着を使う
+        cache->by_key[key] = made;
+    }
+    return made;
 }
 
 // 走査線 1 本を符号化したときの面内・面外の費用［bit］。
@@ -721,8 +750,9 @@ static bool enc_geom_scan(const std::vector<const std::vector<int64_t>*>& cols,
     auto mark = [&](const char* what) {
         if (prof) { fprintf(stderr, "    [走査] %-22s %6.2fs\n", what, now_sec() - tp); tp = now_sec(); }
     };
-    ScanCtx sc;
-    if (!build_scan_ctx(ctx, param, n, sc, err)) return false;
+    auto scp = build_scan_ctx(ctx, param, n, err);
+    if (!scp) return false;
+    const ScanCtx& sc = *scp;
     mark("並べ替えと掃引の切り出し");
     const auto &CX = *cols[0], &CY = *cols[1], &CZ = *cols[2];
     const int var = param.empty() ? 1 : param[0];
@@ -1033,10 +1063,10 @@ static bool enc_geom_scan(const std::vector<const std::vector<int64_t>*>& cols,
     }
     std::vector<uint8_t> br;
     mark("残差を作る");
-    // 走査文脈はここから先で参照しない。400 万点では ord と gps と ret だけで
-    // 80 MB あり、残差（3 列 × 8 バイト）と同時に抱えるとピークが立つ。
-    sc.ord.clear(); sc.ord.shrink_to_fit();
-    sc.ret.clear(); sc.ret.shrink_to_fit();
+    // 走査文脈はここから先で参照しないが、**いまは候補どうしで共有しているので
+    // 解放しない。**1 本ぶん（200 万点で ord 8 MB + ret 2 MB）を抱え続ける代わりに、
+    // 候補の本数だけ作り直して同時に持つことがなくなる。
+    // 走査線の標識は候補ごとの持ち物なので、これは手放す。
     L.label.clear(); L.label.shrink_to_fit();
     if (wide) { if (use_xctx) enc_resid_x(res64, br); else enc_resid(res64, br); }
     else       { if (use_xctx) enc_resid_x(res32, br); else enc_resid(res32, br); }
@@ -1098,8 +1128,9 @@ static bool enc_geom_scan(const std::vector<const std::vector<int64_t>*>& cols,
 static bool dec_geom_scan(const std::vector<uint8_t>& param, const uint8_t* data, size_t len,
                           size_t n, std::vector<std::vector<int64_t>>& out,
                           std::string& err, const CodecCtx* ctx) {
-    ScanCtx sc;
-    if (!build_scan_ctx(ctx, param, n, sc, err)) return false;
+    auto scp = build_scan_ctx(ctx, param, n, err);
+    if (!scp) return false;
+    const ScanCtx& sc = *scp;
     const int var = param.empty() ? 1 : param[0];
     const bool use_med = (var == 2 || var == 4);
     const bool use_xctx = (var == 3 || var == 4);

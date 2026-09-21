@@ -9,6 +9,7 @@
 #include <cstdint>
 #include <map>
 #include <mutex>
+#include <memory>
 #include <utility>
 #include <string>
 #include <vector>
@@ -57,6 +58,11 @@ struct CodecCtx {
     mutable std::map<size_t, std::vector<int32_t>> perm_by_n;
     mutable std::map<std::pair<size_t, int>, std::vector<int32_t>> pred_by_np;
     mutable std::mutex mu;        // 候補を並列に符号化するときのため
+    // 走査モデルの文脈（走査順・戻り番号・掃引の切れ目）は、**変種によらず同じ**で
+    // ある。候補ごとに作り直すと、200 万点の安定ソートを走査候補の本数だけ繰り返し、
+    // 同じ配列を同時に何本も抱えることになる。列名と点数で引けるようにして共有する。
+    // 中身は pcc2.cpp にしかないので、ここでは持ち主だけを置く。
+    mutable std::shared_ptr<void> scan_cache;
     // 符号化は P=1/3/5 を全部試すので全部要る。**復号は選ばれた P しか通らない。**
     // 復号器は流れの一覧を先に読めるので、そこに出てくる P だけをここに入れる。
     // 近傍探索の k は max(P)+4 なので、P=3 だけの回では 9 が 7 に下がる。
