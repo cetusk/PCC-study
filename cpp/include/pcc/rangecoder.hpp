@@ -26,10 +26,13 @@ struct BitModel {
     // 0 や PROB_ONE に張り付くと正規化ループが進まなくなるが、rate >= 1 なら
     // そこには届かない。bit=1 を繰り返しても p0 >> rate が 0 になる 2^rate - 1 で
     // 止まり、bit=0 を繰り返しても PROB_ONE - (2^rate - 1) で止まる。
-    inline void update(int bit) {
-        if (bit) p0 = (uint16_t)(p0 - (p0 >> rate));
-        else     p0 = (uint16_t)(p0 + ((PROB_ONE - p0) >> rate));
+    // 分岐を使わない。下位ビットはほぼ一様なので分岐予測が当たらず、
+    // 1 ビットあたり十数サイクルを取られる。mask は bit が 1 なら全ビット 1。
+    inline void update_m(uint32_t mask) {
+        uint32_t up = (PROB_ONE - p0) >> rate, dn = p0 >> rate;
+        p0 = (uint16_t)(p0 + (up & ~mask) - (dn & mask));
     }
+    inline void update(int bit) { update_m((uint32_t)-(uint32_t)(bit != 0)); }
 };
 
 // 候補を符号化している途中で、既に見つかっている最短を超えたら打ち切る。
@@ -44,9 +47,10 @@ public:
     Encoder() { out_.reserve(1 << 16); }
     inline void encode(BitModel& m, int bit) {
         uint32_t bound = (range_ >> PROB_BITS) * m.p0;
-        if (!bit) range_ = bound;
-        else { low_ += bound; range_ -= bound; }
-        m.update(bit);
+        uint32_t mask = (uint32_t)-(uint32_t)(bit != 0);
+        low_ += bound & mask;
+        range_ = (bound & ~mask) | ((range_ - bound) & mask);
+        m.update_m(mask);
         while (range_ < TOP) { range_ <<= 8; shiftLow(); }
     }
     std::vector<uint8_t> finish() {
@@ -82,12 +86,12 @@ public:
     }
     inline int decode(BitModel& m) {
         uint32_t bound = (range_ >> PROB_BITS) * m.p0;
-        int bit;
-        if (code_ < bound) { range_ = bound; bit = 0; }
-        else { code_ -= bound; range_ -= bound; bit = 1; }
-        m.update(bit);
+        uint32_t mask = (uint32_t)-(uint32_t)(code_ >= bound);
+        code_ -= bound & mask;
+        range_ = (bound & ~mask) | ((range_ - bound) & mask);
+        m.update_m(mask);
         while (range_ < TOP) { range_ <<= 8; code_ = (code_ << 8) | byte(); }
-        return bit;
+        return (int)(mask & 1u);
     }
 private:
     inline uint8_t byte() { return pos_ < n_ ? buf_[pos_++] : 0; }
