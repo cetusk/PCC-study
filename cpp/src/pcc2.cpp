@@ -3,6 +3,7 @@
 #include "pcc/attr.hpp"
 #include "pcc/scanmodel.hpp"
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <map>
 #include <cstdio>
@@ -10,6 +11,13 @@
 #include <cstdlib>
 
 namespace pcc {
+
+// 列ごとの所要時間を測るための時計。
+static double now_sec() {
+    return std::chrono::duration<double>(
+        std::chrono::steady_clock::now().time_since_epoch()).count();
+}
+
 
 // ---------------------------------------------------------------- crc64 (ECMA-182, 反転)
 static uint64_t crc_tab[256];
@@ -243,11 +251,19 @@ static void dec_cols(const uint8_t* data, size_t len, size_t n, size_t nc, int m
 
 
 // ---------------------------------------------------------------- 副次情報
+const std::vector<double>* CodecCtx::world_ptr() const {
+    if (world) return world;
+    if (!want_world || !fr) return nullptr;
+    if (world_own.empty()) frame_world(*fr, world_own);
+    return world_own.empty() ? nullptr : &world_own;
+}
+
 bool CodecCtx::ensure(size_t n, int P) const {
-    if (!world || world->size() < n * 3) return false;
+    const std::vector<double>* w = world_ptr();
+    if (!w || w->size() < n * 3) return false;
     if (built_P == P) return true;
-    if (perm.empty()) perm = coding_order(*world, n, "morton");
-    build_causal_predictors(*world, n, perm, P, P + 4, pred);
+    if (perm.empty()) perm = coding_order(*w, n, "morton");
+    build_causal_predictors(*w, n, perm, P, P + 4, pred);
     built_P = P;
     return true;
 }
@@ -471,8 +487,14 @@ static bool enc_geom_scan(const std::vector<const std::vector<int64_t>*>& cols,
                           std::string& err, const CodecCtx* ctx) {
     if (cols.size() != 3) { err = "走査モデルは 3 軸"; return false; }
     size_t n = cols[0]->size();
+    const bool prof = getenv("PCC_SCAN_PROF") != nullptr;
+    double tp = now_sec();
+    auto mark = [&](const char* what) {
+        if (prof) { fprintf(stderr, "    [走査] %-22s %6.2fs\n", what, now_sec() - tp); tp = now_sec(); }
+    };
     ScanCtx sc;
     if (!build_scan_ctx(ctx, param, n, sc, err)) return false;
+    mark("並べ替えと掃引の切り出し");
     const auto &CX = *cols[0], &CY = *cols[1], &CZ = *cols[2];
     const int var = param.empty() ? 1 : param[0];
     const bool use_med = (var == 2 || var == 4);     // z を中央値予測にする
@@ -486,6 +508,7 @@ static bool enc_geom_scan(const std::vector<const std::vector<int64_t>*>& cols,
 
     std::vector<int64_t> bx, by, bz, bg, bs;
     const auto* sa_col = ctx->fr->get("scan_angle");
+    if (prof) fprintf(stderr, "    [走査] 掃引 %zu 本\n", nsw);
     // PCC_SCAN_DUMP=<path> を付けたときだけ、走査線ごとの当てはめの様子を書き出す。
     // 符号化の結果には影響しない。
     FILE* dump = nullptr; FILE* dump_raw = nullptr;
@@ -590,6 +613,7 @@ static bool enc_geom_scan(const std::vector<const std::vector<int64_t>*>& cols,
         }
     }
 
+    mark("走査線の分割と当てはめ");
     if (dump) { fclose(dump); dump = nullptr; }
     if (dump_raw) { fclose(dump_raw); dump_raw = nullptr; }
 
@@ -671,7 +695,9 @@ static bool enc_geom_scan(const std::vector<const std::vector<int64_t>*>& cols,
         bl = e.finish();
     }
     std::vector<uint8_t> br;
+    mark("残差を作る");
     if (use_xctx) enc_resid_x(res, br); else enc_resid(res, br);
+    mark("残差を符号化");
 
     // PCC_SCAN_DEBUG=1 で内訳を出す。走査モデルが効く規模と効かない規模を
     // 切り分けるための診断で、符号化の結果には影響しない。
@@ -1072,7 +1098,7 @@ std::vector<Stream> plan_streams(const Frame& f, bool joint_geom, std::string* l
                            {C_RANGE_CTX, {}}, {C_RANGE_CTX2, {}}, {C_RANGE_MED, {}}};
     // 幾何が揃っていれば、空間予測の候補（予測子 1 / 3 / 5 個）も加える
     std::vector<Cand> cand_attr = cand;
-    if (ctx && ctx->world)
+    if (ctx && (ctx->world || ctx->want_world))
         for (uint8_t P : {1, 3, 5}) cand_attr.push_back({C_ATTR_SPATIAL, {P}});
     // 順序の実験では幾何だけが関心で、属性の候補掃引が時間の大半を占める。
     // 絞っても往復検証は全列に掛かるので、検証の強さは落ちない。
@@ -1085,13 +1111,18 @@ std::vector<Stream> plan_streams(const Frame& f, bool joint_geom, std::string* l
 
     std::string tr;
     std::string* trp = trace_all ? &tr : nullptr;
+    // 列ごとの所要を測れないと、どこを速くすればよいかが決まらない。
+    double t_col = now_sec();
     auto emit = [&](Stream&& s) {
+        double dt = now_sec() - t_col;
+        t_col = now_sec();
         if (log) {
             std::string nm;
             for (size_t i = 0; i < s.cols.size(); ++i) nm += (i ? "+" : "") + s.cols[i];
             char m[256];
-            snprintf(m, sizeof m, "  %-22s %-8s %8.3f bpp\n", nm.c_str(),
-                     cand_name(s.codec, s.param).c_str(), f.n ? s.data.size() * 8.0 / f.n : 0.0);
+            snprintf(m, sizeof m, "  %-22s %-8s %8.3f bpp %7.2fs\n", nm.c_str(),
+                     cand_name(s.codec, s.param).c_str(),
+                     f.n ? s.data.size() * 8.0 / f.n : 0.0, dt);
             *log += m;
             if (trace_all) { *log += tr; tr.clear(); }
         }

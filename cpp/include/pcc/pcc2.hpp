@@ -30,11 +30,17 @@ inline constexpr uint16_t C_ATTR_XREF   = 22;  // 既に復号済みの別の列
 // 属性の符号化時には座標が揃っている（命題: 副情報の不要性）。
 struct Frame;
 struct CodecCtx {
-    const std::vector<double>* world = nullptr;   // n*3。無ければ空間予測は候補から外れる
+    // 座標の実数表現 n*3。空間予測にしか使わないのに常に作ると、100 万点で
+    // 24 MB が無駄になる（幾何だけを符号化するときは一度も参照されない）。
+    // want_world を立てておけば、最初に必要になった時点で fr から作る。
+    const std::vector<double>* world = nullptr;
+    bool want_world = false;                      // 遅延構築を許すか
+    mutable std::vector<double> world_own;        // 遅延構築したときの実体
     const Frame* fr = nullptr;                    // 既に復号済みの列を引くため
     mutable std::vector<int32_t> perm, pred;
     mutable int built_P = -1;
     bool ensure(size_t n, int P) const;           // 順序表と予測子表を作る（P ごとに 1 回）
+    const std::vector<double>* world_ptr() const; // 無ければ作る
     // 報告する構成を往復検証に通すための指定。空なら通常どおり全候補を実測して選ぶ。
     std::string force_geom;                       // X+Y+Z をこの候補名に固定する
     bool fast_attr = false;                       // 属性列の候補を絞って時間を詰める

@@ -40,6 +40,23 @@ static double peak_gb() {
     rusage r{}; getrusage(RUSAGE_SELF, &r);
     return r.ru_maxrss / 1024.0 / 1024.0;
 }
+
+// いま実際に使っている常駐量。ピークだけ見てもどこで積み上がったか判らない。
+static double rss_mb() {
+    FILE* f = fopen("/proc/self/statm", "r");
+    if (!f) return 0;
+    long total = 0, res = 0;
+    if (fscanf(f, "%ld %ld", &total, &res) != 2) res = 0;
+    fclose(f);
+    return res * (double)sysconf(_SC_PAGESIZE) / 1048576.0;
+}
+
+static bool g_mem_trace = false;
+static void mem_mark(const char* what) {
+    if (g_mem_trace)
+        fprintf(stderr, "  [メモリ] %-28s 常駐 %7.1f MB  ピーク %7.1f MB\n",
+                what, rss_mb(), peak_gb() * 1024.0);
+}
 static uint64_t fsize(const std::string& p) {
     struct stat st{}; return stat(p.c_str(), &st) == 0 ? (uint64_t)st.st_size : 0;
 }
@@ -78,7 +95,8 @@ int main(int argc, char** argv) {
         std::string outp = argv[3];
         size_t mp = 0, samp = 0;
         bool joint = true, do_norm = true, do_spatial = true, trace_all = false;
-        std::string force_geom; bool fast_attr = false, no_fallback = false;
+        std::string force_geom;
+        bool fast_attr = false, no_fallback = false, no_verify = false;
         for (int i = 4; i < argc; ++i) {
             if (!strcmp(argv[i], "--max-points") && i + 1 < argc) mp = atol(argv[++i]);
             else if (!strcmp(argv[i], "--split-geom")) joint = false;
@@ -89,9 +107,15 @@ int main(int argc, char** argv) {
             else if (!strcmp(argv[i], "--force-geom") && i + 1 < argc) force_geom = argv[++i];
             else if (!strcmp(argv[i], "--fast-attr")) fast_attr = true;
             else if (!strcmp(argv[i], "--no-fallback")) no_fallback = true;
+            // 符号化だけを測るための指定。復号検証・元ファイルの読み直し・
+            // 決定性の二度書きを飛ばす。時間とメモリを他の符号器と同じ土俵で
+            // 比べるときに使う（それらは符号化の費用ではない）。
+            else if (!strcmp(argv[i], "--no-verify")) no_verify = true;
+            else if (!strcmp(argv[i], "--mem-trace")) g_mem_trace = true;
         }
         std::string err;
         double t0 = now();
+        mem_mark("開始");
         Frame f;
         bool is_las = false;
         {
@@ -107,12 +131,19 @@ int main(int argc, char** argv) {
         PointCloud pc;
         if (is_las) {
             if (!read_las(path, pc, err, mp)) { fprintf(stderr, "読み込み失敗: %s\n", err.c_str()); return 1; }
+            mem_mark("LAS 読み込み後");
             std::string bp = outp + ".base.laz";
             std::vector<std::string> all;
             for (const auto& nm : pc.order) all.push_back(nm);
             if (write_las(bp, pc, all, err)) { base_bytes = fsize(bp); basep = bp; }
             else remove(bp.c_str());
-            if (!frame_from_las(pc, f, err)) { fprintf(stderr, "%s\n", err.c_str()); return 1; }
+            mem_mark("基準 LAZ を書いた後");
+            // 正規化するなら、計画を先に立てて残す列だけを移す。
+            // 全列をコピーしてから落とすと、pc と f の二重持ちがピークになる。
+            bool built = do_norm ? frame_from_las_normalized(pc, f, false, err)
+                                 : frame_from_las(pc, f, err);
+            if (!built) { fprintf(stderr, "%s\n", err.c_str()); return 1; }
+            mem_mark("Frame を作った後");
         } else {
             if (!load_frame(path, f, err, mp)) { fprintf(stderr, "読み込み失敗: %s\n", err.c_str()); return 1; }
             base_bytes = f.source_bytes;
@@ -120,17 +151,22 @@ int main(int argc, char** argv) {
         double t_read = now() - t0;
 
         double t1 = now();
-        if (do_norm && is_las && !normalize_frame(f, pc, err)) {
+        // LAS 経路の正規化は frame_from_las_normalized が済ませている。
+        if (do_norm && !is_las && !normalize_frame(f, pc, err)) {
             fprintf(stderr, "正規化に失敗: %s\n", err.c_str()); return 1;
         }
+        mem_mark("正規化後");
         pc = PointCloud();                    // 正規化が済んだら元の列は要らない
+        mem_mark("pc を解放した後");
         // 幾何は属性より先に復号されるので、座標は副情報なしで使える
         CodecCtx ctx;
         std::vector<double> world;
         ctx.fr = &f;
         ctx.force_geom = force_geom;
         ctx.fast_attr = fast_attr;
-        if (do_spatial) { frame_world(f, world); ctx.world = &world; }
+        // 実際に空間予測の候補が試されるまで作らない
+        if (do_spatial) ctx.want_world = true;
+        mem_mark("world は遅延構築にした");
 
         std::string log;
         std::vector<Stream> st;
@@ -158,8 +194,10 @@ int main(int argc, char** argv) {
         } else {
             st = plan_streams(f, joint, &log, &ctx, trace_all);
         }
+        mem_mark("候補選択と符号化の後");
         uint64_t bytes = 0;
         if (!write_pcc2(outp, f, st, bytes, err)) { fprintf(stderr, "書き込み失敗: %s\n", err.c_str()); return 1; }
+        mem_mark("書き出した後");
 
         // 自前の符号器が元の器に負けることがある。両方書いて短い方を残し、
         // どちらを使ったかを容器に書いておく。符号器そのものは独立のままで、
@@ -188,6 +226,20 @@ int main(int argc, char** argv) {
         }
         if (!basep.empty()) remove(basep.c_str());
         double t_enc = now() - t1;
+
+        if (no_verify) {
+            double bl0 = f.n ? base_bytes * 8.0 / f.n : 0.0;
+            double ml0 = f.n ? bytes * 8.0 / f.n : 0.0;
+            printf("入力        %s\n            %zu 点 / 列 %zu\n",
+                   path.c_str(), (size_t)f.n, f.schema.size());
+            printf("ストリーム選択（候補を実際に符号化して最短を採る）\n%s", log.c_str());
+            printf("基準 %-7s %10.1f MB  %8.3f bpp\n",
+                   is_las ? "LASzip" : "元", base_bytes / 1e6, bl0);
+            printf("PCC2        %10.1f MB  %8.3f bpp\n", bytes / 1e6, ml0);
+            printf("5 軸        enc %.2fs / dec ---- / 読込 %.2fs / ピーク %.2f GB / 検証なし\n",
+                   t_enc, t_read, peak_gb());
+            return 0;
+        }
 
         double t2 = now();
         Frame g;

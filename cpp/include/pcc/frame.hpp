@@ -68,6 +68,10 @@ struct Frame {
 
 // LAS の PointCloud との相互変換（封筒に点形式・ExtraBytes 定義を格納する）
 bool frame_from_las(const PointCloud& pc, Frame& f, std::string& err);
+// 計画を先に立てて、残す列を pc から移して Frame を作る。
+// pc と f が同じ列を同時に持たないので、ピークメモリが約半分になる。
+bool frame_from_las_normalized(PointCloud& pc, Frame& f, bool residual_ops,
+                               std::string& err);
 bool frame_to_las(const Frame& f, PointCloud& pc, std::string& err);
 
 // 拡張子で振り分けて読む（.las/.laz/.bin/.ply）

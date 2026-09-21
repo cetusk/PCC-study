@@ -4,8 +4,11 @@
 #include <cstdio>
 #include <cmath>
 #include <algorithm>
+#include <set>
 
 namespace pcc {
+
+static void put_envelope(const PointCloud& pc, Frame& f);
 
 // ---- 封筒（元の器を再生成するのに要る情報）の直列化
 namespace {
@@ -55,6 +58,12 @@ bool frame_from_las(const PointCloud& pc, Frame& f, std::string& err) {
         f.col[nm] = it->second.v;
     }
 
+    put_envelope(pc, f);
+    (void)err;
+    return true;
+}
+
+static void put_envelope(const PointCloud& pc, Frame& f) {
     // 封筒: 点形式・レコード長・バージョン・ExtraBytes 定義
     std::vector<uint8_t>& e = f.envelope; e.clear();
     put<uint8_t>(e, pc.point_format);
@@ -71,6 +80,73 @@ bool frame_from_las(const PointCloud& pc, Frame& f, std::string& err) {
         put_str(e, x.description);
         put<int32_t>(e, x.byte_offset);
     }
+}
+
+// 正規化の計画を先に立ててから Frame を作る。
+//
+// これまでは「全列をコピーして Frame を作る → 計画を立てる → 要らない列を消す」
+// の順だったので、pc と f が同じ内容を同時に持つ瞬間があり、そこがピークだった
+// （100 万点の LAS で 147 MB のうち 95 MB がこの二重持ち）。
+// 計画を先に立てれば、残す列だけを pc から**移して**渡せる。
+bool frame_from_las_normalized(PointCloud& pc, Frame& f, bool residual_ops,
+                               std::string& err) {
+    Plan plan = analyze(pc, residual_ops);
+    // 走査モデルはこの 3 列を幾何より前に必要とする。落とすと復号の最後まで
+    // 復元されず、候補として提示できなくなる。定数列でも符号長は 0.001 bpp 程度。
+    {
+        static const char* need[] = {"point_source_id", "gps_time", "bit_fields"};
+        std::vector<Op> keep_ops;
+        for (const auto& o : plan.ops) {
+            bool skip = false;
+            for (const char* nm : need) if (o.target == nm) skip = true;
+            if (!skip) keep_ops.push_back(o);
+        }
+        plan.ops.swap(keep_ops);
+    }
+    std::vector<std::string> keep;
+    std::map<std::string, std::vector<int64_t>> external;
+    apply_plan(pc, plan, keep, external);
+    std::set<std::string> kept(keep.begin(), keep.end());
+
+    f.n = pc.n;
+    f.source_kind = "las";
+    f.source_bytes = pc.src_bytes;
+    f.geom_repr = "int";
+    for (int i = 0; i < 3; ++i) { f.scale[i] = pc.scale[i]; f.offset[i] = pc.offset[i]; }
+    f.geom[0] = "X"; f.geom[1] = "Y"; f.geom[2] = "Z";
+
+    auto add_geom = [&](const char* nm, std::vector<int32_t>& s) {
+        ColSpec c; c.name = nm; c.ftype = FType::I32; c.role = Role::Geometry;
+        f.schema.push_back(c);
+        std::vector<int64_t> v(pc.n);
+        for (size_t i = 0; i < pc.n; ++i) v[i] = s[i];
+        s.clear(); s.shrink_to_fit();       // 変換が済んだら元は要らない
+        f.col[nm] = std::move(v);
+    };
+    add_geom("X", pc.X); add_geom("Y", pc.Y); add_geom("Z", pc.Z);
+
+    for (const auto& nm : pc.order) {
+        auto it = pc.fields.find(nm);
+        if (it == pc.fields.end()) continue;
+        ColSpec c; c.name = nm; c.ftype = it->second.ftype;
+        c.role = (nm == "gps_time") ? Role::Time : Role::Attribute;
+        c.is_extra = it->second.is_extra;
+        auto e = external.find(nm);
+        if (e != external.end()) {
+            c.storage = Storage::Residual;
+            f.col[nm] = std::move(e->second);
+        } else if (kept.count(nm)) {
+            c.storage = Storage::Raw;
+            f.col[nm] = std::move(it->second.v);   // コピーせずに移す
+        } else {
+            c.storage = Storage::Derived;          // 計画から復元するので持たない
+        }
+        it->second.v.clear();
+        it->second.v.shrink_to_fit();
+        f.schema.push_back(c);
+    }
+    put_envelope(pc, f);
+    f.plan = plan.to_json();
     (void)err;
     return true;
 }

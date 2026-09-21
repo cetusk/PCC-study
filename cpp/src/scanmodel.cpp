@@ -64,6 +64,7 @@ int64_t tan_fx(int64_t theta_fx) {
 // 浮動小数を使ってよい。決定性が要るのは scan_predict の側である。
 
 #include <cmath>
+#include <cstdlib>
 #include <algorithm>
 #include "pcc/rangecoder.hpp"
 
@@ -248,7 +249,19 @@ SweepParam fit_scan_line(const int64_t* X, const int64_t* Y, const int64_t* Z,
     // D = diag(sqrt(A_kk)) で正規化してから解く。D⁻¹AD⁻¹ は対角が 1 になる。
     double lambda = 1e-3;
     double cost = cost_of(s0, Sz, th0, om);
+    // 反復は「一歩も進めないとき」しか止まらないので、improvement が
+    // 無視できる大きさになっても最後まで回っていた。1 反復は最大 9 回の
+    // O(n) 走査（毎回 tan を呼ぶ）なので、ここが当てはめの費用の大半を占める。
+    // 相対改善が閾値を下回ったら打ち切る。閾値は環境変数で動かせる。
+    static const double FIT_TOL = [] {
+        const char* e = getenv("PCC_FIT_TOL");
+        // 既定は実測で選んだ。0（＝改善が尽きるまで）と比べて、時間は半分、
+        // bpp は AHN3/4/5 のいずれでも同じか小さい。二乗残差を詰めきると
+        // 符号長はむしろ伸びることがある（最適化している量と目的が違う）。
+        return e ? atof(e) : 3e-2;
+    }();
     for (int it = 0; it < FIT_ITERS; ++it) {
+        const double cost_before = cost;
         double A[4][4] = {{0, 0, 0, 0}, {0, 0, 0, 0}, {0, 0, 0, 0}, {0, 0, 0, 0}};
         double g[4] = {0, 0, 0, 0};
         for (size_t i = 0; i < n; ++i) {
@@ -302,6 +315,7 @@ SweepParam fit_scan_line(const int64_t* X, const int64_t* Y, const int64_t* Z,
             for (int j = it; j < FIT_ITERS; ++j) diag->iter_bits[j] = bb / n;
         }
         if (!stepped) break;
+        if (cost_before - cost <= FIT_TOL * cost_before) break;
     }
 
     // 整数へ。角度は [-45,45] 度 を [-2^31, 2^31] に写す
