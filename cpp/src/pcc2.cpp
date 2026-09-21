@@ -14,6 +14,10 @@
 #include <array>
 #include <atomic>
 #include <thread>
+#include <memory>
+#include <condition_variable>
+#include <functional>
+#include <deque>
 
 namespace pcc {
 
@@ -1456,6 +1460,82 @@ std::string cand_name(uint16_t c, const std::vector<uint8_t>& p) {
 // **事前選別の標本では打ち切ってはいけない。**打ち切った候補は順位表から
 // 消えるので、族の保護が「その族が 1 本も無い」と見て守れなくなる。
 // 17 件のうち 1 件で、走査変換が標本で打ち切られて選ばれなくなった。
+// 符号化の機械の埋まり具合は 16 コアのうち 3.5 だった。候補は 16 並列に走るのに
+// **列が逐次**で、列の中では遅い候補が 1 本だけ残って他のコアが空くからである。
+// 列の仕事と候補の仕事を同じ待ち行列に入れれば、別の列の候補が空きを埋める。
+//
+// 待つ側も待ち行列から仕事を取る。こうしないと、列の仕事がその列の候補を
+// 待って寝たときに、プールの糸が全部寝て詰まる。
+class Pool {
+public:
+    explicit Pool(size_t n) {
+        for (size_t i = 0; i < n; ++i) th_.emplace_back([this] { loop(); });
+    }
+    ~Pool() {
+        { std::lock_guard<std::mutex> lk(m_); stop_ = true; }
+        cv_.notify_all();
+        for (auto& t : th_) t.join();
+    }
+    void add(std::function<void()> f, std::atomic<size_t>& left) {
+        left.fetch_add(1, std::memory_order_relaxed);
+        { std::lock_guard<std::mutex> lk(m_); q_.emplace_back(std::move(f), &left); }
+        cv_.notify_one();
+    }
+    // 待つ側は空回りしない。仕事が無ければ寝て、誰かが 1 つ終えたら起こされる。
+    // 空回りさせると、自分の列の候補を待つ糸が 10 本以上あるときに、その空回りが
+    // 他の列の候補からコアを奪う（実測で CPU 時間だけが増えた）。
+    void help_until(std::atomic<size_t>& left) {
+        for (;;) {
+            std::function<void()> f;
+            std::atomic<size_t>* l = nullptr;
+            {
+                std::unique_lock<std::mutex> lk(m_);
+                cv_.wait(lk, [&] { return left.load(std::memory_order_acquire) == 0
+                                          || !q_.empty(); });
+                if (left.load(std::memory_order_acquire) == 0) return;
+                f = std::move(q_.front().first); l = q_.front().second; q_.pop_front();
+            }
+            f();
+            l->fetch_sub(1, std::memory_order_release);
+            cv_.notify_all();
+        }
+    }
+private:
+    void loop() {
+        for (;;) {
+            std::function<void()> f;
+            std::atomic<size_t>* l = nullptr;
+            {
+                std::unique_lock<std::mutex> lk(m_);
+                cv_.wait(lk, [this] { return stop_ || !q_.empty(); });
+                if (stop_ && q_.empty()) return;
+                f = std::move(q_.front().first); l = q_.front().second; q_.pop_front();
+            }
+            f();
+            l->fetch_sub(1, std::memory_order_release);
+            cv_.notify_all();
+        }
+    }
+    std::vector<std::thread> th_;
+    std::deque<std::pair<std::function<void()>, std::atomic<size_t>*>> q_;
+    std::mutex m_;
+    std::condition_variable cv_;
+    bool stop_ = false;
+};
+
+static size_t pool_threads() {
+    static const size_t NT = [] {
+        if (const char* e = getenv("PCC_THREADS")) { long v = atol(e); if (v > 0) return (size_t)v; }
+        unsigned hw = std::thread::hardware_concurrency();
+        return (size_t)(hw ? hw : 1);
+    }();
+    return NT;
+}
+
+// 計画を立てている間だけ生きるプール。plan_streams が建てて、その中から呼ばれる
+// encode_many が使う。単独で符号化するときは無いので、そのときは今までどおり。
+static Pool* g_pool = nullptr;
+
 static void encode_many(const std::vector<Cand>& cs,
                         const std::vector<const std::vector<int64_t>*>& cv,
                         const CodecCtx* ctx, std::vector<std::vector<uint8_t>>& blobs,
@@ -1469,6 +1549,29 @@ static void encode_many(const std::vector<Cand>& cs,
         return (size_t)(hw ? hw : 1);
     }();
     size_t nt = NT < m ? NT : m;
+    if (g_pool && nt > 1) {
+        std::atomic<size_t> best{(size_t)-1};
+        std::atomic<size_t> left{0};
+        for (size_t i = 0; i < m; ++i)
+            g_pool->add([&, i] {
+                const std::atomic<size_t>* save = enc_best;
+                enc_best = abort_long ? &best : nullptr;
+                try {
+                    ok[i] = codec_encode(cs[i].codec, cv, cs[i].param, blobs[i], errs[i], ctx) ? 1 : 0;
+                } catch (const EncAbort&) {
+                    ok[i] = 0; errs[i] = "最短を超えたので打ち切り"; blobs[i].clear();
+                }
+                enc_best = save;
+                if (ok[i]) {
+                    size_t b = best.load(std::memory_order_relaxed);
+                    while (blobs[i].size() < b &&
+                           !best.compare_exchange_weak(b, blobs[i].size(),
+                                                       std::memory_order_relaxed)) {}
+                }
+            }, left);
+        g_pool->help_until(left);
+        return;
+    }
     if (nt <= 1) {
         std::atomic<size_t> best{(size_t)-1};
         enc_best = abort_long ? &best : nullptr;
@@ -1757,24 +1860,30 @@ std::vector<Stream> plan_streams(const Frame& f, bool joint_geom, std::string* l
         cand_attr = cand;
     }
 
-    std::string tr;
-    std::string* trp = trace_all ? &tr : nullptr;
-    // 列ごとの所要を測れないと、どこを速くすればよいかが決まらない。
-    double t_col = now_sec();
-    auto emit = [&](Stream&& s) {
-        double dt = now_sec() - t_col;
-        t_col = now_sec();
-        if (log) {
-            std::string nm;
-            for (size_t i = 0; i < s.cols.size(); ++i) nm += (i ? "+" : "") + s.cols[i];
-            char m[256];
-            snprintf(m, sizeof m, "  %-22s %-8s %8.3f bpp %7.2fs\n", nm.c_str(),
-                     cand_name(s.codec, s.param).c_str(),
-                     f.n ? s.data.size() * 8.0 / f.n : 0.0, dt);
-            *log += m;
-            if (trace_all) { *log += tr; tr.clear(); }
-        }
-        out.push_back(std::move(s));
+    // 列を 1 本ずつ符号化すると、列の中の候補が終わりかけたところで機械が空く。
+    // 仕事をいったん貯めてから、列も候補もまとめて 1 つの待ち行列に流す。
+    // **どの列にどの候補を出すかは列の名前と並び順だけで決まる**ので、貯める側は
+    // 結果を 1 つも要らない。唯一の例外は色の同時符号化と鎖の比較で、これは
+    // 両方を仕事にしておいて、走らせたあとに短いほうを採る。
+    struct Job {
+        std::vector<std::string> cols;
+        std::vector<Cand> cands;
+        bool presel = false;
+        Stream out;
+        std::string tr;
+        double sec = 0;
+    };
+    const double t_plan0 = now_sec();
+    const size_t NT = pool_threads();
+    std::unique_ptr<Pool> pool;
+    if (NT > 1) { pool.reset(new Pool(NT)); g_pool = pool.get(); }
+    struct PoolGuard { ~PoolGuard() { g_pool = nullptr; } } pool_guard;
+    std::vector<Job> jobs;
+    std::vector<size_t> order;                 // 出す順。SIZE_MAX は色の判定の位置
+    auto defer = [&](std::vector<std::string> cs, std::vector<Cand> cd,
+                     bool presel = false) {
+        jobs.push_back(Job{std::move(cs), std::move(cd), presel, {}, {}, 0});
+        return jobs.size() - 1;
     };
 
     // 幾何より前に置く列。復号器はこれらを使って走査順・掃引・戻り番号を
@@ -1799,7 +1908,7 @@ std::vector<Stream> plan_streams(const Frame& f, bool joint_geom, std::string* l
                 cs.push_back({C_ATTR_XREF, pv});
             }
         }
-        emit(best_stream(f, {nm}, cs, ctx, trp));
+        order.push_back(defer({nm}, cs));
         pre_done.push_back(nm);
     }
     std::string aux = pre.empty() ? std::string() : pre.back();
@@ -1864,14 +1973,15 @@ std::vector<Stream> plan_streams(const Frame& f, bool joint_geom, std::string* l
                 gc.swap(only);
             }
         }
-        emit(best_stream(f, g, gc, ctx, trp, true));   // 幾何だけ事前選別する
+        order.push_back(defer(g, gc, true));           // 幾何だけ事前選別する
     }
 
     // 色 3 列が揃っていれば、可逆色変換つきの同時符号化を候補に加える。
     // 色の脱相関と空間予測は独立に効き、重ねると掛け算になる（実測 6.430 対 11.179）。
     bool color_done = false;
     std::vector<std::string> rgb{"red", "green", "blue"};
-    std::vector<Stream> color_streams;
+    size_t s_joint = (size_t)-1;
+    std::vector<size_t> s_chain;
     if (ctx && ctx->world) {
         bool all = true;
         for (const auto& c : rgb) {
@@ -1882,11 +1992,9 @@ std::vector<Stream> plan_streams(const Frame& f, bool joint_geom, std::string* l
             // 候補 1: 3 列まとめて可逆色変換 + 空間予測
             std::vector<Cand> cc;
             for (uint8_t P : {1, 3, 5}) cc.push_back({C_ATTR_COLOR, {P}});
-            Stream joint = best_stream(f, rgb, cc, ctx, trp);
+            s_joint = defer(rgb, cc);
 
             // 候補 2: blue → green → red の順に、直前の色を参照する鎖
-            std::vector<Stream> chain;
-            size_t sep = 0;
             const char* ord[3] = {"blue", "green", "red"};
             for (int i = 0; i < 3; ++i) {
                 std::vector<Cand> cs = cand_attr;
@@ -1900,35 +2008,70 @@ std::vector<Stream> plan_streams(const Frame& f, bool joint_geom, std::string* l
                         cs.push_back({C_ATTR_XREF, pv});
                     }
                 }
-                chain.push_back(best_stream(f, {ord[i]}, cs, ctx, trp));
-                sep += chain.back().data.size();
+                s_chain.push_back(defer({ord[i]}, cs));
             }
-            if (joint.data.size() <= sep) color_streams.push_back(std::move(joint));
-            else for (auto& s2 : chain) color_streams.push_back(std::move(s2));
             color_done = true;
-            for (auto& s2 : color_streams) emit(std::move(s2));
+            order.push_back((size_t)-1);       // ここで短いほうを採って出す
+        }
+    }
+
+    // 参照の候補を測る段が符号化の 6 割を占めていた。列ごとに小分けに流すと、
+    // 先頭の列は測る相手が 1〜2 本しか無く、その間はコアが空く。
+    // **測る組を先に全部数えあげて 1 回で流す。**どの組を測るかは列の名前と
+    // 並び順だけで決まるので、結果は 1 つも要らない。
+    const Frame& fs_ref = (ctx && ctx->full) ? *ctx->full : f;
+    auto skip_col = [&](const ColSpec& c) {
+        if (joint_geom && c.role == Role::Geometry) return true;
+        if (c.storage == Storage::Derived) return true;
+        if (color_done && (c.name == "red" || c.name == "green" || c.name == "blue")) return true;
+        for (const auto& e : pre_done) if (e == c.name) return true;
+        return false;
+    };
+    std::map<std::pair<std::string, std::string>, double> escore;
+    {
+        std::vector<std::string> em = pre_done;
+        for (const auto& c : f.schema) {
+            if (skip_col(c)) continue;
+            const auto* v = f.get(c.name);
+            const auto* vr = fs_ref.get(c.name);
+            if (v && vr)
+                for (const auto& e : em)
+                    if (fs_ref.get(e)) escore[{c.name, e}] = 0.0;
+            em.push_back(c.name);
+        }
+        std::vector<std::pair<const std::vector<int64_t>*,
+                              std::pair<const std::vector<int64_t>*, double*>>> tk;
+        for (auto& kv : escore)
+            tk.push_back({fs_ref.get(kv.first.first),
+                          {fs_ref.get(kv.first.second), &kv.second}});
+        if (pool && tk.size() > 1) {
+            std::atomic<size_t> left{0};
+            for (size_t i = 0; i < tk.size(); ++i)
+                pool->add([&tk, i] {
+                    *tk[i].second.second =
+                        entropy_diff_sample(*tk[i].first, *tk[i].second.first, 250000);
+                }, left);
+            pool->help_until(left);
+        } else {
+            for (size_t i = 0; i < tk.size(); ++i)
+                *tk[i].second.second =
+                    entropy_diff_sample(*tk[i].first, *tk[i].second.first, 250000);
         }
     }
 
     std::vector<std::string> emitted = pre_done;              // 既に出した列（参照に使える）
     for (const auto& c : f.schema) {
-        if (joint_geom && c.role == Role::Geometry) continue;
-        if (c.storage == Storage::Derived) continue;          // 計画から復元するので送らない
-        if (color_done && (c.name == "red" || c.name == "green" || c.name == "blue")) continue;
-        bool done = false;
-        for (const auto& e : pre_done) if (e == c.name) done = true;
-        if (done) continue;                                   // 幾何より前に出した
+        if (skip_col(c)) continue;
         std::vector<Cand> cs = cand_attr;
         // 既出の列との残差も候補に入れる。標本で相手を 2 つに絞ってから全点で測る。
         // 参照の選定は全点の統計で行う（標本で選ぶと候補の集合が変わる）
-        const Frame& fs_ref = (ctx && ctx->full) ? *ctx->full : f;
         const auto* v = f.get(c.name);
         const auto* vr = fs_ref.get(c.name);
         if (v && !emitted.empty()) {
             std::vector<std::pair<double, std::string>> sc;
             for (const auto& e : emitted) {
-                const auto* w = fs_ref.get(e);
-                if (w && vr) sc.push_back({entropy_diff_sample(*vr, *w, 250000), e});
+                auto it = escore.find({c.name, e});
+                if (it != escore.end()) sc.push_back({it->second, e});
             }
             std::sort(sc.begin(), sc.end());
             for (size_t i = 0; i < sc.size() && i < 2; ++i) {
@@ -1941,8 +2084,58 @@ std::vector<Stream> plan_streams(const Frame& f, bool joint_geom, std::string* l
                 }
             }
         }
-        emit(best_stream(f, {c.name}, cs, ctx, trp));
+        order.push_back(defer({c.name}, cs));
         emitted.push_back(c.name);
+    }
+
+    // 貯めた仕事をまとめて流す。列の仕事から出た候補の仕事も同じ待ち行列に入るので、
+    // 遅い候補が 1 本残った列の横で、別の列の候補が空いたコアを埋める。
+    {
+        const bool eprof = getenv("PCC_EPROF") != nullptr;
+        if (eprof) fprintf(stderr, "  [仕事を貯める] %.3fs  仕事 %zu\n",
+                           now_sec() - t_plan0, jobs.size());
+        double t_run = now_sec();
+        if (!pool || jobs.size() <= 1) {
+            for (auto& j : jobs) {
+                double t0 = now_sec();
+                j.out = best_stream(f, j.cols, j.cands, ctx, trace_all ? &j.tr : nullptr,
+                                    j.presel);
+                j.sec = now_sec() - t0;
+            }
+        } else {
+            std::atomic<size_t> left{0};
+            for (auto& j : jobs)
+                pool->add([&f, &j, ctx, trace_all] {
+                    double t0 = now_sec();
+                    j.out = best_stream(f, j.cols, j.cands, ctx,
+                                        trace_all ? &j.tr : nullptr, j.presel);
+                    j.sec = now_sec() - t0;
+                }, left);
+            pool->help_until(left);
+        }
+        if (eprof) fprintf(stderr, "  [仕事を流す] %.3fs\n", now_sec() - t_run);
+    }
+
+    // 列ごとの秒は、列を並列に走らせたので重なっている。和は全体より大きくなる。
+    auto emit = [&](Job& j) {
+        if (log) {
+            std::string nm;
+            for (size_t i = 0; i < j.out.cols.size(); ++i) nm += (i ? "+" : "") + j.out.cols[i];
+            char m[256];
+            snprintf(m, sizeof m, "  %-22s %-8s %8.3f bpp %7.2fs\n", nm.c_str(),
+                     cand_name(j.out.codec, j.out.param).c_str(),
+                     f.n ? j.out.data.size() * 8.0 / f.n : 0.0, j.sec);
+            *log += m;
+            if (trace_all) *log += j.tr;
+        }
+        out.push_back(std::move(j.out));
+    };
+    for (size_t k : order) {
+        if (k != (size_t)-1) { emit(jobs[k]); continue; }
+        size_t sep = 0;
+        for (size_t c : s_chain) sep += jobs[c].out.data.size();
+        if (jobs[s_joint].out.data.size() <= sep) emit(jobs[s_joint]);
+        else for (size_t c : s_chain) emit(jobs[c]);
     }
     return out;
 }
