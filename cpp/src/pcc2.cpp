@@ -1532,10 +1532,22 @@ Stream best_stream(const Frame& f, const std::vector<std::string>& cols,
     std::vector<Cand> cand2;
     if (FSYM_CAND) {
         cand2.reserve(candidates.size() * 2);
+        // どの符号器に対を作るか。1 は全部、2 は空間予測を除く（高い候補を
+        // 倍にしないぶん速いが、その列で記号版が勝てなくなる）。
+        static const long PAIR_MODE = [] {
+            const char* e = getenv("PCC_FSYM_PAIR");
+            return e ? atol(e) : 1L;
+        }();
         for (const auto& c : candidates) {
             cand2.push_back(c);
-            if (c.codec != C_RAW64)
-                cand2.push_back({(uint16_t)(c.codec | C_FSYM_BIT), c.param});
+            if (c.codec == C_RAW64) continue;
+            if (PAIR_MODE == 2) {
+                bool sp = (c.codec == C_ATTR_SPATIAL || c.codec == C_ATTR_COLOR) ||
+                          (c.codec == C_ATTR_XREF && !c.param.empty() &&
+                           c.param[0] != 0 && c.param[0] != 100);
+                if (sp) continue;
+            }
+            cand2.push_back({(uint16_t)(c.codec | C_FSYM_BIT), c.param});
         }
     }
     const std::vector<Cand>& cands = FSYM_CAND ? cand2 : candidates;
