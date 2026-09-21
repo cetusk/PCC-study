@@ -1210,6 +1210,11 @@ static const std::vector<int64_t>* aux_col(const std::vector<uint8_t>& param, co
 // 候補ごとに確保していた作業領域。糸ごとに使い回す。
 // 候補の仕事は 1 本の糸で最後まで走るので入れ子にならない。
 static thread_local std::vector<std::vector<int64_t>> g_res;
+static thread_local std::vector<std::vector<int32_t>> g_res32;
+// **使わないほうの幅は手放す。**両方抱えると糸ごとに 1.5 倍になり、
+// 並列の本数だけ効いてしまう（200 万点・16 並列で 128 MB）。
+static void free_scratch64() { for (auto& v : g_res) std::vector<int64_t>().swap(v); }
+static void free_scratch32() { for (auto& v : g_res32) std::vector<int32_t>().swap(v); }
 
 bool codec_encode(uint16_t id, const std::vector<const std::vector<int64_t>*>& cols,
                   const std::vector<uint8_t>& param, std::vector<uint8_t>& out,
@@ -1259,6 +1264,40 @@ bool codec_encode(uint16_t id, const std::vector<const std::vector<int64_t>*>& c
         int P = param[0];
         size_t n = cols[0]->size();
         // 作業領域は糸ごとに使い回す。候補ごとに取ると並列の本数だけ要る。
+        // **まず int32 で試す。**列の差も空間予測の残差も普通は収まり、場所が半分で済む。
+        // 符号化する値は同じなので出力は 1 バイトも変わらない。
+        const std::vector<int32_t>* pm = nullptr;
+        const std::vector<int32_t>* pdt = nullptr;
+        if (P > 0 && P != 100) {
+            pdt = ctx->ensure(n, P, &pm);
+            if (!pdt) { err = "座標がない"; return false; }
+        }
+        {
+            std::vector<std::vector<int32_t>>& d32 = g_res32;
+            d32.resize(1); d32[0].resize(n);
+            bool narrow = true;
+            for (size_t i = 0; i < n && narrow; ++i) {
+                int64_t x = (*cols[0])[i] - (*a)[i];
+                if (x < INT32_MIN || x > INT32_MAX) narrow = false;
+                else d32[0][i] = (int32_t)x;
+            }
+            if (narrow && P == 100) {
+                int32_t prev = 0;
+                for (size_t i = 0; i < n && narrow; ++i) {
+                    int64_t r = (int64_t)d32[0][i] - prev;
+                    if (r < INT32_MIN || r > INT32_MAX) narrow = false;
+                    else { prev = d32[0][i]; d32[0][i] = (int32_t)r; }
+                }
+            } else if (narrow && P > 0) {
+                narrow = spatial_residual32_inplace(d32[0], *pm, *pdt, P, n);
+            }
+            if (narrow) {
+                free_scratch64();
+                enc_resid(d32, out);
+                return true;
+            }
+            free_scratch32();
+        }
         std::vector<std::vector<int64_t>>& d = g_res;
         d.resize(1); d[0].resize(n);
         for (size_t i = 0; i < n; ++i) d[0][i] = (*cols[0])[i] - (*a)[i];
@@ -1266,9 +1305,6 @@ bool codec_encode(uint16_t id, const std::vector<const std::vector<int64_t>*>& c
             int64_t prev = 0;
             for (size_t i = 0; i < n; ++i) { int64_t v = d[0][i]; d[0][i] = v - prev; prev = v; }
         } else if (P > 0) {
-            const std::vector<int32_t>* pm = nullptr;
-            const std::vector<int32_t>* pdt = ctx->ensure(n, P, &pm);
-            if (!pdt) { err = "座標がない"; return false; }
             spatial_residual(d[0], *pm, *pdt, P, n, d[0]);   // その場で書き換える
         }
         enc_resid(d, out);
@@ -1284,20 +1320,32 @@ bool codec_encode(uint16_t id, const std::vector<const std::vector<int64_t>*>& c
             if (!pdt) { err = "座標がない"; return false; }
         // **入力列を複製してはいけない。**候補ごとに n*8 byte を余分に取ることになり、
         // 並列に走る本数だけ積み上がる（200 万点・16 並列で 256 MB）。
-        std::vector<std::vector<int64_t>>& res = g_res;
-        res.resize(cols.size());
-        for (auto& v : res) v.resize(n);
         if (id == C_ATTR_COLOR) {
             if (cols.size() != 3) { err = "色は 3 列でなければならない"; return false; }
+            std::vector<std::vector<int64_t>>& res = g_res;
+            res.resize(3);
+            for (auto& v : res) v.resize(n);
             for (size_t i = 0; i < n; ++i)
                 ycocg_fwd((*cols[0])[i], (*cols[1])[i], (*cols[2])[i],
                           res[0][i], res[1][i], res[2][i]);
             for (size_t c = 0; c < 3; ++c)
                 spatial_residual(res[c], *pm, *pdt, P, n, res[c]);
-        } else {
-            for (size_t c = 0; c < cols.size(); ++c)
-                spatial_residual(*cols[c], *pm, *pdt, P, n, res[c]);
+            enc_resid(res, out);
+            return true;
         }
+        // **残差は普通 int32 に収まる。**収まる間は半分の場所で足りる。
+        // 符号化する値は同じなので出力は 1 バイトも変わらない。
+        std::vector<std::vector<int32_t>>& r32 = g_res32;
+        r32.resize(cols.size());
+        bool narrow = true;
+        for (size_t c = 0; c < cols.size() && narrow; ++c)
+            narrow = spatial_residual32(*cols[c], *pm, *pdt, P, n, r32[c]);
+        if (narrow) { free_scratch64(); enc_resid(r32, out); return true; }
+        free_scratch32();
+        std::vector<std::vector<int64_t>>& res = g_res;
+        res.resize(cols.size());
+        for (size_t c = 0; c < cols.size(); ++c)
+            spatial_residual(*cols[c], *pm, *pdt, P, n, res[c]);
         enc_resid(res, out);
         return true;
     }

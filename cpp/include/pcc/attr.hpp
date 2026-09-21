@@ -32,6 +32,14 @@ struct AttrResult {
 void spatial_residual(const std::vector<int64_t>& v, const std::vector<int32_t>& perm,
                       const std::vector<int32_t>& pred, int P, size_t n,
                       std::vector<int64_t>& out);
+// 残差を int32 で受ける版。値も残差も収まったときだけ真を返す。
+// 収まらなければ out には触れず、呼び手は 64 bit の版に落とす。
+bool spatial_residual32(const std::vector<int64_t>& v, const std::vector<int32_t>& perm,
+                        const std::vector<int32_t>& pred, int P, size_t n,
+                        std::vector<int32_t>& out);
+// 入力そのものを残差で置き換える版。参照残差のように、既に int32 の列があるとき。
+bool spatial_residual32_inplace(std::vector<int32_t>& v, const std::vector<int32_t>& perm,
+                                const std::vector<int32_t>& pred, int P, size_t n);
 void spatial_restore(const std::vector<int64_t>& res, const std::vector<int32_t>& perm,
                      const std::vector<int32_t>& pred, int P, size_t n,
                      std::vector<int64_t>& out);

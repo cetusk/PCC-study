@@ -193,6 +193,40 @@ void spatial_residual(const std::vector<int64_t>& v, const std::vector<int32_t>&
     for (size_t i = 0; i < n; ++i) out[i] = w[i] - predict(w, pred, P, i);
 }
 
+// 残差まで int32 で持つ版。属性の残差は小さいので普通は収まる。
+// 収まらないと判ったらすぐ戻り、呼び手が 64 bit の版を呼び直す。
+bool spatial_residual32(const std::vector<int64_t>& v, const std::vector<int32_t>& perm,
+                        const std::vector<int32_t>& pred, int P, size_t n,
+                        std::vector<int32_t>& out) {
+    g_w32.resize(n);
+    for (size_t t = 0; t < n; ++t) {
+        int64_t x = v[(size_t)perm[t]];
+        if (x < INT32_MIN || x > INT32_MAX) return false;
+        g_w32[t] = (int32_t)x;
+    }
+    const int32_t* w = g_w32.data();
+    out.resize(n);
+    for (size_t i = 0; i < n; ++i) {
+        int64_t r = (int64_t)w[i] - predict(w, pred, P, i);
+        if (r < INT32_MIN || r > INT32_MAX) return false;
+        out[i] = (int32_t)r;
+    }
+    return true;
+}
+
+bool spatial_residual32_inplace(std::vector<int32_t>& v, const std::vector<int32_t>& perm,
+                                const std::vector<int32_t>& pred, int P, size_t n) {
+    g_w32.resize(n);
+    for (size_t t = 0; t < n; ++t) g_w32[t] = v[(size_t)perm[t]];
+    const int32_t* w = g_w32.data();
+    for (size_t i = 0; i < n; ++i) {
+        int64_t r = (int64_t)w[i] - predict(w, pred, P, i);
+        if (r < INT32_MIN || r > INT32_MAX) return false;
+        v[i] = (int32_t)r;
+    }
+    return true;
+}
+
 void spatial_restore(const std::vector<int64_t>& res, const std::vector<int32_t>& perm,
                      const std::vector<int32_t>& pred, int P, size_t n,
                      std::vector<int64_t>& out) {
