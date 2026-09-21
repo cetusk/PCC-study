@@ -1207,6 +1207,10 @@ static const std::vector<int64_t>* aux_col(const std::vector<uint8_t>& param, co
     return ctx->fr->get(nm);
 }
 
+// 候補ごとに確保していた作業領域。糸ごとに使い回す。
+// 候補の仕事は 1 本の糸で最後まで走るので入れ子にならない。
+static thread_local std::vector<std::vector<int64_t>> g_res;
+
 bool codec_encode(uint16_t id, const std::vector<const std::vector<int64_t>*>& cols,
                   const std::vector<uint8_t>& param, std::vector<uint8_t>& out,
                   std::string& err, const CodecCtx* ctx) {
@@ -1254,7 +1258,9 @@ bool codec_encode(uint16_t id, const std::vector<const std::vector<int64_t>*>& c
         if (!a || a->size() < cols[0]->size()) { err = "参照列がない"; return false; }
         int P = param[0];
         size_t n = cols[0]->size();
-        std::vector<std::vector<int64_t>> d(1, std::vector<int64_t>(n));
+        // 作業領域は糸ごとに使い回す。候補ごとに取ると並列の本数だけ要る。
+        std::vector<std::vector<int64_t>>& d = g_res;
+        d.resize(1); d[0].resize(n);
         for (size_t i = 0; i < n; ++i) d[0][i] = (*cols[0])[i] - (*a)[i];
         if (P == 100) {                       // 残差にさらに格納順の 1 次差分を掛ける
             int64_t prev = 0;
@@ -1263,9 +1269,7 @@ bool codec_encode(uint16_t id, const std::vector<const std::vector<int64_t>*>& c
             const std::vector<int32_t>* pm = nullptr;
             const std::vector<int32_t>* pdt = ctx->ensure(n, P, &pm);
             if (!pdt) { err = "座標がない"; return false; }
-            std::vector<int64_t> r;
-            spatial_residual(d[0], *pm, *pdt, P, n, r);
-            d[0] = std::move(r);
+            spatial_residual(d[0], *pm, *pdt, P, n, d[0]);   // その場で書き換える
         }
         enc_resid(d, out);
         return true;
@@ -1278,19 +1282,22 @@ bool codec_encode(uint16_t id, const std::vector<const std::vector<int64_t>*>& c
         const std::vector<int32_t>* pm = nullptr;
             const std::vector<int32_t>* pdt = ctx->ensure(n, P, &pm);
             if (!pdt) { err = "座標がない"; return false; }
-        std::vector<std::vector<int64_t>> src;
+        // **入力列を複製してはいけない。**候補ごとに n*8 byte を余分に取ることになり、
+        // 並列に走る本数だけ積み上がる（200 万点・16 並列で 256 MB）。
+        std::vector<std::vector<int64_t>>& res = g_res;
+        res.resize(cols.size());
+        for (auto& v : res) v.resize(n);
         if (id == C_ATTR_COLOR) {
             if (cols.size() != 3) { err = "色は 3 列でなければならない"; return false; }
-            src.assign(3, std::vector<int64_t>(n));
             for (size_t i = 0; i < n; ++i)
                 ycocg_fwd((*cols[0])[i], (*cols[1])[i], (*cols[2])[i],
-                          src[0][i], src[1][i], src[2][i]);
+                          res[0][i], res[1][i], res[2][i]);
+            for (size_t c = 0; c < 3; ++c)
+                spatial_residual(res[c], *pm, *pdt, P, n, res[c]);
         } else {
-            for (auto* c : cols) src.push_back(*c);
+            for (size_t c = 0; c < cols.size(); ++c)
+                spatial_residual(*cols[c], *pm, *pdt, P, n, res[c]);
         }
-        std::vector<std::vector<int64_t>> res(src.size());
-        for (size_t c = 0; c < src.size(); ++c)
-            spatial_residual(src[c], *pm, *pdt, P, n, res[c]);
         enc_resid(res, out);
         return true;
     }
@@ -1616,13 +1623,19 @@ static size_t pool_threads() {
 // encode_many が使う。単独で符号化するときは無いので、そのときは今までどおり。
 static Pool* g_pool = nullptr;
 
+// 候補の出力は全部が同時に生きている。列も並列にしたので、列数 × 候補数ぶんが
+// 一度にメモリに載る（200 万点・13 列・20 候補で 1 GB を超える）。
+// **最短より長いと判った出力は、その場で捨ててよい。**最短は単調に縮むので、
+// ある時点の最短より長いものが後から勝つことはない。大きさだけ控えておく。
+// 同じ大きさのものは捨てない（選択は添字の早いほうを採るので、捨てると変わる）。
 static void encode_many(const std::vector<Cand>& cs,
                         const std::vector<const std::vector<int64_t>*>& cv,
                         const CodecCtx* ctx, std::vector<std::vector<uint8_t>>& blobs,
                         std::vector<std::string>& errs, std::vector<char>& ok,
-                        bool abort_long) {
+                        bool abort_long, std::vector<size_t>* sizes = nullptr) {
     const size_t m = cs.size();
     blobs.assign(m, {}); errs.assign(m, std::string()); ok.assign(m, 0);
+    if (sizes) sizes->assign(m, 0);
     static const size_t NT = [] {
         if (const char* e = getenv("PCC_THREADS")) { long v = atol(e); if (v > 0) return (size_t)v; }
         unsigned hw = std::thread::hardware_concurrency();
@@ -1643,10 +1656,14 @@ static void encode_many(const std::vector<Cand>& cs,
                 }
                 enc_best = save;
                 if (ok[i]) {
+                    if (sizes) (*sizes)[i] = blobs[i].size();
                     size_t b = best.load(std::memory_order_relaxed);
                     while (blobs[i].size() < b &&
                            !best.compare_exchange_weak(b, blobs[i].size(),
                                                        std::memory_order_relaxed)) {}
+                    if (sizes && blobs[i].size() > best.load(std::memory_order_relaxed)) {
+                        std::vector<uint8_t>().swap(blobs[i]);   // 負けが確定。捨てる
+                    }
                 }
             }, left);
         g_pool->help_until(left);
@@ -1661,8 +1678,11 @@ static void encode_many(const std::vector<Cand>& cs,
             } catch (const EncAbort&) {
                 ok[i] = 0; errs[i] = "最短を超えたので打ち切り"; blobs[i].clear();
             }
-            if (ok[i] && blobs[i].size() < best.load(std::memory_order_relaxed))
-                best.store(blobs[i].size(), std::memory_order_relaxed);
+            if (ok[i]) {
+                if (sizes) (*sizes)[i] = blobs[i].size();
+                if (blobs[i].size() < best.load(std::memory_order_relaxed))
+                    best.store(blobs[i].size(), std::memory_order_relaxed);
+            }
         }
         enc_best = nullptr;
         return;
@@ -1681,6 +1701,7 @@ static void encode_many(const std::vector<Cand>& cs,
                     ok[i] = 0; errs[i] = "最短を超えたので打ち切り"; blobs[i].clear();
                 }
                 if (ok[i]) {
+                    if (sizes) (*sizes)[i] = blobs[i].size();
                     size_t b = best.load(std::memory_order_relaxed);
                     while (blobs[i].size() < b &&
                            !best.compare_exchange_weak(b, blobs[i].size(),
@@ -1903,13 +1924,22 @@ Stream best_stream(const Frame& f, const std::vector<std::string>& cols,
         const char* e = getenv("PCC_ABORT");
         return !e || e[0] != '0';
     }();
-    if (par) encode_many(use, cv, ctx, fb, fe, fok, ABORT_ON && !on_sample);
+    std::vector<size_t> fsz;
+    if (par) encode_many(use, cv, ctx, fb, fe, fok, ABORT_ON && !on_sample, &fsz);
+    // 捨てた出力があるので、勝者の判定は blob の大きさではなく控えた値で行う。
+    size_t bestsz = (size_t)-1;
     for (size_t ui = 0; ui < use.size(); ++ui) {
         const Cand& cd = use[ui];
         std::vector<uint8_t> blob; std::string err;
         bool got;
-        if (par) { got = fok[ui] != 0; blob = std::move(fb[ui]); err = fe[ui]; }
-        else got = codec_encode(cd.codec, cv, cd.param, blob, err, ctx);
+        size_t sz;
+        if (par) {
+            got = fok[ui] != 0; blob = std::move(fb[ui]); err = fe[ui];
+            sz = fsz.empty() ? blob.size() : fsz[ui];
+        } else {
+            got = codec_encode(cd.codec, cv, cd.param, blob, err, ctx);
+            sz = blob.size();
+        }
         if (!got) {
             if (trace) *trace += "      " + cand_name(cd.codec, cd.param) + " 不可: " + err + "\n";
             continue;
@@ -1917,12 +1947,12 @@ Stream best_stream(const Frame& f, const std::vector<std::string>& cols,
         if (trace) {
             char m[160];
             snprintf(m, sizeof m, "      %-10s %8.3f bpp\n", cand_name(cd.codec, cd.param).c_str(),
-                     f.n ? blob.size() * 8.0 / f.n : 0.0);
+                     f.n ? sz * 8.0 / f.n : 0.0);
             *trace += m;
         }
-        const size_t sz = blob.size();
         rank.push_back({sz, {cd.codec, cd.param}});
-        if (first || sz < best.data.size()) {
+        if (sz < bestsz) {
+            bestsz = sz;
             best.codec = cd.codec; best.param = cd.param;
             best.data = std::move(blob); first = false;
         }
@@ -1954,12 +1984,26 @@ Stream best_stream(const Frame& f, const std::vector<std::string>& cols,
 std::vector<Stream> plan_streams(const Frame& f, bool joint_geom, std::string* log,
                                  const CodecCtx* ctx, bool trace_all) {
     std::vector<Stream> out;
+    // 空間予測を使う列が 1 つでもあるか。**これを見ずに表を作ってはいけない。**
+    // 幾何だけの入力（属性がすべて定数で落ちるもの）でも「幾何が揃っている」
+    // という理由だけで順序表・KD木・P ごとの表を作っていた。100 万点で
+    // 0.15 秒と約 80 MB を、一度も引かれない表に使っていたことになる。
+    bool any_attr = false;
+    for (const auto& c : f.schema) {
+        if (joint_geom && c.role == Role::Geometry) continue;
+        if (c.storage == Storage::Derived) continue;
+        if (joint_geom && (c.name == "point_source_id" || c.name == "gps_time" ||
+                           c.name == "bit_fields")) continue;
+        if (f.get(c.name)) { any_attr = true; break; }
+    }
+    const bool want_spatial = ctx && (ctx->world || ctx->want_world) && any_attr;
+
     // 空間予測の近傍表は、最初にそれを呼ぶ列（たいてい intensity）が 1 人で
     // 背負っている。AHN3 _20 の 100 万点では intensity が 0.35 秒、同じ候補数の
     // red が 0.12 秒で、差の 0.23 秒がこの構築である。幾何の列を符号化している
     // 間に裏で作っておけば隠れる。表の中身は変わらないので出力は同じ。
     std::thread warm;
-    if (ctx && (ctx->world || ctx->want_world))
+    if (want_spatial)
         warm = std::thread([ctx, &f] { ctx->ensure(f.n, 1, nullptr); });
     struct Joiner {
         std::thread& t;
@@ -1983,7 +2027,7 @@ std::vector<Stream> plan_streams(const Frame& f, bool joint_geom, std::string* l
         return v;
     }();
     std::vector<Cand> cand_attr = cand;
-    if (ctx && (ctx->world || ctx->want_world))
+    if (want_spatial)
         for (uint8_t P : SPS) cand_attr.push_back({C_ATTR_SPATIAL, {P}});
     // 順序の実験では幾何だけが関心で、属性の候補掃引が時間の大半を占める。
     // 絞っても往復検証は全列に掛かるので、検証の強さは落ちない。
@@ -2202,7 +2246,7 @@ std::vector<Stream> plan_streams(const Frame& f, bool joint_geom, std::string* l
     // AHN4 _20 の nir は green が差では 5 位、空間予測の後では上位に来る。
     // 座標が要るので、幾何が揃っているときだけ。
     std::map<std::pair<std::string, std::string>, double> escore_sp;
-    if (ctx && (ctx->world || ctx->want_world)) {
+    if (want_spatial && !escore.empty()) {
         const std::vector<int32_t>* pm = nullptr;
         const std::vector<int32_t>* pdt = ctx->ensure(f.n, 3, &pm);
         if (pdt && pm) {

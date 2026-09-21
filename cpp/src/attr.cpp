@@ -13,6 +13,7 @@
 #include <thread>
 #include <algorithm>
 #include <cmath>
+#include <cstdint>
 #include <chrono>
 
 static double now_sec() {
@@ -141,41 +142,66 @@ void build_causal_predictors(const std::vector<double>& xyz, size_t n,
 }
 
 // w は符号化順に並べ替えた値の列。位置 t の予測値を返す。
-static inline int64_t predict(const std::vector<int64_t>& w,
-                              const std::vector<int32_t>& pred, int P, size_t t) {
+template <class T>
+static inline int64_t predict(const T* w, const std::vector<int32_t>& pred,
+                              int P, size_t t) {
     if (t == 0) return 0;
     int64_t s = 0; int c = 0;
     for (int j = 0; j < P; ++j) {
         int32_t p = pred[t * P + j];
         if (p < 0) break;
-        s += w[p]; ++c;
+        s += (int64_t)w[p]; ++c;
     }
-    if (c == 0) return w[t - 1];
+    if (c == 0) return (int64_t)w[t - 1];
     return s >= 0 ? (s + c / 2) / c : -((-s + c / 2) / c);
 }
 
 // 符号化順に並べ替えた値を置く作業領域。1 列につき候補が 6〜10 本あり、
 // 候補ごとに 100 万点で 8 MB を確保して捨てていた。スレッドごとに使い回す。
-static thread_local std::vector<int64_t> g_w;
+//
+// **多くの列は int32 に収まる**（強度・分類・色・走査角）。収まる間は 32 bit で
+// 持ち、溢れた列だけ 64 bit に移す。並列に走る本数だけ効くので、200 万点・
+// 16 並列で 256 MB の差になる。予測は 64 bit で足すので値は変わらない。
+static thread_local std::vector<int32_t> g_w32;
+static thread_local std::vector<int64_t> g_w64;
 
+// **out は v と同じ配列でよい。**値はいったん w に符号化順で写してから引くので、
+// 2 つめのループは v を読まない。候補ごとに出力用の配列を別に取ると、
+// 並列に走る本数だけメモリが要る（200 万点・16 並列で 256 MB）。
 void spatial_residual(const std::vector<int64_t>& v, const std::vector<int32_t>& perm,
                       const std::vector<int32_t>& pred, int P, size_t n,
                       std::vector<int64_t>& out) {
-    g_w.resize(n);
-    std::vector<int64_t>& w = g_w;
-    for (size_t t = 0; t < n; ++t) w[t] = v[perm[t]];
+    g_w32.resize(n);
+    size_t t = 0;
+    for (; t < n; ++t) {
+        int64_t x = v[(size_t)perm[t]];
+        if (x < INT32_MIN || x > INT32_MAX) break;
+        g_w32[t] = (int32_t)x;
+    }
+    if (t == n) {
+        std::vector<int64_t>().swap(g_w64);          // 広い側は抱えない
+        const int32_t* w = g_w32.data();
+        out.resize(n);
+        for (size_t i = 0; i < n; ++i) out[i] = (int64_t)w[i] - predict(w, pred, P, i);
+        return;
+    }
+    g_w64.resize(n);
+    for (size_t i = 0; i < t; ++i) g_w64[i] = g_w32[i];
+    for (size_t i = t; i < n; ++i) g_w64[i] = v[(size_t)perm[i]];
+    const int64_t* w = g_w64.data();
     out.resize(n);
-    for (size_t t = 0; t < n; ++t) out[t] = w[t] - predict(w, pred, P, t);
+    for (size_t i = 0; i < n; ++i) out[i] = w[i] - predict(w, pred, P, i);
 }
 
 void spatial_restore(const std::vector<int64_t>& res, const std::vector<int32_t>& perm,
                      const std::vector<int32_t>& pred, int P, size_t n,
                      std::vector<int64_t>& out) {
-    g_w.resize(n);
-    std::vector<int64_t>& w = g_w;
+    // 復号は値が判る前に幅を決められないので 64 bit で持つ。
+    g_w64.resize(n);
+    int64_t* w = g_w64.data();
     for (size_t t = 0; t < n; ++t) w[t] = res[t] + predict(w, pred, P, t);
     out.resize(n);
-    for (size_t t = 0; t < n; ++t) out[perm[t]] = w[t];
+    for (size_t t = 0; t < n; ++t) out[(size_t)perm[t]] = w[t];
 }
 
 AttrResult compare_field(const std::string& name, const std::vector<int64_t>& v,
@@ -192,7 +218,7 @@ AttrResult compare_field(const std::string& name, const std::vector<int64_t>& v,
 
     std::vector<int64_t> w(n), rs(n);
     for (size_t t = 0; t < n; ++t) w[t] = v[perm[t]];
-    for (size_t t = 0; t < n; ++t) rs[t] = w[t] - predict(w, pred, P, t);
+    for (size_t t = 0; t < n; ++t) rs[t] = w[t] - predict(w.data(), pred, P, t);
     auto bs = encode_ints(rs.data(), n);
     R.bpp_spatial = bs.size() * 8.0 / n;
 
@@ -200,7 +226,7 @@ AttrResult compare_field(const std::string& name, const std::vector<int64_t>& v,
     std::vector<int64_t> dec(n), back(n, 0);
     decode_ints(bs.data(), bs.size(), dec.data(), n);
     bool ok = true;
-    for (size_t t = 0; t < n; ++t) back[t] = dec[t] + predict(back, pred, P, t);
+    for (size_t t = 0; t < n; ++t) back[t] = dec[t] + predict(back.data(), pred, P, t);
     for (size_t t = 0; t < n && ok; ++t) if (back[t] != v[perm[t]]) ok = false;
     R.roundtrip_ok = ok;
     return R;

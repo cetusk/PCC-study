@@ -20,6 +20,8 @@
 
 #include "pcc/rangecoder.hpp"
 #include <cstdio>
+#include <thread>
+#include <atomic>
 #include <cstring>
 #include <cstdlib>
 #include <chrono>
@@ -52,10 +54,34 @@ static double rss_mb() {
 }
 
 static bool g_mem_trace = false;
+
+// **ru_maxrss は exec をまたいで引き継がれる。**太った親から起動されると、
+// 子のピークに親の分が乗ったまま出る（起動直後に 1.4 GB と出た）。
+// 本当のピークは自分で /proc/self/statm を刻んで取る。
+static std::atomic<double> g_rss_peak{0.0};
+static std::atomic<bool> g_rss_stop{false};
+static std::thread g_rss_thread;
+static void rss_watch_start() {
+    if (!g_mem_trace) return;
+    g_rss_thread = std::thread([] {
+        while (!g_rss_stop.load(std::memory_order_relaxed)) {
+            double v = rss_mb();
+            double p = g_rss_peak.load(std::memory_order_relaxed);
+            while (v > p && !g_rss_peak.compare_exchange_weak(p, v)) {}
+            std::this_thread::sleep_for(std::chrono::milliseconds(3));
+        }
+    });
+}
+static void rss_watch_stop() {
+    if (!g_rss_thread.joinable()) return;
+    g_rss_stop.store(true);
+    g_rss_thread.join();
+    fprintf(stderr, "  [メモリ] %-28s %7.1f MB\n", "実測ピーク（3 ms 刻み）",
+            g_rss_peak.load());
+}
 static void mem_mark(const char* what) {
     if (g_mem_trace)
-        fprintf(stderr, "  [メモリ] %-28s 常駐 %7.1f MB  ピーク %7.1f MB\n",
-                what, rss_mb(), peak_gb() * 1024.0);
+        fprintf(stderr, "  [メモリ] %-28s 常駐 %7.1f MB\n", what, rss_mb());
 }
 static uint64_t fsize(const std::string& p) {
     struct stat st{}; return stat(p.c_str(), &st) == 0 ? (uint64_t)st.st_size : 0;
@@ -115,6 +141,7 @@ int main(int argc, char** argv) {
         }
         std::string err;
         double t0 = now();
+        rss_watch_start();
         mem_mark("開始");
         Frame f;
         bool is_las = false;
@@ -223,6 +250,7 @@ int main(int argc, char** argv) {
         uint64_t bytes = 0;
         if (!write_pcc2(outp, f, st, bytes, err)) { fprintf(stderr, "書き込み失敗: %s\n", err.c_str()); return 1; }
         mem_mark("書き出した後");
+        rss_watch_stop();
 
         // 自前の符号器が元の器に負けることがある。両方書いて短い方を残し、
         // どちらを使ったかを容器に書いておく。符号器そのものは独立のままで、
