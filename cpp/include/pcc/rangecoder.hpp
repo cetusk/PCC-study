@@ -15,16 +15,20 @@ inline constexpr int PROB_BITS = 16;
 inline constexpr uint32_t PROB_ONE = 1u << PROB_BITS;
 inline constexpr uint32_t TOP = 1u << 24;
 
+// p0 は [2^rate - 1, PROB_ONE - (2^rate - 1)] にしか入らないので 16 bit で足りる
+// （rate=5 での実際の範囲は [31, 65505]、総当たりで確認した）。rate を持たせると
+// 1 模型 8 byte になり、文脈が増えたときに当たりが悪くなる。定数にすると 2 byte。
+// 算術は同じなので出力は 1 bit も変わらない。
+inline constexpr int PROB_RATE = 5;
 struct BitModel {
-    uint32_t p0 = PROB_ONE >> 1;
-    int rate = 5;
+    uint16_t p0 = PROB_ONE >> 1;
+    static constexpr int rate = PROB_RATE;
+    // 0 や PROB_ONE に張り付くと正規化ループが進まなくなるが、rate >= 1 なら
+    // そこには届かない。bit=1 を繰り返しても p0 >> rate が 0 になる 2^rate - 1 で
+    // 止まり、bit=0 を繰り返しても PROB_ONE - (2^rate - 1) で止まる。
     inline void update(int bit) {
-        if (bit) p0 -= p0 >> rate;
-        else     p0 += (PROB_ONE - p0) >> rate;
-        // 0 や PROB_ONE に張り付くと bound が 0 または range と等しくなり、
-        // 正規化ループが進まなくなる。念のため内側に寄せる。
-        if (p0 == 0) p0 = 1;
-        else if (p0 >= PROB_ONE) p0 = PROB_ONE - 1;
+        if (bit) p0 = (uint16_t)(p0 - (p0 >> rate));
+        else     p0 = (uint16_t)(p0 + ((PROB_ONE - p0) >> rate));
     }
 };
 
@@ -107,11 +111,11 @@ public:
         int k; uint64_t rem;
         if (v == ~0ull) { k = 64; rem = v; }
         else {
-            // t >> 64 はシフト量が幅以上で未定義動作（x86 では t>>0 になり
-            // ループが抜けなくなる）。k は 63 で必ず頭打ちにする。
-            k = 0; uint64_t t = v + 1;
-            while (k < 63 && (t >> (k + 1))) ++k;
-            rem = v + 1 - (1ull << k);
+            // k = 最上位ビットの位置。1 つずつ数えると 1 値あたり k 回まわるので、
+            // 前置ゼロの数から直に出す（t >= 1 なので clz は 63 以下）。
+            uint64_t t = v + 1;
+            k = 63 - __builtin_clzll(t);
+            rem = t - (1ull << k);
         }
         BitModel* pm = &prefix_[ctx * stride_];
         BitModel* sm = &suffix_[ctx * stride_];
