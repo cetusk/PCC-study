@@ -55,7 +55,7 @@ bool frame_from_las(const PointCloud& pc, Frame& f, std::string& err) {
         c.role = (nm == "gps_time") ? Role::Time : Role::Attribute;
         c.is_extra = it->second.is_extra;
         f.schema.push_back(c);
-        if (it->second.is_const) f.col[nm].assign(pc.n, it->second.cval);
+        if (it->second.is_const) f.col[nm].from_const(it->second.cval, pc.n);
         else f.col[nm] = it->second.v;
     }
 
@@ -157,7 +157,7 @@ bool frame_to_las(const Frame& f, PointCloud& pc, std::string& err) {
     if (f.source_kind != "las") { err = "封筒が LAS ではない"; return false; }
     pc.n = f.n;
     for (int i = 0; i < 3; ++i) { pc.scale[i] = f.scale[i]; pc.offset[i] = f.offset[i]; }
-    const std::vector<int64_t>* g[3];
+    const Col* g[3];
     for (int i = 0; i < 3; ++i) {
         g[i] = f.get(f.geom[i]);
         if (!g[i]) { err = "幾何の列がない: " + f.geom[i]; return false; }
@@ -173,7 +173,7 @@ bool frame_to_las(const Frame& f, PointCloud& pc, std::string& err) {
         Field fl; fl.ftype = s.ftype; fl.is_extra = s.is_extra;
         auto it = f.col.find(s.name);
         if (it == f.col.end()) { err = "列がない: " + s.name; return false; }
-        fl.v = it->second;
+        fl.v = it->second.to_vector();
         pc.order.push_back(s.name);
         pc.fields[s.name] = std::move(fl);
     }
@@ -318,7 +318,7 @@ Frame sample_frame(const Frame& f, size_t n, int chunks) {
         v.reserve(g.n);
         for (int c = 0; c < chunks; ++c) {
             size_t b = beg[c], e = std::min(span, b + per);
-            v.insert(v.end(), kv.second.begin() + b, kv.second.begin() + e);
+            for (size_t i = b; i < e; ++i) v.push_back(kv.second[i]);
         }
         v.resize(g.n);
         g.col[kv.first] = std::move(v);
@@ -334,8 +334,11 @@ Frame truncate_frame(const Frame& f, size_t n) {
                                   g.geom[i] = f.geom[i]; }
     g.geom_repr = f.geom_repr; g.source_kind = f.source_kind;
     g.source_bytes = f.source_bytes; g.plan = f.plan; g.fid = f.fid;
-    for (const auto& kv : f.col)
-        g.col[kv.first] = std::vector<int64_t>(kv.second.begin(), kv.second.begin() + g.n);
+    for (const auto& kv : f.col) {
+        std::vector<int64_t> v((size_t)g.n);
+        for (size_t i = 0; i < (size_t)g.n; ++i) v[i] = kv.second[i];
+        g.col[kv.first] = std::move(v);
+    }
     return g;
 }
 
@@ -387,11 +390,11 @@ bool denormalize_frame(Frame& f, std::string& err) {
         auto it = f.col.find(c.name);
         if (c.storage == Storage::Residual) {
             if (it == f.col.end()) { err = "残差の列が無い: " + c.name; return false; }
-            ext[c.name] = std::move(it->second);
+            ext[c.name] = it->second.to_vector();
             f.col.erase(it);
         } else if (c.storage == Storage::Raw) {
             if (it == f.col.end()) { err = "列が無い: " + c.name; return false; }
-            fields[c.name] = it->second;
+            fields[c.name] = it->second.to_vector();
         }
     }
     if (!invert_plan(fields, ext, plan, f.n, err)) return false;

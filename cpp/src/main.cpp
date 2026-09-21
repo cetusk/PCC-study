@@ -212,7 +212,7 @@ int main(int argc, char** argv) {
             // 標本の 1 位が全点でも 1 位とは限らない。上位 2 つを全点で測り、
             // 短い方を採る。全候補を全点で測るより速く、1 位だけを信じるより安全。
             for (auto& s0 : sel) {
-                std::vector<const std::vector<int64_t>*> cv;
+                std::vector<const Col*> cv;
                 for (const auto& c : s0.cols) cv.push_back(f.get(c));
                 Stream s1; s1.cols = s0.cols;
                 bool got = false;
@@ -314,7 +314,7 @@ int main(int argc, char** argv) {
         // 以降で使う覚え書きだけ残して、列の実体と流れを手放す。
         const size_t rep_n = (size_t)f.n, rep_ncol = f.schema.size();
         const std::string rep_src = f.source_kind, rep_geom = f.geom_repr, rep_plan = f.plan;
-        std::map<std::string, std::vector<int64_t>>().swap(f.col);
+        std::map<std::string, Col>().swap(f.col);
         std::vector<Stream>().swap(st);
         std::vector<uint8_t>().swap(fe.embed);
         mem_mark("符号化側を手放した後");

@@ -167,26 +167,19 @@ static thread_local std::vector<int64_t> g_w64;
 // **out は v と同じ配列でよい。**値はいったん w に符号化順で写してから引くので、
 // 2 つめのループは v を読まない。候補ごとに出力用の配列を別に取ると、
 // 並列に走る本数だけメモリが要る（200 万点・16 並列で 256 MB）。
-void spatial_residual(const std::vector<int64_t>& v, const std::vector<int32_t>& perm,
+void spatial_residual(const Col& v, const std::vector<int32_t>& perm,
                       const std::vector<int32_t>& pred, int P, size_t n,
                       std::vector<int64_t>& out) {
-    if (&out != &v) {                    // 並べ替えて入れてから、後ろから引く
-        out.resize(n);
-        for (size_t t = 0; t < n; ++t) out[t] = v[(size_t)perm[t]];
-        residual_backward64(out, pred, P, n);
-        return;
-    }
-    // 同じ配列のときは在来で並べ替えられないので、作業配列を 1 本だけ使う。
-    g_w64.resize(n);
-    for (size_t t = 0; t < n; ++t) g_w64[t] = v[(size_t)perm[t]];
-    const int64_t* w = g_w64.data();
+    // 列は幅つきの持ち物になったので、出力と同じ配列ではありえない。
+    // 並べ替えて入れてから、後ろから引く。
     out.resize(n);
-    for (size_t i = 0; i < n; ++i) out[i] = w[i] - predict(w, pred, P, i);
+    for (size_t t = 0; t < n; ++t) out[t] = v[(size_t)perm[t]];
+    residual_backward64(out, pred, P, n);
 }
 
 // 残差まで int32 で持つ版。属性の残差は小さいので普通は収まる。
 // 収まらないと判ったらすぐ戻り、呼び手が 64 bit の版を呼び直す。
-bool spatial_residual32(const std::vector<int64_t>& v, const std::vector<int32_t>& perm,
+bool spatial_residual32(const Col& v, const std::vector<int32_t>& perm,
                         const std::vector<int32_t>& pred, int P, size_t n,
                         std::vector<int32_t>& out) {
     out.resize(n);

@@ -91,7 +91,7 @@ struct Stream {
 };
 
 // 単一符号器の符号化・復号（cols は同じ長さの列）
-bool codec_encode(uint16_t id, const std::vector<const std::vector<int64_t>*>& cols,
+bool codec_encode(uint16_t id, const std::vector<const Col*>& cols,
                   const std::vector<uint8_t>& param, std::vector<uint8_t>& out,
                   std::string& err, const CodecCtx* ctx = nullptr);
 bool codec_decode(uint16_t id, const std::vector<uint8_t>& param,

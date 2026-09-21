@@ -112,7 +112,7 @@ struct Pred {
 // mode: 0 そのまま / 1 1次差分 / 2 1次差分＋ビット数文脈 / 3 2次差分＋文脈
 // 3 は「一定の刻みで増える列」に効く。gps_time は float64 のビットパターンを
 // 整数と見なして差を取ると刻みがほぼ一定になるので、2 次差分はほぼ 0 になる。
-static void enc_cols(const std::vector<const std::vector<int64_t>*>& cols, int mode,
+static void enc_cols(const std::vector<const Col*>& cols, int mode,
                      std::vector<uint8_t>& out) {
     size_t nc = cols.size(), n = nc ? cols[0]->size() : 0;
     Encoder e;
@@ -138,7 +138,7 @@ static void enc_cols(const std::vector<const std::vector<int64_t>*>& cols, int m
 // 表は移動前置（当たった値を先頭へ）で更新するので副情報は要らない。
 inline constexpr int DCACHE = 1024;
 
-static void enc_cols_cache(const std::vector<const std::vector<int64_t>*>& cols,
+static void enc_cols_cache(const std::vector<const Col*>& cols,
                            std::vector<uint8_t>& out) {
     size_t nc = cols.size(), n = nc ? cols[0]->size() : 0;
     Encoder e;
@@ -204,7 +204,7 @@ static void dec_cols_cache(const uint8_t* data, size_t len, size_t n, size_t nc,
 // 文脈は直前の残差のビット数（大きさごとに別の確率モデルを持つ）。
 // med3 / MedPred は scanmodel.hpp にある（走査モデルの退避路と共有）。
 
-static void enc_geom_med(const std::vector<const std::vector<int64_t>*>& cols,
+static void enc_geom_med(const std::vector<const Col*>& cols,
                          std::vector<uint8_t>& out) {
     size_t nc = cols.size(), n = nc ? cols[0]->size() : 0;
     Encoder e;
@@ -242,8 +242,8 @@ static void dec_geom_med(const uint8_t* data, size_t len, size_t n, size_t nc,
 // 航空 LiDAR では 1 発から複数の点が返るので、格納順の隣は走査線上の隣とは限らない。
 // 同じ状態の点だけを繋ぐと逐次予測が成立する。LASzip が点レコードに対して
 // しているのと同じ考え方で、復号器は補助列を先に復号していれば副情報を要しない。
-static void enc_geom_aux(const std::vector<const std::vector<int64_t>*>& cols,
-                         const std::vector<int64_t>& aux, std::vector<uint8_t>& out) {
+static void enc_geom_aux(const std::vector<const Col*>& cols,
+                         const Col& aux, std::vector<uint8_t>& out) {
     size_t nc = cols.size(), n = nc ? cols[0]->size() : 0;
     Encoder e;
     UIntCoder uc((int)nc * NCTX, 64);
@@ -262,7 +262,7 @@ static void enc_geom_aux(const std::vector<const std::vector<int64_t>*>& cols,
     out = e.finish();
 }
 static void dec_geom_aux(const uint8_t* data, size_t len, size_t n, size_t nc,
-                         const std::vector<int64_t>& aux,
+                         const Col& aux,
                          std::vector<std::vector<int64_t>>& out) {
     out.assign(nc, std::vector<int64_t>(n));
     Decoder d(data, len);
@@ -284,7 +284,7 @@ static void dec_geom_aux(const uint8_t* data, size_t len, size_t n, size_t nc,
 // 幾何 v3: 軸をまたぐ文脈。LASzip は Y を符号化するとき X の残差が
 // 何ビットだったかを文脈に使い、Z には X と Y の平均を使う。
 // 走査線上では 3 軸の残差の大きさが連動するので、これが効く。
-static void enc_geom_x(const std::vector<const std::vector<int64_t>*>& cols,
+static void enc_geom_x(const std::vector<const Col*>& cols,
                        int pmode, std::vector<uint8_t>& out) {
     size_t n = cols[0]->size();
     Encoder e;
@@ -320,7 +320,8 @@ static void enc_geom_x(const std::vector<const std::vector<int64_t>*>& cols,
 // 添字（直前から何点戻るか）を符号化する。残差の減りから添字の費用を引いた
 // 正味は、実測で AHN4 _21 が −7.5、USGS NY が −2.2 bit/点。効かない入力も
 // あるので候補の 1 つとして出し、選択原理に任せる。
-static inline int nn_back(const int64_t* X, const int64_t* Y, const int64_t* Z,
+template <class T>
+static inline int nn_back(const T& X, const T& Y, const T& Z,
                           size_t i, size_t w) {
     size_t a = i > w ? i - w : 0;
     int64_t bd = INT64_MAX; size_t bj = i - 1;
@@ -342,10 +343,13 @@ static inline int64_t trend_of(const MedPred& t, int tmode) {
     return tmode == 2 ? fdiv(v, 2) : v;
 }
 
-static void enc_geom_w(const std::vector<const std::vector<int64_t>*>& cols,
+static void enc_geom_w(const std::vector<const Col*>& cols,
                        size_t w, int tmode, std::vector<uint8_t>& out) {
     size_t n = cols[0]->size();
-    const int64_t *X = cols[0]->data(), *Y = cols[1]->data(), *Z = cols[2]->data();
+    // **ここで列を実体化してはいけない。**候補ごとに 3 列ぶんの場所を取ることに
+    // なり、並列に走る本数だけ積み上がる（200 万点・16 並列で 768 MB）。
+    // 幅つきの列をそのまま引く。探す窓は直近 w 点だけなので、引く回数は増えない。
+    const Col &X = *cols[0], &Y = *cols[1], &Z = *cols[2];
     Encoder e;
     UIntCoder uc(3 * NCTX, 64);
     UIntCoder ui(NCTX, 8);                     // 添字。文脈は直前の添字
@@ -584,7 +588,7 @@ struct ScanCtx {
     std::vector<int32_t> ord;        // 走査順 → 格納順
     // 時刻は元の列を ord 経由で引く。並べ替えた複製を持つと 400 万点で 32 MB
     // 余計に要る（値は同じなので、指す先を変えるだけ）。
-    const std::vector<int64_t>* gcol = nullptr;
+    const Col* gcol = nullptr;
     inline int64_t gps(int32_t t) const { return (*gcol)[ord[t]]; }
     std::vector<uint8_t> ret;        // 走査順の戻り番号（4 ビットしか使わない）
     std::vector<int32_t> swp;        // 掃引の先頭位置（末尾に n）
@@ -740,7 +744,7 @@ static void undelta_ip(std::vector<int64_t>& v) {
 
 
 // ---- 符号化: 走査線を当てはめ、副情報・標識・残差の 3 つを並べて書く
-static bool enc_geom_scan(const std::vector<const std::vector<int64_t>*>& cols,
+static bool enc_geom_scan(const std::vector<const Col*>& cols,
                           const std::vector<uint8_t>& param, std::vector<uint8_t>& out,
                           std::string& err, const CodecCtx* ctx) {
     if (cols.size() != 3) { err = "走査モデルは 3 軸"; return false; }
@@ -1230,7 +1234,7 @@ static bool dec_geom_scan(const std::vector<uint8_t>& param, const uint8_t* data
 }
 
 // param の 2 バイト目以降に入っている名前で、既に復号済みの列を引く
-static const std::vector<int64_t>* aux_col(const std::vector<uint8_t>& param, const CodecCtx* ctx) {
+static const Col* aux_col(const std::vector<uint8_t>& param, const CodecCtx* ctx) {
     if (!ctx || !ctx->fr || param.size() < 3) return nullptr;
     uint16_t l; memcpy(&l, param.data() + 1, 2);
     if (param.size() < 3u + l) return nullptr;
@@ -1247,7 +1251,7 @@ static thread_local std::vector<std::vector<int32_t>> g_res32;
 static void free_scratch64() { for (auto& v : g_res) std::vector<int64_t>().swap(v); }
 static void free_scratch32() { for (auto& v : g_res32) std::vector<int32_t>().swap(v); }
 
-bool codec_encode(uint16_t id, const std::vector<const std::vector<int64_t>*>& cols,
+bool codec_encode(uint16_t id, const std::vector<const Col*>& cols,
                   const std::vector<uint8_t>& param, std::vector<uint8_t>& out,
                   std::string& err, const CodecCtx* ctx) {
     if (cols.empty()) { err = "列がない"; return false; }
@@ -1258,7 +1262,9 @@ bool codec_encode(uint16_t id, const std::vector<const std::vector<int64_t>*>& c
         size_t nc = cols.size(), n = cols[0]->size();
         out.resize(nc * n * 8);
         uint8_t* p = out.data();
-        for (size_t c = 0; c < nc; ++c) { memcpy(p, cols[c]->data(), n * 8); p += n * 8; }
+        for (size_t c = 0; c < nc; ++c) {
+            for (size_t i = 0; i < n; ++i) { int64_t v = (*cols[c])[i]; memcpy(p, &v, 8); p += 8; }
+        }
         return true;
     }
     case C_RANGE:        enc_cols(cols, 0, out); return true;
@@ -1274,7 +1280,7 @@ bool codec_encode(uint16_t id, const std::vector<const std::vector<int64_t>*>& c
             size_t w = param.size() > 1 ? (size_t)param[1] : 16;
             enc_geom_w(cols, w ? w : 16, param.size() > 2 ? param[2] : 0, out);
         } else if (var == 2) {
-            const std::vector<int64_t>* a = aux_col(param, ctx);
+            const Col* a = aux_col(param, ctx);
             if (!a || a->size() < cols[0]->size()) { err = "補助列がない"; return false; }
             enc_geom_aux(cols, *a, out);
         } else if (var == 3) {
@@ -1290,7 +1296,7 @@ bool codec_encode(uint16_t id, const std::vector<const std::vector<int64_t>*>& c
         // 他の列との残差。その列が先に復号されていれば副情報は生じない。
         // PCC2 は列ごとに独立して符号化するので、周辺費用は加法的であり、
         // LASzip 経路で必要だった「抜いた容器を書いて測る」段は要らない。
-        const std::vector<int64_t>* a = aux_col(param, ctx);
+        const Col* a = aux_col(param, ctx);
         if (!a || a->size() < cols[0]->size()) { err = "参照列がない"; return false; }
         int P = param[0];
         size_t n = cols[0]->size();
@@ -1429,7 +1435,7 @@ bool codec_decode(uint16_t id, const std::vector<uint8_t>& param,
             size_t w = param.size() > 1 ? (size_t)param[1] : 16;
             dec_geom_w(data, len, n, w ? w : 16, param.size() > 2 ? param[2] : 0, out);
         } else if (var == 2) {
-            const std::vector<int64_t>* a = aux_col(param, ctx);
+            const Col* a = aux_col(param, ctx);
             if (!a || a->size() < n) { err = "補助列がない"; return false; }
             dec_geom_aux(data, len, n, ncol, *a, out);
         } else if (var == 3) {
@@ -1442,7 +1448,7 @@ bool codec_decode(uint16_t id, const std::vector<uint8_t>& param,
     case C_GEOM_SCAN:
         return dec_geom_scan(param, data, len, n, out, err, ctx);
     case C_ATTR_XREF: {
-        const std::vector<int64_t>* a = aux_col(param, ctx);
+        const Col* a = aux_col(param, ctx);
         if (!a || a->size() < n) { err = "参照列がない"; return false; }
         int P = param[0];
         // 配列は 1 本で足りる。残差 → 復元 → 参照列を足す、をその場で行う。
@@ -1518,8 +1524,7 @@ struct DiffCounter {
 }
 static thread_local DiffCounter g_dc;
 
-static double entropy_diff_sample(const std::vector<int64_t>& a,
-                                  const std::vector<int64_t>& b, size_t cap) {
+static double entropy_diff_sample(const Col& a, const Col& b, size_t cap) {
     size_t n = std::min({a.size(), b.size(), cap});
     if (!n) return 1e30;
     g_dc.reset();
@@ -1533,8 +1538,7 @@ static double entropy_diff_sample(const std::vector<int64_t>& a,
 // **差が乱雑でも空間的に滑らかなら短くなる。**AHN4 _20 の nir がそれで、
 // green は差の乱雑さでは 5 位（自分自身の乱雑さより悪い）なのに、
 // 空間予測を掛けると全点で 1 位になる（4.289 → 3.736 bpp、全列で −1.23%）。
-static double entropy_spatial_diff(const std::vector<int64_t>& a,
-                                   const std::vector<int64_t>& b,
+static double entropy_spatial_diff(const Col& a, const Col& b,
                                    const std::vector<int32_t>& perm,
                                    const std::vector<int32_t>& pred, int P,
                                    size_t n, size_t cap) {
@@ -1725,7 +1729,7 @@ static Pool* g_pool = nullptr;
 // ある時点の最短より長いものが後から勝つことはない。大きさだけ控えておく。
 // 同じ大きさのものは捨てない（選択は添字の早いほうを採るので、捨てると変わる）。
 static void encode_many(const std::vector<Cand>& cs,
-                        const std::vector<const std::vector<int64_t>*>& cv,
+                        const std::vector<const Col*>& cv,
                         const CodecCtx* ctx, std::vector<std::vector<uint8_t>>& blobs,
                         std::vector<std::string>& errs, std::vector<char>& ok,
                         bool abort_long, std::vector<size_t>* sizes = nullptr) {
@@ -1833,7 +1837,7 @@ Stream best_stream(const Frame& f, const std::vector<std::string>& cols,
     }();
     const bool par = preselect || PAR_ALL;
     if (PRE_ATTR) preselect = true;
-    std::vector<const std::vector<int64_t>*> cv;
+    std::vector<const Col*> cv;
     for (const auto& c : cols) cv.push_back(f.get(c));
     // 下位ビットを 1 記号で送る版も候補に出す。どちらが短いかは列で変わる
     // （全列では中央値が縮むが、TLS p1 の幾何のように伸びる列もある）。
@@ -1896,10 +1900,13 @@ Stream best_stream(const Frame& f, const std::vector<std::string>& cols,
     // 節約を上回った（全列の比が 14.6〜15.5 倍から 17 倍に伸びた）。入れない。
     if (preselect && PRE_SAMP && cands.size() > PRE_KEEP + 1 &&
         ncols_n > PRE_SAMP * 2) {
-        std::vector<std::vector<int64_t>> sub;
-        sub.reserve(cv.size());
-        for (auto* c : cv) sub.emplace_back(c->begin(), c->begin() + PRE_SAMP);
-        std::vector<const std::vector<int64_t>*> scv;
+        std::vector<Col> sub(cv.size());
+        for (size_t k = 0; k < cv.size(); ++k) {
+            std::vector<int64_t> t(PRE_SAMP);
+            for (size_t i = 0; i < PRE_SAMP; ++i) t[i] = (*cv[k])[i];
+            sub[k] = std::move(t);
+        }
+        std::vector<const Col*> scv;
         for (auto& v : sub) scv.push_back(&v);
         std::vector<std::vector<uint8_t>> sb; std::vector<std::string> se;
         std::vector<char> sok;
@@ -2324,8 +2331,7 @@ std::vector<Stream> plan_streams(const Frame& f, bool joint_geom, std::string* l
                     if (fs_ref.get(e)) escore[{c.name, e}] = 0.0;
             em.push_back(c.name);
         }
-        std::vector<std::pair<const std::vector<int64_t>*,
-                              std::pair<const std::vector<int64_t>*, double*>>> tk;
+        std::vector<std::pair<const Col*, std::pair<const Col*, double*>>> tk;
         for (auto& kv : escore)
             tk.push_back({fs_ref.get(kv.first.first),
                           {fs_ref.get(kv.first.second), &kv.second}});
@@ -2355,8 +2361,7 @@ std::vector<Stream> plan_streams(const Frame& f, bool joint_geom, std::string* l
             for (const auto& kv : escore)
                 if (f.get(kv.first.first) && f.get(kv.first.second))
                     escore_sp[kv.first] = 0.0;
-            std::vector<std::pair<const std::vector<int64_t>*,
-                                  std::pair<const std::vector<int64_t>*, double*>>> tk;
+            std::vector<std::pair<const Col*, std::pair<const Col*, double*>>> tk;
             for (auto& kv : escore_sp)
                 tk.push_back({f.get(kv.first.first), {f.get(kv.first.second), &kv.second}});
             auto one = [&](size_t i) {

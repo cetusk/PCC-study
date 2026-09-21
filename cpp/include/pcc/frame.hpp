@@ -4,6 +4,7 @@
 // 値はすべて int64 の列として持つ（浮動小数の列はビットパターンを入れる）。
 // 幾何も属性と同じく「列」であり、特別扱いは geom[3] の名前だけが持つ。
 #pragma once
+#include "pcc/col.hpp"
 #include <cstdint>
 #include <string>
 #include <vector>
@@ -43,7 +44,7 @@ struct Fidelity {
 struct Frame {
     uint64_t n = 0;
     std::vector<ColSpec> schema;                          // 出現順（＝取得順の列の並び）
-    std::map<std::string, std::vector<int64_t>> col;
+    std::map<std::string, Col> col;
     double scale[3] = {1, 1, 1}, offset[3] = {0, 0, 0};
     std::string geom[3] = {"X", "Y", "Z"};
     std::string geom_repr = "int";
@@ -57,7 +58,7 @@ struct Frame {
     std::vector<uint8_t> embed;
     std::string embed_kind;
 
-    const std::vector<int64_t>* get(const std::string& k) const {
+    const Col* get(const std::string& k) const {
         auto it = col.find(k); return it == col.end() ? nullptr : &it->second;
     }
     const ColSpec* spec(const std::string& k) const {

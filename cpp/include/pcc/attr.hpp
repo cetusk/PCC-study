@@ -1,5 +1,6 @@
 // 属性の空間予測 — 幾何から導いた順序で、既に復号済みの近傍から予測する。
 #pragma once
+#include "pcc/col.hpp"
 #include <cstdint>
 #include <vector>
 #include <string>
@@ -29,12 +30,12 @@ struct AttrResult {
 };
 
 // 符号化順に並べ替えて予測残差を作る / 残差から元の並びへ戻す
-void spatial_residual(const std::vector<int64_t>& v, const std::vector<int32_t>& perm,
+void spatial_residual(const Col& v, const std::vector<int32_t>& perm,
                       const std::vector<int32_t>& pred, int P, size_t n,
                       std::vector<int64_t>& out);
 // 残差を int32 で受ける版。値も残差も収まったときだけ真を返す。
 // 収まらなければ out には触れず、呼び手は 64 bit の版に落とす。
-bool spatial_residual32(const std::vector<int64_t>& v, const std::vector<int32_t>& perm,
+bool spatial_residual32(const Col& v, const std::vector<int32_t>& perm,
                         const std::vector<int32_t>& pred, int P, size_t n,
                         std::vector<int32_t>& out);
 // **符号化順に値が並んだ配列を、その場で残差に変える。**
