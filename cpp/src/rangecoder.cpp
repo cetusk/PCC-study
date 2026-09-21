@@ -1,3 +1,4 @@
+#include <cstdlib>
 #include "pcc/rangecoder.hpp"
 
 namespace pcc {
@@ -20,3 +21,7 @@ void decode_ints(const uint8_t* buf, size_t nbytes, int64_t* out, size_t n,
 }
 
 } // namespace pcc
+
+namespace pcc {
+thread_local int UIntCoder::FSYM = 0;
+}

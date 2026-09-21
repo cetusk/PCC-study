@@ -9,6 +9,7 @@
 #include <cstdint>
 #include <map>
 #include <mutex>
+#include <utility>
 #include <string>
 #include <vector>
 #include "pcc/frame.hpp"
@@ -28,6 +29,9 @@ inline constexpr uint16_t C_GEOM_SCAN   = 11;  // ALS の走査モデル経由�
 inline constexpr uint16_t C_ATTR_SPATIAL= 20;  // 幾何由来の順序で先行する近傍 P 個から予測
 inline constexpr uint16_t C_ATTR_COLOR  = 21;  // 3 列に可逆色変換を掛けてから同上
 inline constexpr uint16_t C_ATTR_XREF   = 22;  // 既に復号済みの別の列との残差を符号化
+// 符号器 id の最上位ビットを「下位ビットを 1 記号で送る」の旗に使う。
+// 流れに書かれるので復号側は迷わない。立っていなければ従来どおり。
+inline constexpr uint16_t C_FSYM_BIT     = 0x8000;
 
 // 符号器が使ってよい副次情報。幾何は属性より先に復号されるので、
 // 属性の符号化時には座標が揃っている（命題: 副情報の不要性）。
@@ -48,12 +52,15 @@ struct CodecCtx {
     // sp(P=1) / sp(P=3) / sp(P=5) …と何度も建て直すことになる
     // （AHN3 _20 の 14 列では 30 回を超えていた）。
     // P ごとに取っておく。表は n*P の int32 なので 100 万点・P=5 で 20 MB。
-    mutable std::vector<int32_t> perm;
-    mutable std::map<int, std::vector<int32_t>> pred_by_p;
-    mutable size_t built_n = 0;   // 標本と全点で表を取り違えないため
+    // 点数でも分けて持つ。標本（版を選ぶための 2.5 万点）と全点が交互に来るので、
+    // 片方しか持たないと毎回作り直しになる（実測で全体が 2 倍になった）。
+    mutable std::map<size_t, std::vector<int32_t>> perm_by_n;
+    mutable std::map<std::pair<size_t, int>, std::vector<int32_t>> pred_by_np;
     mutable std::mutex mu;        // 候補を並列に符号化するときのため
     // 順序表と、P に対応する予測子表を返す。作っていなければ作る。
-    const std::vector<int32_t>* ensure(size_t n, int P) const;
+    // 予測子表を返し、perm_out に順序表を入れる（どちらも点数ごとに持つ）。
+    const std::vector<int32_t>* ensure(size_t n, int P,
+                                       const std::vector<int32_t>** perm_out) const;
     const std::vector<double>* world_ptr() const; // 無ければ作る
     // 報告する構成を往復検証に通すための指定。空なら通常どおり全候補を実測して選ぶ。
     std::string force_geom;                       // X+Y+Z をこの候補名に固定する

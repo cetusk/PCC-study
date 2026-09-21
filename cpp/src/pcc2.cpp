@@ -449,27 +449,29 @@ const std::vector<double>* CodecCtx::world_ptr() const {
     return world_own.empty() ? nullptr : &world_own;
 }
 
-const std::vector<int32_t>* CodecCtx::ensure(size_t n, int P) const {
+const std::vector<int32_t>* CodecCtx::ensure(size_t n, int P,
+                                             const std::vector<int32_t>** perm_out) const {
     std::lock_guard<std::mutex> lk(mu);
     const std::vector<double>* w = world_ptr();
     if (!w || w->size() < n * 3) return nullptr;
     // 点数が変わったら作り直す。標本で順位を付けるときに同じ P で呼ばれると、
     // 標本ぶんの表を全点の符号化に使ってしまう。
-    if (built_n != n) { perm.clear(); pred_by_p.clear(); built_n = n; }
-    if (perm.empty()) perm = coding_order(*w, n, "morton");
-    auto it = pred_by_p.find(P);
-    if (it == pred_by_p.end()) {
+    auto pit = perm_by_n.find(n);
+    if (pit == perm_by_n.end())
+        pit = perm_by_n.emplace(n, coding_order(*w, n, "morton")).first;
+    auto it = pred_by_np.find({n, P});
+    if (it == pred_by_np.end()) {
         // 候補が使う P はいつも 1 / 3 / 5 なので、最初の 1 回でまとめて作る。
         // 近傍探索も KdTree の構築も 1 回で済む（P ごとだと 3 回になる）。
-        std::vector<int> Ps;
-        if (pred_by_p.empty()) { Ps = {1, 3, 5}; }
+        std::vector<int> Ps{1, 3, 5};
         if (std::find(Ps.begin(), Ps.end(), P) == Ps.end()) Ps.push_back(P);
         std::vector<std::vector<int32_t>> pds;
-        build_causal_predictors_multi(*w, n, perm, Ps, pds);
+        build_causal_predictors_multi(*w, n, pit->second, Ps, pds);
         for (size_t a = 0; a < Ps.size(); ++a)
-            pred_by_p.emplace(Ps[a], std::move(pds[a]));
-        it = pred_by_p.find(P);
+            pred_by_np.emplace(std::make_pair(n, Ps[a]), std::move(pds[a]));
+        it = pred_by_np.find({n, P});
     }
+    if (perm_out) *perm_out = &pit->second;
     return &it->second;
 }
 
@@ -1192,6 +1194,8 @@ bool codec_encode(uint16_t id, const std::vector<const std::vector<int64_t>*>& c
                   const std::vector<uint8_t>& param, std::vector<uint8_t>& out,
                   std::string& err, const CodecCtx* ctx) {
     if (cols.empty()) { err = "列がない"; return false; }
+    UIntCoder::FSYM = (id & C_FSYM_BIT) ? 1 : 0;
+    id = (uint16_t)(id & ~C_FSYM_BIT);
     switch (id) {
     case C_RAW64: {
         size_t nc = cols.size(), n = cols[0]->size();
@@ -1239,10 +1243,11 @@ bool codec_encode(uint16_t id, const std::vector<const std::vector<int64_t>*>& c
             int64_t prev = 0;
             for (size_t i = 0; i < n; ++i) { int64_t v = d[0][i]; d[0][i] = v - prev; prev = v; }
         } else if (P > 0) {
-            const std::vector<int32_t>* pdt = ctx->ensure(n, P);
+            const std::vector<int32_t>* pm = nullptr;
+            const std::vector<int32_t>* pdt = ctx->ensure(n, P, &pm);
             if (!pdt) { err = "座標がない"; return false; }
             std::vector<int64_t> r;
-            spatial_residual(d[0], ctx->perm, *pdt, P, n, r);
+            spatial_residual(d[0], *pm, *pdt, P, n, r);
             d[0] = std::move(r);
         }
         enc_resid(d, out);
@@ -1253,7 +1258,8 @@ bool codec_encode(uint16_t id, const std::vector<const std::vector<int64_t>*>& c
         if (!ctx || param.empty()) { err = "空間予測に必要な副次情報がない"; return false; }
         int P = param[0];
         size_t n = cols[0]->size();
-        const std::vector<int32_t>* pdt = ctx->ensure(n, P);
+        const std::vector<int32_t>* pm = nullptr;
+            const std::vector<int32_t>* pdt = ctx->ensure(n, P, &pm);
             if (!pdt) { err = "座標がない"; return false; }
         std::vector<std::vector<int64_t>> src;
         if (id == C_ATTR_COLOR) {
@@ -1267,7 +1273,7 @@ bool codec_encode(uint16_t id, const std::vector<const std::vector<int64_t>*>& c
         }
         std::vector<std::vector<int64_t>> res(src.size());
         for (size_t c = 0; c < src.size(); ++c)
-            spatial_residual(src[c], ctx->perm, *pdt, P, n, res[c]);
+            spatial_residual(src[c], *pm, *pdt, P, n, res[c]);
         enc_resid(res, out);
         return true;
     }
@@ -1280,6 +1286,8 @@ bool codec_decode(uint16_t id, const std::vector<uint8_t>& param,
                   const uint8_t* data, size_t len, size_t n, size_t ncol,
                   std::vector<std::vector<int64_t>>& out, std::string& err,
                   const CodecCtx* ctx) {
+    UIntCoder::FSYM = (id & C_FSYM_BIT) ? 1 : 0;
+    id = (uint16_t)(id & ~C_FSYM_BIT);
     switch (id) {
     case C_RAW64: {
         if (len != ncol * n * 8) { err = "RAW64 の長さが合わない"; return false; }
@@ -1323,10 +1331,11 @@ bool codec_decode(uint16_t id, const std::vector<uint8_t>& param,
             int64_t acc = 0;
             for (size_t i = 0; i < n; ++i) { acc += d[0][i]; d[0][i] = acc; }
         } else if (P > 0) {
-            const std::vector<int32_t>* pdt = ctx->ensure(n, P);
+            const std::vector<int32_t>* pm = nullptr;
+            const std::vector<int32_t>* pdt = ctx->ensure(n, P, &pm);
             if (!pdt) { err = "座標がない"; return false; }
             std::vector<int64_t> r;
-            spatial_restore(d[0], ctx->perm, *pdt, P, n, r);
+            spatial_restore(d[0], *pm, *pdt, P, n, r);
             d[0] = std::move(r);
         }
         out.assign(1, std::vector<int64_t>(n));
@@ -1337,13 +1346,14 @@ bool codec_decode(uint16_t id, const std::vector<uint8_t>& param,
     case C_ATTR_COLOR: {
         if (!ctx || param.empty()) { err = "空間予測に必要な副次情報がない"; return false; }
         int P = param[0];
-        const std::vector<int32_t>* pdt = ctx->ensure(n, P);
+        const std::vector<int32_t>* pm = nullptr;
+            const std::vector<int32_t>* pdt = ctx->ensure(n, P, &pm);
             if (!pdt) { err = "座標がない"; return false; }
         std::vector<std::vector<int64_t>> res;
         dec_resid(data, len, n, ncol, res);
         std::vector<std::vector<int64_t>> src(ncol);
         for (size_t c = 0; c < ncol; ++c)
-            spatial_restore(res[c], ctx->perm, *pdt, P, n, src[c]);
+            spatial_restore(res[c], *pm, *pdt, P, n, src[c]);
         if (id == C_ATTR_COLOR) {
             if (ncol != 3) { err = "色は 3 列でなければならない"; return false; }
             out.assign(3, std::vector<int64_t>(n));
@@ -1373,6 +1383,11 @@ static double entropy_diff_sample(const std::vector<int64_t>& a,
 }
 
 std::string cand_name(uint16_t c, const std::vector<uint8_t>& p) {
+    if (c & C_FSYM_BIT) {
+        static std::string s2;
+        s2 = cand_name((uint16_t)(c & ~C_FSYM_BIT), p) + "記";
+        return s2;
+    }
     char b[32];
     switch (c) {
     case C_RAW64: return "raw64";
@@ -1507,6 +1522,23 @@ Stream best_stream(const Frame& f, const std::vector<std::string>& cols,
     if (PRE_ATTR) preselect = true;
     std::vector<const std::vector<int64_t>*> cv;
     for (const auto& c : cols) cv.push_back(f.get(c));
+    // 下位ビットを 1 記号で送る版も候補に出す。どちらが短いかは列で変わる
+    // （全列では中央値が縮むが、TLS p1 の幾何のように伸びる列もある）。
+    // 流れに書かれる旗なので、選択原理に選ばせれば悪化はしない。
+    static const bool FSYM_CAND = [] {
+        const char* e = getenv("PCC_FSYM_CAND");
+        return !e || e[0] != '0';
+    }();
+    std::vector<Cand> cand2;
+    if (FSYM_CAND) {
+        cand2.reserve(candidates.size() * 2);
+        for (const auto& c : candidates) {
+            cand2.push_back(c);
+            if (c.codec != C_RAW64)
+                cand2.push_back({(uint16_t)(c.codec | C_FSYM_BIT), c.param});
+        }
+    }
+    const std::vector<Cand>& cands = FSYM_CAND ? cand2 : candidates;
     // 候補が多いときは、まず先頭の標本で順位を付け、上位だけを全点で測る。
     // 全候補を全点で符号化すると、幾何だけで十数候補 × 全点になる。
     // 標本の 1 位が全点でも 1 位とは限らないので上位 3 つを残す。
@@ -1534,8 +1566,10 @@ Stream best_stream(const Frame& f, const std::vector<std::string>& cols,
         if (PRE_SAMP < 20000) PRE_SAMP = 20000;
         if (PRE_SAMP > 25000) PRE_SAMP = 25000;
     }
-    std::vector<Cand> use = candidates;
-    if (preselect && PRE_SAMP && candidates.size() > PRE_KEEP + 1 &&
+    std::vector<Cand> use = cands;
+    // 属性でも「どちらの版か」だけを標本で決める案を試したが、標本パスの費用が
+    // 節約を上回った（全列の比が 14.6〜15.5 倍から 17 倍に伸びた）。入れない。
+    if (preselect && PRE_SAMP && cands.size() > PRE_KEEP + 1 &&
         ncols_n > PRE_SAMP * 2) {
         std::vector<std::vector<int64_t>> sub;
         sub.reserve(cv.size());
@@ -1545,17 +1579,17 @@ Stream best_stream(const Frame& f, const std::vector<std::string>& cols,
         std::vector<std::vector<uint8_t>> sb; std::vector<std::string> se;
         std::vector<char> sok;
         if (par) {
-            encode_many(candidates, scv, ctx, sb, se, sok, false);
+            encode_many(cands, scv, ctx, sb, se, sok, false);
         } else {
-            sb.assign(candidates.size(), {}); se.assign(candidates.size(), std::string());
-            sok.assign(candidates.size(), 0);
-            for (size_t t = 0; t < candidates.size(); ++t)
-                sok[t] = codec_encode(candidates[t].codec, scv, candidates[t].param,
+            sb.assign(cands.size(), {}); se.assign(cands.size(), std::string());
+            sok.assign(cands.size(), 0);
+            for (size_t t = 0; t < cands.size(); ++t)
+                sok[t] = codec_encode(cands[t].codec, scv, cands[t].param,
                                       sb[t], se[t], ctx) ? 1 : 0;
         }
         std::vector<std::pair<size_t, Cand>> pre;
-        for (size_t t = 0; t < candidates.size(); ++t)
-            if (sok[t]) pre.push_back({sb[t].size(), candidates[t]});
+        for (size_t t = 0; t < cands.size(); ++t)
+            if (sok[t]) pre.push_back({sb[t].size(), cands[t]});
         if (pre.size() > PRE_KEEP) {
             std::sort(pre.begin(), pre.end(),
                       [](const auto& a, const auto& b) { return a.first < b.first; });
@@ -1677,7 +1711,7 @@ std::vector<Stream> plan_streams(const Frame& f, bool joint_geom, std::string* l
     // 間に裏で作っておけば隠れる。表の中身は変わらないので出力は同じ。
     std::thread warm;
     if (ctx && (ctx->world || ctx->want_world))
-        warm = std::thread([ctx, &f] { ctx->ensure(f.n, 1); });
+        warm = std::thread([ctx, &f] { ctx->ensure(f.n, 1, nullptr); });
     struct Joiner {
         std::thread& t;
         ~Joiner() { if (t.joinable()) t.join(); }
