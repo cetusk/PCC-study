@@ -144,10 +144,15 @@ static inline int64_t predict(const std::vector<int64_t>& w,
     return s >= 0 ? (s + c / 2) / c : -((-s + c / 2) / c);
 }
 
+// 符号化順に並べ替えた値を置く作業領域。1 列につき候補が 6〜10 本あり、
+// 候補ごとに 100 万点で 8 MB を確保して捨てていた。スレッドごとに使い回す。
+static thread_local std::vector<int64_t> g_w;
+
 void spatial_residual(const std::vector<int64_t>& v, const std::vector<int32_t>& perm,
                       const std::vector<int32_t>& pred, int P, size_t n,
                       std::vector<int64_t>& out) {
-    std::vector<int64_t> w(n);
+    g_w.resize(n);
+    std::vector<int64_t>& w = g_w;
     for (size_t t = 0; t < n; ++t) w[t] = v[perm[t]];
     out.resize(n);
     for (size_t t = 0; t < n; ++t) out[t] = w[t] - predict(w, pred, P, t);
@@ -156,7 +161,8 @@ void spatial_residual(const std::vector<int64_t>& v, const std::vector<int32_t>&
 void spatial_restore(const std::vector<int64_t>& res, const std::vector<int32_t>& perm,
                      const std::vector<int32_t>& pred, int P, size_t n,
                      std::vector<int64_t>& out) {
-    std::vector<int64_t> w(n);
+    g_w.resize(n);
+    std::vector<int64_t>& w = g_w;
     for (size_t t = 0; t < n; ++t) w[t] = res[t] + predict(w, pred, P, t);
     out.resize(n);
     for (size_t t = 0; t < n; ++t) out[perm[t]] = w[t];
