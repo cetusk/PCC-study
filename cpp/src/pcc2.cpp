@@ -1399,6 +1399,30 @@ static double entropy_diff_sample(const std::vector<int64_t>& a,
     return e;
 }
 
+// 差にさらに空間予測を掛けたあとの乱雑さ。参照の順位付けに使う。
+//
+// 上の見積りは「差そのものの乱雑さ」を見ているが、候補は差に空間予測を掛ける。
+// **差が乱雑でも空間的に滑らかなら短くなる。**AHN4 _20 の nir がそれで、
+// green は差の乱雑さでは 5 位（自分自身の乱雑さより悪い）なのに、
+// 空間予測を掛けると全点で 1 位になる（4.289 → 3.736 bpp、全列で −1.23%）。
+static double entropy_spatial_diff(const std::vector<int64_t>& a,
+                                   const std::vector<int64_t>& b,
+                                   const std::vector<int32_t>& perm,
+                                   const std::vector<int32_t>& pred, int P,
+                                   size_t n, size_t cap) {
+    if (!n || a.size() < n || b.size() < n) return 1e30;
+    std::vector<int64_t> d(n);
+    for (size_t i = 0; i < n; ++i) d[i] = a[i] - b[i];
+    std::vector<int64_t> r;
+    spatial_residual(d, perm, pred, P, n, r);
+    size_t m = std::min(n, cap);
+    std::map<int64_t, uint32_t> h;
+    for (size_t i = 0; i < m; ++i) ++h[r[i]];
+    double e = 0;
+    for (const auto& kv : h) { double q = (double)kv.second / m; e -= q * std::log2(q); }
+    return e;
+}
+
 std::string cand_name(uint16_t c, const std::vector<uint8_t>& p) {
     if (c & C_FSYM_BIT) {
         static std::string s2;
@@ -2123,6 +2147,35 @@ std::vector<Stream> plan_streams(const Frame& f, bool joint_geom, std::string* l
         }
     }
 
+    // 空間予測を掛けたあとの乱雑さでも順位を付ける。差そのものの順位とは別物で、
+    // AHN4 _20 の nir は green が差では 5 位、空間予測の後では上位に来る。
+    // 座標が要るので、幾何が揃っているときだけ。
+    std::map<std::pair<std::string, std::string>, double> escore_sp;
+    if (ctx && (ctx->world || ctx->want_world)) {
+        const std::vector<int32_t>* pm = nullptr;
+        const std::vector<int32_t>* pdt = ctx->ensure(f.n, 3, &pm);
+        if (pdt && pm) {
+            for (const auto& kv : escore)
+                if (f.get(kv.first.first) && f.get(kv.first.second))
+                    escore_sp[kv.first] = 0.0;
+            std::vector<std::pair<const std::vector<int64_t>*,
+                                  std::pair<const std::vector<int64_t>*, double*>>> tk;
+            for (auto& kv : escore_sp)
+                tk.push_back({f.get(kv.first.first), {f.get(kv.first.second), &kv.second}});
+            auto one = [&](size_t i) {
+                *tk[i].second.second = entropy_spatial_diff(
+                    *tk[i].first, *tk[i].second.first, *pm, *pdt, 3, f.n, 250000);
+            };
+            if (pool && tk.size() > 1) {
+                std::atomic<size_t> left{0};
+                for (size_t i = 0; i < tk.size(); ++i) pool->add([&one, i] { one(i); }, left);
+                pool->help_until(left);
+            } else {
+                for (size_t i = 0; i < tk.size(); ++i) one(i);
+            }
+        }
+    }
+
     std::vector<std::string> emitted = pre_done;              // 既に出した列（参照に使える）
     for (const auto& c : f.schema) {
         if (skip_col(c)) continue;
@@ -2138,18 +2191,49 @@ std::vector<Stream> plan_streams(const Frame& f, bool joint_geom, std::string* l
                 if (it != escore.end()) sc.push_back({it->second, e});
             }
             std::sort(sc.begin(), sc.end());
+            std::vector<std::pair<double, std::string>> sp;
+            for (const auto& e : emitted) {
+                auto it = escore_sp.find({c.name, e});
+                if (it != escore_sp.end()) sp.push_back({it->second, e});
+            }
+            std::sort(sp.begin(), sp.end());
+            if (getenv("PCC_EPROF")) {
+                auto dump = [&](const char* tag,
+                                const std::vector<std::pair<double, std::string>>& z) {
+                    std::string m = std::string("  [参照の見積り ") + tag + "] " + c.name + ":";
+                    for (const auto& q : z) {
+                        char b[96];
+                        snprintf(b, sizeof b, " %s=%.3f", q.second.c_str(), q.first);
+                        m += b;
+                    }
+                    fprintf(stderr, "%s\n", m.c_str());
+                };
+                dump("差", sc);
+                dump("空間", sp);
+            }
             // 参照の相手を何本まで候補にするか。既定は 2 本。
+            // **2 つの見積りは別のものを測っているので、それぞれの上位を採る。**
             // 絞りが何を犠牲にしているかは PCC_XREF_KEEP を大きくして測れる。
             static const size_t XKEEP = [] {
                 const char* e = getenv("PCC_XREF_KEEP");
                 return e ? (size_t)atol(e) : (size_t)2;
             }();
-            for (size_t i = 0; i < sc.size() && i < XKEEP; ++i) {
-                uint16_t l = (uint16_t)sc[i].second.size();
+            std::vector<std::string> refs;
+            auto take = [&](const std::vector<std::pair<double, std::string>>& z) {
+                for (size_t i = 0; i < z.size() && i < XKEEP; ++i) {
+                    bool dup = false;
+                    for (const auto& r : refs) if (r == z[i].second) dup = true;
+                    if (!dup) refs.push_back(z[i].second);
+                }
+            };
+            take(sc);
+            take(sp);
+            for (const auto& ref : refs) {
+                uint16_t l = (uint16_t)ref.size();
                 for (uint8_t P : {0, 100, 1, 3, 5}) {
                     std::vector<uint8_t> pv{P};
                     pv.insert(pv.end(), (uint8_t*)&l, (uint8_t*)&l + 2);
-                    pv.insert(pv.end(), sc[i].second.begin(), sc[i].second.end());
+                    pv.insert(pv.end(), ref.begin(), ref.end());
                     cs.push_back({C_ATTR_XREF, pv});
                 }
             }
