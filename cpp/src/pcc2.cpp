@@ -123,6 +123,73 @@ static void enc_cols(const std::vector<const std::vector<int64_t>*>& cols, int m
     out = e.finish();
 }
 
+// 差分の値が繰り返す列に効く。gps_time の差分は値の種類が少ないのに桁が大きく、
+// bit 長を送る方式では同じ値が何度出ても毎回その桁ぶん払う。直近 K 個の相異なる
+// 差分を表に持ち、当たれば添字だけを送る。外れたら逃げ道として従来どおり送る。
+// 表は移動前置（当たった値を先頭へ）で更新するので副情報は要らない。
+inline constexpr int DCACHE = 64;
+
+static void enc_cols_cache(const std::vector<const std::vector<int64_t>*>& cols,
+                           std::vector<uint8_t>& out) {
+    size_t nc = cols.size(), n = nc ? cols[0]->size() : 0;
+    Encoder e;
+    UIntCoder ui((int)nc, 16);                 // 添字（0..DCACHE、DCACHE は逃げ道）
+    UIntCoder uc((int)nc * NCTX, 64);
+    std::vector<std::vector<int64_t>> cache(nc);
+    std::vector<int64_t> prev(nc, 0);
+    std::vector<int> ctx(nc, 0);
+    for (size_t i = 0; i < n; ++i)
+        for (size_t c = 0; c < nc; ++c) {
+            int64_t x = (*cols[c])[i], d = x - prev[c];
+            prev[c] = x;
+            auto& ca = cache[c];
+            int pos = DCACHE;
+            for (size_t t = 0; t < ca.size(); ++t)
+                if (ca[t] == d) { pos = (int)t; break; }
+            ui.encode(e, (uint64_t)pos, (int)c);
+            if (pos == DCACHE) {
+                uint64_t z = zigzag(d);
+                uc.encode(e, z, (int)c * NCTX + ctx[c]);
+                ctx[c] = ctx_of(z);
+                if ((int)ca.size() == DCACHE) ca.pop_back();
+            } else {
+                ca.erase(ca.begin() + pos);
+            }
+            ca.insert(ca.begin(), d);
+        }
+    out = e.finish();
+}
+
+static void dec_cols_cache(const uint8_t* data, size_t len, size_t n, size_t nc,
+                           std::vector<std::vector<int64_t>>& out) {
+    out.assign(nc, std::vector<int64_t>(n));
+    Decoder dd(data, len);
+    UIntCoder ui((int)nc, 16);
+    UIntCoder uc((int)nc * NCTX, 64);
+    std::vector<std::vector<int64_t>> cache(nc);
+    std::vector<int64_t> prev(nc, 0);
+    std::vector<int> ctx(nc, 0);
+    for (size_t i = 0; i < n; ++i)
+        for (size_t c = 0; c < nc; ++c) {
+            auto& ca = cache[c];
+            int pos = (int)ui.decode(dd, (int)c);
+            int64_t d;
+            if (pos == DCACHE) {
+                uint64_t z = uc.decode(dd, (int)c * NCTX + ctx[c]);
+                d = unzigzag(z);
+                ctx[c] = ctx_of(z);
+                if ((int)ca.size() == DCACHE) ca.pop_back();
+            } else {
+                d = ca[pos];
+                ca.erase(ca.begin() + pos);
+            }
+            ca.insert(ca.begin(), d);
+            int64_t x = prev[c] + d;
+            out[c][i] = x;
+            prev[c] = x;
+        }
+}
+
 // 幾何 v1: LASzip と同じ考え方で、直近 3 つの差分の中央値を次の差分の予測に使う。
 // 走査線に沿った逐次予測であり、取得順が最も得意な入力になる。
 // 文脈は直前の残差のビット数（大きさごとに別の確率モデルを持つ）。
@@ -1033,6 +1100,7 @@ bool codec_encode(uint16_t id, const std::vector<const std::vector<int64_t>*>& c
     case C_RANGE_CTX:    enc_cols(cols, 2, out); return true;
     case C_RANGE_CTX2:   enc_cols(cols, 3, out); return true;
     case C_RANGE_MED:    enc_geom_med(cols, out); return true;
+    case C_RANGE_CACHE:  enc_cols_cache(cols, out); return true;
     case C_GEOM_XYZ: {
         int var = param.empty() ? 0 : param[0];
         if (var == 4) {
@@ -1118,6 +1186,7 @@ bool codec_decode(uint16_t id, const std::vector<uint8_t>& param,
     case C_RANGE_CTX:    dec_cols(data, len, n, ncol, 2, out); return true;
     case C_RANGE_CTX2:   dec_cols(data, len, n, ncol, 3, out); return true;
     case C_RANGE_MED:    dec_geom_med(data, len, n, ncol, out); return true;
+    case C_RANGE_CACHE:  dec_cols_cache(data, len, n, ncol, out); return true;
     case C_GEOM_XYZ: {
         int var = param.empty() ? 0 : param[0];
         if (var == 4) {
@@ -1203,6 +1272,7 @@ std::string cand_name(uint16_t c, const std::vector<uint8_t>& p) {
     case C_RANGE_CTX: return "ctx";
     case C_RANGE_CTX2: return "ctx2";
     case C_RANGE_MED: return "med3";
+    case C_RANGE_CACHE: return "差分表";
     case C_GEOM_SCAN: {
         static char b2[16];
         int v = p.empty() ? 1 : p[0];
@@ -1370,7 +1440,8 @@ std::vector<Stream> plan_streams(const Frame& f, bool joint_geom, std::string* l
                                  const CodecCtx* ctx, bool trace_all) {
     std::vector<Stream> out;
     std::vector<Cand> cand{{C_RAW64, {}}, {C_RANGE, {}}, {C_RANGE_DELTA, {}},
-                           {C_RANGE_CTX, {}}, {C_RANGE_CTX2, {}}, {C_RANGE_MED, {}}};
+                           {C_RANGE_CTX, {}}, {C_RANGE_CTX2, {}}, {C_RANGE_MED, {}},
+                           {C_RANGE_CACHE, {}}};
     // 幾何が揃っていれば、空間予測の候補（予測子 1 / 3 / 5 個）も加える
     std::vector<Cand> cand_attr = cand;
     if (ctx && (ctx->world || ctx->want_world))

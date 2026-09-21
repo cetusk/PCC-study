@@ -152,6 +152,14 @@ def main() -> None:
         print(f"    {c:<7} 対 G-PCC 中央値 {100*(np.median(v)-1):+6.1f}%"
               f"  ばらつき（四分位幅）{100*(np.percentile(v,75)-np.percentile(v,25)):5.1f}%点"
               f"  符号化 中央値 {np.median(t):.2f}s")
+    # 速度は「ファイルごとの比」で見る。中央値どうしの割り算は、小さい入力が
+    # 表示の分解能より下に沈むぶんだけ楽な値になる。
+    rr = np.array([r["PCC2"][1] / r["LAZ"][1] for r in res
+                   if r["LAZ"][1] > 0 and r["PCC2"][1] > 0])
+    nres = sum(1 for r in res if r["PCC2"][1] <= 0)
+    print(f"    PCC2/LAZ の比（{len(rr)} 件、pccnorm の表示が 0.00s の {nres} 件は除く）"
+          f"  中央値 {np.median(rr):.1f}x  四分位 [{np.percentile(rr,25):.1f}, "
+          f"{np.percentile(rr,75):.1f}]  幅 {rr.min():.1f}〜{rr.max():.1f}")
     Path("data/work").mkdir(parents=True, exist_ok=True)
     Path("data/work/bench_size.json").write_text(json.dumps(
         {r["lab"]: {c: r[c][0] for c in CODERS} for r in res}, indent=1))
