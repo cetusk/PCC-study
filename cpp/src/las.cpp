@@ -138,28 +138,59 @@ bool read_las(const std::string& path, PointCloud& pc, std::string& err,
             parse_extra_vlr(v.data, v.record_length_after_header, pc.extra);
     }
 
-    // 取り出すフィールドを決める
-    auto add = [&](const std::string& nm, FType t, bool ex) {
+    // 取り出すフィールドを決める。
+    //
+    // 以前は全フィールドを resize(n) で確保していたので、定数の列（幾何だけの
+    // PF6 では大半がそう）にも 8n バイトを払っていた。400 万点で 265 MB。
+    // 代わりに「値が変わるまで確保しない」形にする。最初の値と違う値が来た
+    // 時点で確保し、それまでを最初の値で埋める。
+    // あわせて、点ごとの pc.fields["名前"] という map 検索もやめる
+    // （400 万点 × 10 列で 4000 万回の文字列比較になっていた）。
+    struct Lazy {
+        std::vector<int64_t>* v = nullptr;   // 実体（確保されるまで nullptr）
+        int64_t first = 0;
+        bool started = false, varied = false;
+        size_t n = 0;
+        inline void put(size_t i, int64_t val) {
+            if (!started) { first = val; started = true; return; }
+            if (!varied) {
+                if (val == first) return;
+                varied = true;
+                v->assign(n, first);
+            }
+            (*v)[i] = val;
+        }
+        void finish() {
+            if (!varied) { v->clear(); v->shrink_to_fit(); }
+        }
+    };
+    std::vector<Lazy> lz_f;
+    auto add = [&](const std::string& nm, FType t, bool ex) -> size_t {
         pc.order.push_back(nm);
-        Field f; f.ftype = t; f.is_extra = ex; f.v.resize(n);
+        Field f; f.ftype = t; f.is_extra = ex;
         pc.fields[nm] = std::move(f);
+        Lazy L; L.v = &pc.fields[nm].v; L.n = n;
+        lz_f.push_back(L);
+        return lz_f.size() - 1;
     };
     bool has_gps = (pc.point_format == 1 || pc.point_format >= 3);
     bool has_rgb = (pc.point_format == 2 || pc.point_format == 3 ||
                     pc.point_format == 5 || pc.point_format == 7 ||
                     pc.point_format == 8 || pc.point_format == 10);
     bool has_nir = (pc.point_format == 8 || pc.point_format == 10);
-    add("intensity", FType::U16, false);
-    add("bit_fields", FType::U8, false);
-    add("classification", FType::U8, false);
-    add("user_data", FType::U8, false);
-    add("scan_angle", FType::I16, false);
-    add("point_source_id", FType::U16, false);
-    if (has_gps) add("gps_time", FType::F64, false);
-    if (has_rgb) { add("red", FType::U16, false); add("green", FType::U16, false);
-                   add("blue", FType::U16, false); }
-    if (has_nir) add("nir", FType::U16, false);
-    for (const auto& e : pc.extra) add(e.name, e.type, true);
+    const size_t I_INT = add("intensity", FType::U16, false);
+    const size_t I_BF  = add("bit_fields", FType::U8, false);
+    const size_t I_CLS = add("classification", FType::U8, false);
+    const size_t I_UD  = add("user_data", FType::U8, false);
+    const size_t I_SA  = add("scan_angle", FType::I16, false);
+    const size_t I_PSI = add("point_source_id", FType::U16, false);
+    size_t I_GPS = 0, I_R = 0, I_G = 0, I_B = 0, I_NIR = 0;
+    if (has_gps) I_GPS = add("gps_time", FType::F64, false);
+    if (has_rgb) { I_R = add("red", FType::U16, false); I_G = add("green", FType::U16, false);
+                   I_B = add("blue", FType::U16, false); }
+    if (has_nir) I_NIR = add("nir", FType::U16, false);
+    std::vector<size_t> I_EX;
+    for (const auto& e : pc.extra) I_EX.push_back(add(e.name, e.type, true));
 
     pc.X.resize(n); pc.Y.resize(n); pc.Z.resize(n);
     laszip_point* p = nullptr;
@@ -167,25 +198,41 @@ bool read_las(const std::string& path, PointCloud& pc, std::string& err,
     for (size_t i = 0; i < n; ++i) {
         LZ_CHECK(laszip_read_point(lz), "read_point");
         pc.X[i] = p->X; pc.Y[i] = p->Y; pc.Z[i] = p->Z;
-        pc.fields["intensity"].v[i] = p->intensity;
+        lz_f[I_INT].put(i, p->intensity);
         // 戻り番号など詰め込みビットは 1 つにまとめて扱う
         uint8_t bf = (uint8_t)(p->extended_return_number |
                                (p->extended_number_of_returns << 4));
-        pc.fields["bit_fields"].v[i] = bf;
-        pc.fields["classification"].v[i] =
-            p->extended_classification ? p->extended_classification : p->classification;
-        pc.fields["user_data"].v[i] = p->user_data;
-        pc.fields["scan_angle"].v[i] = p->extended_scan_angle;
-        pc.fields["point_source_id"].v[i] = p->point_source_ID;
+        lz_f[I_BF].put(i, bf);
+        lz_f[I_CLS].put(i, p->extended_classification ? p->extended_classification
+                                                      : p->classification);
+        lz_f[I_UD].put(i, p->user_data);
+        lz_f[I_SA].put(i, p->extended_scan_angle);
+        lz_f[I_PSI].put(i, p->point_source_ID);
         if (has_gps) { uint64_t b; memcpy(&b, &p->gps_time, 8);
-                       pc.fields["gps_time"].v[i] = (int64_t)b; }
-        if (has_rgb) { pc.fields["red"].v[i] = p->rgb[0];
-                       pc.fields["green"].v[i] = p->rgb[1];
-                       pc.fields["blue"].v[i] = p->rgb[2]; }
-        if (has_nir) pc.fields["nir"].v[i] = p->rgb[3];
-        for (const auto& e : pc.extra)
+                       lz_f[I_GPS].put(i, (int64_t)b); }
+        if (has_rgb) { lz_f[I_R].put(i, p->rgb[0]);
+                       lz_f[I_G].put(i, p->rgb[1]);
+                       lz_f[I_B].put(i, p->rgb[2]); }
+        if (has_nir) lz_f[I_NIR].put(i, p->rgb[3]);
+        for (size_t k = 0; k < pc.extra.size(); ++k) {
+            const auto& e = pc.extra[k];
             if (p->num_extra_bytes >= e.byte_offset + ftype_size(e.type))
-                pc.fields[e.name].v[i] = read_raw(p->extra_bytes + e.byte_offset, e.type);
+                lz_f[I_EX[k]].put(i, read_raw(p->extra_bytes + e.byte_offset, e.type));
+        }
+    }
+    // 定数のままだった列は実体を持たせない。値だけを覚えておく。
+    {
+        size_t k = 0;
+        for (const auto& nm : pc.order) {
+            Field& fl = pc.fields[nm];
+            if (k < lz_f.size() && !lz_f[k].varied) {
+                fl.is_const = true;
+                fl.cval = lz_f[k].first;
+                fl.v.clear();
+                fl.v.shrink_to_fit();
+            }
+            ++k;
+        }
     }
     laszip_close_reader(lz);
     laszip_destroy(lz);
@@ -235,7 +282,7 @@ bool write_las(const std::string& path, const PointCloud& pc,
     auto get = [&](const std::string& nm, size_t i) -> int64_t {
         auto it = pc.fields.find(nm);
         if (it == pc.fields.end() || !kept(nm)) return 0;
-        return it->second.v[i];
+        return it->second.at(i);
     };
     for (size_t i = 0; i < pc.n; ++i) {
         p->X = Xq ? (*Xq)[i] : pc.X[i];
@@ -270,7 +317,8 @@ bool write_las(const std::string& path, const PointCloud& pc,
             if (p->extra_bytes && p->num_extra_bytes >= off) {
                 memset(p->extra_bytes, 0, (size_t)p->num_extra_bytes);
                 for (const auto& e : ex)
-                    write_raw(p->extra_bytes + e.byte_offset, e.type, pc.fields.at(e.name).v[i]);
+                    write_raw(p->extra_bytes + e.byte_offset, e.type,
+                              pc.fields.at(e.name).at(i));
             }
         }
         LZ_CHECK(laszip_write_point(lz), "write_point");

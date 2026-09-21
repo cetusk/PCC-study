@@ -172,20 +172,45 @@ int main(int argc, char** argv) {
         std::vector<Stream> st;
         if (samp && samp < f.n) {
             // 候補選択だけ標本で行い、選ばれた符号器で全点を符号化し直す。
-            Frame fs = truncate_frame(f, samp);
+            int nchunk = 8;
+            if (const char* e = getenv("PCC_SAMPLE_CHUNKS")) nchunk = atoi(e);
+            Frame fs = sample_frame(f, samp, nchunk);
             CodecCtx sctx; std::vector<double> sworld;
             sctx.fr = &fs;
+            sctx.full = &f;
             sctx.force_geom = force_geom;
             sctx.fast_attr = fast_attr;
             if (do_spatial) { frame_world(fs, sworld); sctx.world = &sworld; }
             auto sel = plan_streams(fs, joint, &log, &sctx, trace_all);
+            // 標本の 1 位が全点でも 1 位とは限らない。上位 2 つを全点で測り、
+            // 短い方を採る。全候補を全点で測るより速く、1 位だけを信じるより安全。
             for (auto& s0 : sel) {
                 std::vector<const std::vector<int64_t>*> cv;
                 for (const auto& c : s0.cols) cv.push_back(f.get(c));
-                Stream s1; s1.cols = s0.cols; s1.codec = s0.codec; s1.param = s0.param;
-                std::string e2;
-                if (!codec_encode(s1.codec, cv, s1.param, s1.data, e2, &ctx)) {
-                    fprintf(stderr, "全点での符号化に失敗: %s\n", e2.c_str()); return 1;
+                Stream s1; s1.cols = s0.cols;
+                bool got = false;
+                std::vector<Cand> tryv{{s0.codec, s0.param}};
+                for (const auto& a : s0.alt) tryv.push_back(a);
+                for (const auto& cd : tryv) {
+                    std::vector<uint8_t> blob; std::string e2;
+                    if (!codec_encode(cd.codec, cv, cd.param, blob, e2, &ctx)) continue;
+                    if (!got || blob.size() < s1.data.size()) {
+                        s1.codec = cd.codec; s1.param = cd.param;
+                        s1.data = std::move(blob); got = true;
+                    }
+                }
+                if (!got) {
+                    fprintf(stderr, "全点での符号化に失敗\n"); return 1;
+                }
+                {   // 標本での値ではなく、全点で実測した値を出す
+                    std::string nm;
+                    for (size_t i2 = 0; i2 < s1.cols.size(); ++i2)
+                        nm += (i2 ? "+" : "") + s1.cols[i2];
+                    char m[256];
+                    snprintf(m, sizeof m, "  全点 %-17s %-8s %8.3f bpp\n", nm.c_str(),
+                             cand_name(s1.codec, s1.param).c_str(),
+                             f.n ? s1.data.size() * 8.0 / f.n : 0.0);
+                    log += m;
                 }
                 st.push_back(std::move(s1));
             }
@@ -386,7 +411,9 @@ int main(int argc, char** argv) {
             uint64_t ab = 0; double worst = 0;
             for (const auto& nm : pcA.order) {
                 auto it = pcA.fields.find(nm);
-                if (it == pcA.fields.end() || it->second.v.size() != n) continue;
+                if (it == pcA.fields.end()) continue;
+                const_cast<Field&>(it->second).materialize(n);
+                if (it->second.v.size() != n) continue;
                 const auto& v = it->second.v;
                 std::vector<int64_t> mean(R.n_leaf);
                 for (size_t t = 0; t < R.n_leaf; ++t) {
@@ -516,6 +543,7 @@ int main(int argc, char** argv) {
         PointCloud pa = pc;
         for (size_t t = 0; t < n; ++t) { pa.X[t] = 0; pa.Y[t] = 0; pa.Z[t] = 0; }
         for (auto& kv : pa.fields) {
+            kv.second.materialize(n);
             if (kv.second.v.size() != n) continue;
             const auto& src = pc.fields.at(kv.first).v;
             for (size_t t = 0; t < n; ++t) kv.second.v[t] = src[(size_t)pe[t]];

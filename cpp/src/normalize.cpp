@@ -103,10 +103,23 @@ Plan analyze(const PointCloud& pc, bool enable_residual) {
         if (!PROTECTED.count(nm)) { pos[nm] = (int)names.size(); names.push_back(nm); }
     std::set<std::string> dropped;
 
+    // 定数の列は実体を持たない（Field::is_const）。相手として使っても
+    // 情報が無いので、以降の当てはめ・残差の候補からは外す。
+    auto is_const_col = [&](const std::string& nm) {
+        auto it = pc.fields.find(nm);
+        return it == pc.fields.end() || it->second.is_const;
+    };
+
     // 1) 定数
     for (const auto& nm : names) {
         int64_t v;
-        if (all_equal(pc.fields.at(nm).v, v)) {
+        const Field& fl = pc.fields.at(nm);
+        if (fl.is_const) {
+            Op o; o.kind = "drop_constant"; o.target = nm; o.value = fl.cval;
+            plan.ops.push_back(o); dropped.insert(nm);
+            continue;
+        }
+        if (all_equal(fl.v, v)) {
             Op o; o.kind = "drop_constant"; o.target = nm; o.value = v;
             plan.ops.push_back(o); dropped.insert(nm);
         }
@@ -114,10 +127,12 @@ Plan analyze(const PointCloud& pc, bool enable_residual) {
     // 2) 完全重複 / アフィン（参照元は「自分より前」かつ落とさないもの）
     for (const auto& nm : names) {
         if (dropped.count(nm)) continue;
+        if (is_const_col(nm)) continue;
         const auto& a = pc.fields.at(nm).v;
         bool found = false;
         for (const auto& s : names) {
             if (found || dropped.count(s) || pos[s] >= pos[nm]) continue;
+            if (is_const_col(s)) continue;
             const auto& b = pc.fields.at(s).v;
             if (a == b) {
                 Op o; o.kind = "drop_duplicate"; o.target = nm; o.source = s;
@@ -154,6 +169,7 @@ Plan analyze(const PointCloud& pc, bool enable_residual) {
         std::set<std::string> resid;
         for (const auto& nm : names) {
             if (dropped.count(nm)) continue;
+            if (is_const_col(nm)) continue;
             const auto& a = pc.fields.at(nm).v;
             std::string bs; double best_s = entropy0_diff_sampled(a, a, idx);
             // 自分との差分は 0 なので、基準は標本での h0 にする
@@ -165,6 +181,7 @@ Plan analyze(const PointCloud& pc, bool enable_residual) {
             }
             for (const auto& s : names) {
                 if (s == nm || dropped.count(s) || resid.count(s)) continue;
+                if (is_const_col(s)) continue;
                 double h = entropy0_diff_sampled(a, pc.fields.at(s).v, idx);
                 if (h < best_s) { best_s = h; bs = s; }
             }

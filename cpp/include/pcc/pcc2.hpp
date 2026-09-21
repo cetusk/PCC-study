@@ -37,6 +37,10 @@ struct CodecCtx {
     bool want_world = false;                      // 遅延構築を許すか
     mutable std::vector<double> world_own;        // 遅延構築したときの実体
     const Frame* fr = nullptr;                    // 既に復号済みの列を引くため
+    // 標本で順位を付けるとき、候補の**集合**まで標本から決めると、全点での
+    // 勝者が候補に入らないことがある（AHN3 の nir が実際にそうだった）。
+    // 参照列の選定だけは全点の統計で行うため、全点の Frame をここに置く。
+    const Frame* full = nullptr;
     mutable std::vector<int32_t> perm, pred;
     mutable int built_P = -1;
     bool ensure(size_t n, int P) const;           // 順序表と予測子表を作る（P ごとに 1 回）
@@ -46,15 +50,18 @@ struct CodecCtx {
     bool fast_attr = false;                       // 属性列の候補を絞って時間を詰める
 };
 
+// 候補（符号器とそのパラメタ）
+struct Cand { uint16_t codec; std::vector<uint8_t> param; };
+
 struct Stream {
     std::vector<std::string> cols;
     uint16_t codec = C_RAW64;
     std::vector<uint8_t> param;
     std::vector<uint8_t> data;
+    // 標本で順位を付けたときの次点。標本の 1 位が全点でも 1 位とは限らないので、
+    // 上位だけを全点で測り直して短い方を採るために使う。data には入らない。
+    std::vector<Cand> alt;
 };
-
-// 候補（符号器とそのパラメタ）
-struct Cand { uint16_t codec; std::vector<uint8_t> param; };
 
 // 単一符号器の符号化・復号（cols は同じ長さの列）
 bool codec_encode(uint16_t id, const std::vector<const std::vector<int64_t>*>& cols,

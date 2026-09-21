@@ -87,6 +87,9 @@ void frame_world(const Frame& f, std::vector<double>& xyz);
 // 注意: 空間予測の利得そのものは部分標本では測れない（既報 2.42% 対 6.07%）。
 // これは「どの符号器を選ぶか」にだけ使い、報告する数字は必ず全点で取り直す。
 Frame truncate_frame(const Frame& f, size_t n);
+// 等間隔に置いた chunks 個の連続塊から合計 n 点を取る。
+// 先頭だけを見ると分布を代表しないファイルがある。
+Frame sample_frame(const Frame& f, size_t n, int chunks);
 
 // 正規化の計画を Frame に適用する / 復元する。
 // 適用後もスキーマは元の全列を保持し、各列の storage だけが変わる。

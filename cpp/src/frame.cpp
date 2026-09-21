@@ -55,7 +55,8 @@ bool frame_from_las(const PointCloud& pc, Frame& f, std::string& err) {
         c.role = (nm == "gps_time") ? Role::Time : Role::Attribute;
         c.is_extra = it->second.is_extra;
         f.schema.push_back(c);
-        f.col[nm] = it->second.v;
+        if (it->second.is_const) f.col[nm].assign(pc.n, it->second.cval);
+        else f.col[nm] = it->second.v;
     }
 
     put_envelope(pc, f);
@@ -137,6 +138,7 @@ bool frame_from_las_normalized(PointCloud& pc, Frame& f, bool residual_ops,
             f.col[nm] = std::move(e->second);
         } else if (kept.count(nm)) {
             c.storage = Storage::Raw;
+            it->second.materialize(pc.n);          // 定数のまま残す列はここで展開
             f.col[nm] = std::move(it->second.v);   // コピーせずに移す
         } else {
             c.storage = Storage::Derived;          // 計画から復元するので持たない
@@ -290,6 +292,39 @@ void frame_world(const Frame& f, std::vector<double>& xyz) {
     }
 }
 
+
+// 先頭から n 点を切り出す。候補の順位付けに使うと、先頭が全体を代表して
+// いないファイルで誤る（AHN3 の gps_time と nir で実際に起きた）。
+// 代わりに sample_frame を使うこと。truncate_frame は互換のために残す。
+Frame sample_frame(const Frame& f, size_t n, int chunks) {
+    Frame g;
+    g.n = std::min<uint64_t>(f.n, n);
+    g.schema = f.schema;
+    for (int i = 0; i < 3; ++i) { g.scale[i] = f.scale[i]; g.offset[i] = f.offset[i];
+                                  g.geom[i] = f.geom[i]; }
+    g.geom_repr = f.geom_repr; g.source_kind = f.source_kind;
+    g.source_bytes = f.source_bytes; g.plan = f.plan; g.fid = f.fid;
+    if (chunks < 1) chunks = 1;
+    if ((uint64_t)chunks * 2 > g.n) chunks = 1;
+    const size_t per = (size_t)(g.n / chunks);
+    // 塊は等間隔に置く。差分符号器のために塊の中は連続させる
+    // （塊の境目では差分が 1 点ぶん乱れるが、10 万点中 数点なので影響しない）。
+    std::vector<size_t> beg(chunks);
+    const size_t span = (size_t)f.n;
+    for (int c = 0; c < chunks; ++c)
+        beg[c] = (size_t)((double)c * (span - per) / (chunks > 1 ? chunks - 1 : 1));
+    for (const auto& kv : f.col) {
+        std::vector<int64_t> v;
+        v.reserve(g.n);
+        for (int c = 0; c < chunks; ++c) {
+            size_t b = beg[c], e = std::min(span, b + per);
+            v.insert(v.end(), kv.second.begin() + b, kv.second.begin() + e);
+        }
+        v.resize(g.n);
+        g.col[kv.first] = std::move(v);
+    }
+    return g;
+}
 
 Frame truncate_frame(const Frame& f, size_t n) {
     Frame g;

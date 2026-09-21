@@ -696,6 +696,12 @@ static bool enc_geom_scan(const std::vector<const std::vector<int64_t>*>& cols,
     }
     std::vector<uint8_t> br;
     mark("残差を作る");
+    // 走査文脈はここから先で参照しない。400 万点では ord と gps と ret だけで
+    // 80 MB あり、残差（3 列 × 8 バイト）と同時に抱えるとピークが立つ。
+    sc.ord.clear(); sc.ord.shrink_to_fit();
+    sc.gps.clear(); sc.gps.shrink_to_fit();
+    sc.ret.clear(); sc.ret.shrink_to_fit();
+    L.label.clear(); L.label.shrink_to_fit();
     if (use_xctx) enc_resid_x(res, br); else enc_resid(res, br);
     mark("残差を符号化");
 
@@ -1071,6 +1077,13 @@ Stream best_stream(const Frame& f, const std::vector<std::string>& cols,
     for (const auto& c : cols) cv.push_back(f.get(c));
     Stream best; best.cols = cols; best.codec = C_RAW64;
     bool first = true;
+    // 標本で順位を付けたとき、全点での 1 位が標本で 3 位まで落ちることがある
+    // （AHN3 の gps_time と nir で実際に起きた）。上位を何本か残しておく。
+    static const size_t KEEP_ALT = [] {
+        const char* e = getenv("PCC_KEEP_ALT");
+        return e ? (size_t)atoi(e) : (size_t)3;
+    }();
+    std::vector<std::pair<size_t, Cand>> rank;      // (符号長, 候補) を短い順に
     for (const auto& cd : candidates) {
         std::vector<uint8_t> blob; std::string err;
         if (!codec_encode(cd.codec, cv, cd.param, blob, err, ctx)) {
@@ -1083,11 +1096,34 @@ Stream best_stream(const Frame& f, const std::vector<std::string>& cols,
                      f.n ? blob.size() * 8.0 / f.n : 0.0);
             *trace += m;
         }
-        if (first || blob.size() < best.data.size()) {
+        const size_t sz = blob.size();
+        rank.push_back({sz, {cd.codec, cd.param}});
+        if (first || sz < best.data.size()) {
             best.codec = cd.codec; best.param = cd.param;
             best.data = std::move(blob); first = false;
         }
     }
+    std::sort(rank.begin(), rank.end(),
+              [](const auto& a, const auto& b) { return a.first < b.first; });
+    for (size_t i = 1; i < rank.size() && best.alt.size() < KEEP_ALT; ++i)
+        best.alt.push_back(rank[i].second);
+    // 標本で順位を付けると、空間予測を使う候補が系統的に不利になる。
+    // 点を間引くと近傍が遠くなり、標本上では実力より悪く見えるためである
+    // （AHN3 の nir は全点では参照＋空間予測が勝つのに、標本では 4 位にも入らない）。
+    // 上位に入らなくても、空間予測を使う最良の候補は必ず 1 つ残す。
+    auto uses_spatial = [](const Cand& c) {
+        if (c.codec == C_ATTR_SPATIAL || c.codec == C_ATTR_COLOR) return true;
+        return c.codec == C_ATTR_XREF && !c.param.empty() &&
+               c.param[0] != 0 && c.param[0] != 100;
+    };
+    auto same = [](const Cand& a, const Cand& b) {
+        return a.codec == b.codec && a.param == b.param;
+    };
+    bool have = uses_spatial({best.codec, best.param});
+    for (const auto& a : best.alt) if (uses_spatial(a)) have = true;
+    if (!have)
+        for (const auto& r : rank)
+            if (uses_spatial(r.second)) { best.alt.push_back(r.second); break; }
     return best;
 }
 
@@ -1263,12 +1299,15 @@ std::vector<Stream> plan_streams(const Frame& f, bool joint_geom, std::string* l
         if (done) continue;                                   // 幾何より前に出した
         std::vector<Cand> cs = cand_attr;
         // 既出の列との残差も候補に入れる。標本で相手を 2 つに絞ってから全点で測る。
+        // 参照の選定は全点の統計で行う（標本で選ぶと候補の集合が変わる）
+        const Frame& fs_ref = (ctx && ctx->full) ? *ctx->full : f;
         const auto* v = f.get(c.name);
+        const auto* vr = fs_ref.get(c.name);
         if (v && !emitted.empty()) {
             std::vector<std::pair<double, std::string>> sc;
             for (const auto& e : emitted) {
-                const auto* w = f.get(e);
-                if (w) sc.push_back({entropy_diff_sample(*v, *w, 250000), e});
+                const auto* w = fs_ref.get(e);
+                if (w && vr) sc.push_back({entropy_diff_sample(*vr, *w, 250000), e});
             }
             std::sort(sc.begin(), sc.end());
             for (size_t i = 0; i < sc.size() && i < 2; ++i) {

@@ -33,6 +33,16 @@ struct Field {
     FType ftype = FType::I64;
     bool is_extra = false;
     std::vector<int64_t> v;
+    // 値が 1 種類しかない列は実体を持たない。幾何だけの PF6 では大半がそうで、
+    // 400 万点なら 1 列あたり 32 MB を節約できる。
+    bool is_const = false;
+    int64_t cval = 0;
+    inline int64_t at(size_t i) const { return is_const ? cval : v[i]; }
+    inline size_t count(size_t n) const { return is_const ? n : v.size(); }
+    // 実体が要る場面で展開する（定数のままでは扱えない経路のため）
+    void materialize(size_t n) {
+        if (is_const) { v.assign(n, cval); is_const = false; }
+    }
 };
 
 struct PointCloud {
