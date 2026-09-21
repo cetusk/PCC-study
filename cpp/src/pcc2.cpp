@@ -724,6 +724,14 @@ static bool enc_geom_scan(const std::vector<const std::vector<int64_t>*>& cols,
     }();
     std::vector<double> thin_hist;
     double thin_gate = -1.0;
+    // 鍵が定数の入力では掃引が 1 本しかできない。ファイルの大半を占める「掃引」は
+    // 走査線ではないので、2 本に分ける試み（EM と当てはめ 2 回）は無駄が大きい。
+    static const double SPLIT_MAXFRAC = [] {
+        const char* e = getenv("PCC_SPLIT_MAXFRAC");
+        // 0.25 は掃引で決めた。17 件すべてで bpp が変わらない。
+        return e ? atof(e) : 0.25;             // 0 なら上限なし
+    }();
+    const size_t split_max = SPLIT_MAXFRAC > 0 ? (size_t)(SPLIT_MAXFRAC * (double)n) : 0;
     if (prof) fprintf(stderr, "    [走査] 掃引 %zu 本\n", nsw);
     // PCC_SCAN_DUMP=<path> を付けたときだけ、走査線ごとの当てはめの様子を書き出す。
     // 符号化の結果には影響しない。
@@ -783,7 +791,7 @@ static bool enc_geom_scan(const std::vector<const std::vector<int64_t>*>& cols,
         // 基準を作るのに使った先頭 200 本には足切りを掛けない。順に回していた
         // ときと同じ判断にするため（掛けると AHN4 _20 が +0.04% 伸びた）。
         const bool gated = (k >= 200) && thin_gate >= 0;
-        if (m >= 40 && (!gated || sp_r0 > thin_gate)) {
+        if (m >= 40 && (!split_max || m <= split_max) && (!gated || sp_r0 > thin_gate)) {
             std::vector<uint8_t> lab;
             split_two_lines(bx.data(), by.data(), m, lab);
             size_t c1 = 0; for (auto v : lab) c1 += v;
