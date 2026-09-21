@@ -1527,9 +1527,12 @@ Stream best_stream(const Frame& f, const std::vector<std::string>& cols,
     size_t PRE_SAMP;
     if (PRE_OPT >= 0) PRE_SAMP = (size_t)PRE_OPT;
     else {
+        // 標本は 2 万〜2.5 万点。上限を 20 万点から 2.5 万点に下げても、
+        // 幾何の 17 件・全列の 15 件（20 万点と 100 万点）・回帰の 9 件の
+        // どれも bpp が 1 つも動かず、100 万点の幾何の列が 0.27 s → 0.22 s になる。
         PRE_SAMP = ncols_n / 8;
         if (PRE_SAMP < 20000) PRE_SAMP = 20000;
-        if (PRE_SAMP > 200000) PRE_SAMP = 200000;
+        if (PRE_SAMP > 25000) PRE_SAMP = 25000;
     }
     std::vector<Cand> use = candidates;
     if (preselect && PRE_SAMP && candidates.size() > PRE_KEEP + 1 &&
