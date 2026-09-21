@@ -1752,19 +1752,22 @@ Stream best_stream(const Frame& f, const std::vector<std::string>& cols,
             //                   先頭 12.5 万点だけ見ると 3 位以内に入らない）
             //   記号版   … 多値の模型は馴染むのに点数が要る（2.5 万点の標本では
             //                 実力より悪く見える。AHN4 _20 の走査v1記が実際にそう）
-            // **族の判定から記号版の旗を外してはいけない。** 外すと、記号版が
+            // 記号版かどうかは族と**直交する軸**である。族だけで数えると、記号版が
             // 上位に入ったときに「その族はもう居る」と判じて非記号版の代表を
-            // 足さなくなる。AHN3 _20 の先頭 30 万点で、全点なら勝つ 幾何v4W4 が
-            // 決勝に残らず 21.315 → 21.328 bpp に伸びた。
-            // 記号版かどうかは族と直交する軸なので、下で別に 1 本残す。
+            // 足さなくなる（AHN3 _20 の先頭 30 万点で 幾何v4W4 が決勝に残らず
+            // 21.315 → 21.328 bpp に伸びた）。逆に記号版だけで数えると、族ごとの
+            // 記号版が守れない（autzen-2023 で 走査v3記 が残らず +0.065%）。
+            // **族 × 記号版の組で数える。**
             auto family = [](const Cand& c) -> int {
-                if (c.codec == C_GEOM_SCAN) return 1;
-                if (c.codec == C_ATTR_SPATIAL || c.codec == C_ATTR_COLOR) return 2;
-                if (c.codec == C_ATTR_XREF && !c.param.empty() &&
+                const uint16_t id = c.codec & ~C_FSYM_BIT;
+                if (id == C_GEOM_SCAN) return 1;
+                if (id == C_ATTR_SPATIAL || id == C_ATTR_COLOR) return 2;
+                if (id == C_ATTR_XREF && !c.param.empty() &&
                     c.param[0] != 0 && c.param[0] != 100) return 2;
-                if (c.codec == C_GEOM_XYZ && !c.param.empty() && c.param[0] == 4) return 3;
+                if (id == C_GEOM_XYZ && !c.param.empty() && c.param[0] == 4) return 3;
                 return 0;
             };
+            auto is_fsym = [](const Cand& c) { return (c.codec & C_FSYM_BIT) != 0; };
             // 族の保護は無条件だと重い。走査モデルは全点で 1 本 0.09 s かかり、
             // 既定の符号化時間の半分近くを占める。標本での符号長が最良から
             // 離れすぎている族は、全点で測っても勝たないと見て落とす。
@@ -1773,22 +1776,24 @@ Stream best_stream(const Frame& f, const std::vector<std::string>& cols,
                 return e ? atof(e) : 1e9;
             }();
             const double best_pre = (double)pre[0].first;
-            for (int fam = 1; fam <= 3; ++fam) {
-                bool have = false;
-                for (const auto& c : use) if (family(c) == fam) have = true;
-                if (have) continue;
-                for (const auto& pr : pre)
-                    if (family(pr.second) == fam) {
-                        if ((double)pr.first <= best_pre * FAM_THR) use.push_back(pr.second);
-                        break;
-                    }
-            }
-            // 記号版かどうかは族と直交する軸なので、別に 1 本残す。
+            for (int fam = 1; fam <= 3; ++fam)
+                for (int fs = 0; fs < 2; ++fs) {
+                    bool have = false;
+                    for (const auto& c : use)
+                        if (family(c) == fam && is_fsym(c) == (fs != 0)) have = true;
+                    if (have) continue;
+                    for (const auto& pr : pre)
+                        if (family(pr.second) == fam && is_fsym(pr.second) == (fs != 0)) {
+                            if ((double)pr.first <= best_pre * FAM_THR) use.push_back(pr.second);
+                            break;
+                        }
+                }
+            // 族に属さない符号器（delta や range）の記号版も 1 本残す。
             bool have_fsym = false;
-            for (const auto& c : use) if (c.codec & C_FSYM_BIT) have_fsym = true;
+            for (const auto& c : use) if (family(c) == 0 && is_fsym(c)) have_fsym = true;
             if (!have_fsym)
                 for (const auto& pr : pre)
-                    if (pr.second.codec & C_FSYM_BIT) {
+                    if (family(pr.second) == 0 && is_fsym(pr.second)) {
                         if ((double)pr.first <= best_pre * FAM_THR) use.push_back(pr.second);
                         break;
                     }
