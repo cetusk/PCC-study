@@ -780,7 +780,10 @@ static bool enc_geom_scan(const std::vector<const std::vector<int64_t>*>& cols,
         SweepParam two[2];
         FitDiag fd2[2];
         if (warm && SPLIT_THIN > 0 && sp_r0 < 1e17) thin_hist.push_back(sp_r0);
-        if (m >= 40 && (thin_gate < 0 || sp_r0 > thin_gate)) {
+        // 基準を作るのに使った先頭 200 本には足切りを掛けない。順に回していた
+        // ときと同じ判断にするため（掛けると AHN4 _20 が +0.04% 伸びた）。
+        const bool gated = (k >= 200) && thin_gate >= 0;
+        if (m >= 40 && (!gated || sp_r0 > thin_gate)) {
             std::vector<uint8_t> lab;
             split_two_lines(bx.data(), by.data(), m, lab);
             size_t c1 = 0; for (auto v : lab) c1 += v;
@@ -839,15 +842,29 @@ static bool enc_geom_scan(const std::vector<const std::vector<int64_t>*>& cols,
         }
     };
 
-    // 先頭 200 本（足切りの基準が決まるまで）は順に回す。
-    size_t kwarm = nsw < 200 ? nsw : (size_t)200;
-    if (dump) kwarm = nsw;                       // 書き出しは順序に依るので並列にしない
-    for (size_t k = 0; k < kwarm; ++k) do_sweep(k, true, bx, by, bz, bg, bs);
-    if (SPLIT_THIN > 0 && !thin_hist.empty()) {
-        std::vector<double> v = thin_hist;
-        std::nth_element(v.begin(), v.begin() + v.size() / 2, v.end());
-        thin_gate = v[v.size() / 2] * SPLIT_THIN;
+    // 足切りの基準は先頭 200 本の散らばりから決める。散らばりは O(m) で
+    // 当てはめを伴わないので、当てはめを 1 本も順に回さずに基準を作れる。
+    if (SPLIT_THIN > 0) {
+        size_t kw = nsw < 200 ? nsw : (size_t)200;
+        for (size_t k = 0; k < kw; ++k) {
+            int32_t a = sc.swp[k], b = sc.swp[k + 1];
+            bx.clear(); by.clear();
+            for (int32_t t = a; t < b; ++t) {
+                int32_t i = sc.ord[t];
+                bx.push_back(CX[i]); by.push_back(CY[i]);
+            }
+            if (bx.empty()) continue;
+            double r0 = line_thinness(bx.data(), by.data(), (size_t)(b - a));
+            if (r0 < 1e17) thin_hist.push_back(r0);
+        }
+        if (!thin_hist.empty()) {
+            std::vector<double> v = thin_hist;
+            std::nth_element(v.begin(), v.begin() + v.size() / 2, v.end());
+            thin_gate = v[v.size() / 2] * SPLIT_THIN;
+        }
     }
+    size_t kwarm = dump ? nsw : (size_t)0;       // 書き出しは順序に依るので並列にしない
+    for (size_t k = 0; k < kwarm; ++k) do_sweep(k, true, bx, by, bz, bg, bs);
     if (kwarm < nsw) {
         static const size_t NT = [] {
             if (const char* e = getenv("PCC_THREADS")) { long v = atol(e); if (v > 0) return (size_t)v; }
@@ -865,8 +882,14 @@ static bool enc_geom_scan(const std::vector<const std::vector<int64_t>*>& cols,
             for (size_t t = 0; t < nt; ++t)
                 th.emplace_back([&] {
                     std::vector<int64_t> lx, ly, lz2, lg, ls;
-                    for (size_t k = next++; k < nsw; k = next++)
-                        do_sweep(k, false, lx, ly, lz2, lg, ls);
+                    // 掃引を 1 本ずつ取ると、隣り合う掃引が別のスレッドに散って
+                    // L.label と sp_out の同じキャッシュ行を取り合う。16 本ずつ取る。
+                    const size_t CH = 16;
+                    for (size_t k0 = next.fetch_add(CH); k0 < nsw; k0 = next.fetch_add(CH)) {
+                        size_t k1 = k0 + CH < nsw ? k0 + CH : nsw;
+                        for (size_t k = k0; k < k1; ++k)
+                            do_sweep(k, false, lx, ly, lz2, lg, ls);
+                    }
                 });
             for (auto& x : th) x.join();
         }
@@ -1618,14 +1641,14 @@ std::vector<Stream> plan_streams(const Frame& f, bool joint_geom, std::string* l
     if (joint_geom) {
         std::vector<std::string> g{f.geom[0], f.geom[1], f.geom[2]};
         std::vector<Cand> gc{{C_RAW64, {}}, {C_RANGE, {}}, {C_RANGE_DELTA, {}},
-                             {C_GEOM_XYZ, {0}}, {C_GEOM_XYZ, {1}}, {C_GEOM_XYZ, {3}},
+                             {C_GEOM_XYZ, {1}}, {C_GEOM_XYZ, {3}},
                              // 予測子だけを差し替えた 幾何v3。副情報は増えない。
                              // 直近 4 つの差分の平均は TLS と AHN3 で、中央値の
                              // 半分は autzen-2023 で残差が短かった（符号化前の見積り）。
                              {C_GEOM_XYZ, {3, 1}}, {C_GEOM_XYZ, {3, 2}},
                              // 直近 W 点の最近傍から予測する。格納順が空間的に
                              // 連続していない入力で効く（幾何v4 の注記を参照）。
-                             {C_GEOM_XYZ, {4, 4}}, {C_GEOM_XYZ, {4, 16}},
+                             {C_GEOM_XYZ, {4, 4}},
                              // 選んだ点に局所の傾きを足す。副情報は増えない。
                              {C_GEOM_XYZ, {4, 4, 1}}};
         if (!aux.empty()) {
@@ -1656,7 +1679,7 @@ std::vector<Stream> plan_streams(const Frame& f, bool joint_geom, std::string* l
             // （results/scan_model_fitting.md 16・32 節）。v3 が v1 を上回るのは
             // 1 件ではなく 2 件で、vegetation の 0.31% は誤差では片づかない。
             // PCC_ALL_VARIANTS=1 で測り直して決め直すこと。
-            std::vector<uint8_t> vars{1, 5};
+            std::vector<uint8_t> vars{5};
             if (const char* e = getenv("PCC_ALL_VARIANTS"))
                 if (e[0] == '1') vars = {1, 2, 3, 4, 5};
             for (uint8_t v : vars) {
