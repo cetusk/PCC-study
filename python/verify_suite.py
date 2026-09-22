@@ -10,7 +10,7 @@
   unpack    unpack --las を元のファイルと欄ごと・生バイトで比べる（先頭 30 万点）
   ply       PLY 4 件の往復
   kitti     KITTI 108 frame の .bin → PCC2 → .bin のバイト比較
-  force     幾何の基底候補を 1 本ずつ --force-geom で往復（4 ファイル）
+  force     幾何の基底候補を 1 本ずつ --force-geom で往復（5 ファイル）
   lossy     KITTI 20 frame の非可逆（誤差上限 3 通り）で上限を守るか
 
 以前はこのうち後半 4 つがその場のコマンドで、手順がリポジトリに残っていなかった。
@@ -157,12 +157,14 @@ def t_force(say):
     names, on = set(), False
     for l in r.stdout.splitlines():
         if re.match(r"^  X\+Y\+Z", l): on = True; continue
-        if on and re.match(r"^      \S", l): names.add(re.sub(r"(記|生|束|符[124])+$", "", l.split()[0]))
+        if on and re.match(r"^      \S", l): names.add(re.sub(r"(記|生|束|符[124]|速)+$", "", l.split()[0]))
         elif on and re.match(r"^  \S", l): break
     say(f"基底候補 {len(names)} 本")
     bad = tot = 0
+    # USGS NY は多重戻りを持つので、後置検査で光・面の旗が立った版もここで往復する
     for f in ["data/raw/small/autzen_trim.laz", "data/raw/small/vegetation_1_3.las",
-              "data/raw/small/fullwave.laz", "data/work/tls_scan1.ply"]:
+              "data/raw/small/fullwave.laz", "data/work/tls_scan1.ply",
+              "data/raw/usgs/NY_ClintonEssex_2014.laz"]:
         for g in sorted(names):
             tot += 1
             with tempfile.TemporaryDirectory() as t:
