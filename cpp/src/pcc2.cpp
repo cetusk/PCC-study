@@ -3409,7 +3409,7 @@ static void post_flags(Stream& best, size_t& bestsz, const std::vector<const Col
     // （恒等・素の幅）では同じバイト列になるので測らない。
     const bool no_model = ((b0 & ~C_FLAG_MASK) == C_RAW64 || (b0 & ~C_FLAG_MASK) == C_RAW_W);
     if (!(b0 & C_RAW_BIT) && !no_model) pc.push_back({(uint16_t)(b0 | C_RAW_BIT), best.param});
-    // 符号つきの文脈は幾何の符号器にしか効かない。長さの最適値は
+    // 符号つきの文脈は、それを読む符号器（下の sgn_ok）にだけ効く。長さの最適値は
     // ファイルで違うので、1 / 2 / 4 個の 3 通りを出して実測で選ばせる。
     //
     // **実装している経路に限る。**旗を読まない符号器に立てても、同じバイト列を
@@ -3428,10 +3428,11 @@ static void post_flags(Stream& best, size_t& bestsz, const std::vector<const Col
     const bool sgn_ok =
         (bid0 == C_GEOM_XYZ && (gp0 == 3 || gp0 == 4)) ||
         bid0 == C_GEOM_ROT ||
-        // 走査モデルは var 3/4 が enc_resid_x、それ以外（1・2・5 = 走査変換）が enc_resid を
+        // 走査モデルは var 3/4 が enc_resid_x、それ以外（1・2 = 走査v1/v2、5 = 走査変換）が enc_resid を
         // 通る。どちらも符号つきの文脈を持つので全部の var で試す（2026-09-23 に広げた）。
         bid0 == C_GEOM_SCAN || attr_sgn ||
-        // 幾何v0（enc_cols mode 2）・幾何v1 と med3（enc_geom_med）・向き追従（enc_geom_dir）
+        // 幾何v0（enc_cols mode 2）・幾何v1（enc_geom_med）・向き追従（enc_geom_dir）。
+        // med3（C_RANGE_MED）も enc_geom_med なので、属性の流れで勝ったときも試す
         (bid0 == C_GEOM_XYZ && (gp0 == 0 || gp0 == 1)) || bid0 == C_RANGE_MED ||
         bid0 == C_GEOM_DIR;
     // 属性の流れにも 3 通り（符1・符2・符4）を全部試す。
