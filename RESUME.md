@@ -9,9 +9,10 @@
 > **現在の値は [`results/standing.md`](results/standing.md)**（到達点・数値の正本）と
 > [`results/losses.md`](results/losses.md)（何をどう直したか）を見ること。文書の地図は
 > [`results/INDEX.md`](results/INDEX.md)。
-> 要点（2026-09-23）: 全列 対 LASzip **−14.3%（15/15）**、幾何単体で **LAZ に 17/17**（0.90x）、
-> 符号化 36.5x・復号 9.5x・647 byte/点。
-> 2026-09-23 に器の版を 2 に上げた（`results/defects.md`）。**版 1 の .pcc2 は読めない**ので作り直すこと。
+> 要点（2026-09-23）: 全列 対 LASzip **−14.7%（15/15）**、幾何単体で **LAZ に 17/17**（0.89x）、
+> 符号化 44.6x・復号 9.4x・773 byte/点。
+> 2026-09-23 に器の版を 3 に上げた（`results/defects.md`・`results/losses.md` §29）。
+> **版 1・2 の .pcc2 は読めない**ので作り直すこと。
 
 ## 1. 再開時にまずこれを打つ
 
