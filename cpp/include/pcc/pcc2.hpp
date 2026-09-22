@@ -129,9 +129,15 @@ inline constexpr uint16_t C_SURF_B       = 0x0080;
 inline constexpr int      LMS_ORD        = 16;   // 履歴の長さ
 inline constexpr int      LMS_SH         = 12;   // 重みの固定小数の桁
 
+// **速い後半の適応**（名前の「速」）。二値の模型の速さの表を、長く続いた文脈も
+// 1/32 のまま寄せる表（rangecoder.hpp の BM_RATE_FAST）に替える。既定の表は長く続いた
+// 文脈ほど遅く寄せ、止まった分布の流れ（LAS の多く）で縮むが、場面の変わる流れ
+// （KITTI・物体のスキャン）では速い表が勝つので、流れごとに選ぶ。
+inline constexpr uint16_t C_FAST_BIT     = 0x0040;
+
 inline constexpr uint16_t C_FLAG_MASK =
     (uint16_t)(C_FSYM_BIT | C_RAW_BIT | C_MTC_BIT | C_BND_BIT |
-               C_LMS_BIT | C_SGN2_BIT | C_RAY_BIT | C_SURF_A | C_SURF_B);
+               C_LMS_BIT | C_SGN2_BIT | C_RAY_BIT | C_SURF_A | C_SURF_B | C_FAST_BIT);
 
 // 符号器が使ってよい副次情報。幾何は属性より先に復号されるので、
 // 属性の符号化時には座標が揃っている（命題: 副情報の不要性）。
@@ -177,6 +183,7 @@ struct CodecCtx {
     const std::vector<double>* world_ptr() const; // 無ければ作る
     // 報告する構成を往復検証に通すための指定。空なら通常どおり全候補を実測して選ぶ。
     std::string force_geom;                       // X+Y+Z をこの候補名に固定する
+    bool bitfields_first = false;                 // bit_fields が属性より先に出る（戻りの種類を属性の文脈に使える）
     bool fast_attr = false;                       // 属性列の候補を絞って時間を詰める
 };
 

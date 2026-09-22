@@ -148,6 +148,15 @@ struct Pred {
 } // namespace
 
 // ---------------------------------------------------------------- 符号器
+// 符号つきの文脈（旗 符1/2/4）。定義は旗の変数の後ろにある。
+static inline bool sgn_ctx_on();
+static inline int sgn_mul();
+static inline int sgn_push(int prev, int64_t d);
+// 戻りの種類の文脈（属性に光線の旗が立っているとき）。定義は旗の変数の後ろ。
+//   0 単独の戻り / 1 複数の最初 / 2 複数の最後 / 3 中間。旗が無ければ常に 0。
+static inline int ret_class(size_t i);
+static inline int ret_mul();
+
 // 共通形: 1 点ごとに列を横断して符号化する（幾何 3 軸の同時符号化に必要）。
 // mode: 0 そのまま / 1 1次差分 / 2 1次差分＋ビット数文脈 / 3 2次差分＋文脈
 // 3 は「一定の刻みで増える列」に効く。gps_time は float64 のビットパターンを
@@ -156,18 +165,23 @@ static void enc_cols(const std::vector<const Col*>& cols, int mode,
                      std::vector<uint8_t>& out) {
     size_t nc = cols.size(), n = nc ? cols[0]->size() : 0;
     Encoder e;
-    UIntCoder uc((int)nc * NCTX, 64);
+    // 符号つきの文脈（旗が立っているときだけ。差分を送る mode 1〜3 に効く）
+    const bool sgnctx = mode >= 1 && sgn_ctx_on();
+    const int SM = sgnctx ? sgn_mul() : 1;
+    const int RM = ret_mul();
+    UIntCoder uc((int)nc * NCTX * SM * RM, 64);
     std::vector<int64_t> prev(nc, 0), prev2(nc, 0);
-    std::vector<int> ctx(nc, 0);
+    std::vector<int> ctx(nc, 0), sg(nc, 0);
     for (size_t i = 0; i < n; ++i)
         for (size_t c = 0; c < nc; ++c) {
             int64_t x = (*cols[c])[i];
             int64_t d = (mode == 0) ? x : x - prev[c];
             if (mode == 3) { int64_t t = d; d = d - prev2[c]; prev2[c] = t; }
             uint64_t z = zigzag(d);
-            uc.encode(e, z, (int)c * NCTX + (mode >= 2 ? ctx[c] : 0));
+            uc.encode(e, z, (((int)c * NCTX + (mode >= 2 ? ctx[c] : 0)) * SM + sg[c]) * RM + ret_class(i));
             prev[c] = x;
             if (mode >= 2) ctx[c] = ctx_of(z);
+            if (sgnctx) sg[c] = sgn_push(sg[c], d);
         }
     out = e.finish();
 }
@@ -848,6 +862,19 @@ struct SurfPred {
     void insert(int64_t x, int64_t y, int64_t z) { g[key(x >> S, y >> S)] = {x, y, z}; }
 };
 static thread_local int g_lms = 0;
+// 符号つきの文脈を使うか（旗が立ち、かつ既定の種類のとき）
+static inline bool sgn_ctx_on() { return g_lms && lms_kind() == 2; }
+static inline int ret_mul() { return (g_ray && g_ray_bf) ? 4 : 1; }
+// 残差が符号化順（空間予測の順）に並んでいるとき、その順の表（位置 → 点の番号）。
+// 空なら残差は点の並び順。codec_encode / codec_decode が抜けるときに戻す。
+static thread_local const std::vector<int32_t>* g_resid_ord = nullptr;
+static inline int ret_class(size_t i) {
+    if (!g_ray || !g_ray_bf) return 0;
+    if (g_resid_ord) i = (size_t)(*g_resid_ord)[i];
+    const uint64_t a = (uint64_t)(*g_ray_bf)[i];
+    const int r = (int)(a & 15), n = (int)((a >> 4) & 15);
+    return n <= 1 ? 0 : (r <= 1 ? 1 : (r >= n ? 2 : 3));
+}
 
 static void enc_geom_x(const std::vector<const Col*>& cols,
                        int pmode, std::vector<uint8_t>& out, bool cross = false,
@@ -1554,13 +1581,17 @@ static void dec_cols(const uint8_t* data, size_t len, size_t n, size_t nc, int m
                      std::vector<std::vector<int64_t>>& out) {
     out.assign(nc, std::vector<int64_t>(n));
     Decoder d(data, len);
-    UIntCoder uc((int)nc * NCTX, 64);
+    const bool sgnctx = mode >= 1 && sgn_ctx_on();
+    const int SM = sgnctx ? sgn_mul() : 1;
+    const int RM = ret_mul();
+    UIntCoder uc((int)nc * NCTX * SM * RM, 64);
     std::vector<int64_t> prev(nc, 0), prev2(nc, 0);
-    std::vector<int> ctx(nc, 0);
+    std::vector<int> ctx(nc, 0), sg(nc, 0);
     for (size_t i = 0; i < n; ++i)
         for (size_t c = 0; c < nc; ++c) {
-            uint64_t z = uc.decode(d, (int)c * NCTX + (mode >= 2 ? ctx[c] : 0));
+            uint64_t z = uc.decode(d, (((int)c * NCTX + (mode >= 2 ? ctx[c] : 0)) * SM + sg[c]) * RM + ret_class(i));
             int64_t v = unzigzag(z);
+            if (sgnctx) sg[c] = sgn_push(sg[c], v);
             if (mode == 3) { v += prev2[c]; prev2[c] = v; }
             int64_t x = (mode == 0) ? v : prev[c] + v;
             out[c][i] = x;
@@ -1637,13 +1668,21 @@ template <class T>
 static void enc_resid(const std::vector<std::vector<T>>& res, std::vector<uint8_t>& out) {
     size_t nc = res.size(), n = nc ? res[0].size() : 0;
     Encoder e;
-    UIntCoder uc((int)nc * NCTX, 64);
-    std::vector<int> ctx(nc, 0);
+    // 符号つきの文脈（旗 符1/2/4 が立っているときだけ）。桁数の文脈は符号を捨てるので、
+    // 直前の残差の符号の履歴を足す。幾何で効いたものを属性の残差にも使う。
+    const bool sgnctx = sgn_ctx_on();
+    const int SM = sgnctx ? sgn_mul() : 1;
+    // 戻りの種類（光線の旗）。残差が点の並び順に並んでいる符号器でだけ意味がある。
+    const int RM = ret_mul();
+    UIntCoder uc((int)nc * NCTX * SM * RM, 64);
+    std::vector<int> ctx(nc, 0), sg(nc, 0);
     for (size_t i = 0; i < n; ++i)
         for (size_t c = 0; c < nc; ++c) {
-            uint64_t z = zigzag((int64_t)res[c][i]);
-            uc.encode(e, z, (int)c * NCTX + ctx[c]);
+            const int64_t r = (int64_t)res[c][i];
+            uint64_t z = zigzag(r);
+            uc.encode(e, z, (((int)c * NCTX + ctx[c]) * SM + sg[c]) * RM + ret_class(i));
             ctx[c] = ctx_of(z);
+            if (sgnctx) sg[c] = sgn_push(sg[c], r);
         }
     out = e.finish();
 }
@@ -1689,13 +1728,18 @@ static void dec_resid(const uint8_t* data, size_t len, size_t n, size_t nc,
                       std::vector<std::vector<int64_t>>& res) {
     res.assign(nc, std::vector<int64_t>(n));
     Decoder d(data, len);
-    UIntCoder uc((int)nc * NCTX, 64);
-    std::vector<int> ctx(nc, 0);
+    const bool sgnctx = sgn_ctx_on();
+    const int SM = sgnctx ? sgn_mul() : 1;
+    const int RM = ret_mul();
+    UIntCoder uc((int)nc * NCTX * SM * RM, 64);
+    std::vector<int> ctx(nc, 0), sg(nc, 0);
     for (size_t i = 0; i < n; ++i)
         for (size_t c = 0; c < nc; ++c) {
-            uint64_t z = uc.decode(d, (int)c * NCTX + ctx[c]);
-            res[c][i] = unzigzag(z);
+            uint64_t z = uc.decode(d, (((int)c * NCTX + ctx[c]) * SM + sg[c]) * RM + ret_class(i));
+            const int64_t r = unzigzag(z);
+            res[c][i] = r;
             ctx[c] = ctx_of(z);
+            if (sgnctx) sg[c] = sgn_push(sg[c], r);
         }
 }
 
@@ -2399,6 +2443,47 @@ static const int RAWKEEP_ENV = [] {
     return e ? atoi(e) : -1;
 }();
 static inline int rawkeep_env() { return g_decoding ? -1 : RAWKEEP_ENV; }
+// 速さの表の差し替え（実験用。PCC_BM_SCHED="1,2,2,3,3,4,5,6,6,7" のように 10 個）。
+// 他の実験用の変数と同じく、復号は常に既定の表を使い、pack は許可なしでは断る。
+static const std::array<uint8_t, 256> BM_RATE_ENV = [] {
+    int sch[10];
+    for (int k = 0; k < 10; ++k) sch[k] = BM_SCHED_ADAPT[k];
+    if (const char* e = getenv("PCC_BM_SCHED")) {
+        int k = 0;
+        for (const char* p = e; *p && k < 10; ) {
+            char* end = nullptr;
+            long v = strtol(p, &end, 10);
+            if (end == p) break;
+            if (v >= 1 && v <= 12) sch[k++] = (int)v;
+            p = (*end == ',') ? end + 1 : end;
+        }
+        for (; k > 0 && k < 10; ++k) sch[k] = sch[k - 1];
+    }
+    return make_bm_rate(sch);
+}();
+static inline const uint8_t* bm_rate_pcc2() {
+    return g_decoding ? BM_RATE_ADAPT.data() : BM_RATE_ENV.data();
+}
+// 旗（C_FAST_BIT）の表の差し替え（実験用。PCC_BM_SCHED2、同じく 10 個）
+static const std::array<uint8_t, 256> BM_RATE_ENV2 = [] {
+    int sch[10];
+    for (int k = 0; k < 10; ++k) sch[k] = BM_SCHED_FAST[k];
+    if (const char* e = getenv("PCC_BM_SCHED2")) {
+        int k = 0;
+        for (const char* p = e; *p && k < 10; ) {
+            char* end = nullptr;
+            long v = strtol(p, &end, 10);
+            if (end == p) break;
+            if (v >= 1 && v <= 12) sch[k++] = (int)v;
+            p = (*end == ',') ? end + 1 : end;
+        }
+        for (; k > 0 && k < 10; ++k) sch[k] = sch[k - 1];
+    }
+    return make_bm_rate(sch);
+}();
+static inline const uint8_t* bm_rate_flag() {
+    return g_decoding ? BM_RATE_FAST.data() : BM_RATE_ENV2.data();
+}
 
 static const Col* aux_col_at(const std::vector<uint8_t>& param,
                              const CodecCtx* ctx, size_t off) {
@@ -2431,16 +2516,21 @@ bool codec_encode(uint16_t id, const std::vector<const Col*>& cols,
         int fsym, raw;
         int mtc, bnd, lms, sgb, ray, srf, dcd;
         const Col* rbf;
+        const std::vector<int32_t>* ord;
+        const uint8_t* bmr;
         FlagGuard() : fsym(UIntCoder::FSYM), raw(UIntCoder::RAWKEEP),
                       mtc(UIntCoder::MATCH), bnd(UIntCoder::BUNDLE),
                       lms(g_lms), sgb(g_sgnbits), ray(g_ray), srf(g_surf),
-                      dcd(g_decoding), rbf(g_ray_bf) {}
+                      dcd(g_decoding), rbf(g_ray_bf), ord(g_resid_ord), bmr(g_bm_rate) {}
         ~FlagGuard() { UIntCoder::FSYM = fsym; UIntCoder::RAWKEEP = raw;
                        UIntCoder::MATCH = mtc; UIntCoder::BUNDLE = bnd;
                        g_lms = lms; g_sgnbits = sgb; g_ray = ray; g_ray_bf = rbf;
-                       g_surf = srf; g_decoding = dcd; }
+                       g_surf = srf; g_decoding = dcd; g_resid_ord = ord; g_bm_rate = bmr; }
     } flag_guard;
+    g_resid_ord = nullptr;
+    // PCC2 の符号器は出現回数で適応の速さを変える模型を使う（rangecoder.hpp）
     g_decoding = 0;
+    g_bm_rate = (id & C_FAST_BIT) ? bm_rate_flag() : bm_rate_pcc2();   // g_decoding を決めてから
     UIntCoder::FSYM = (id & C_FSYM_BIT) ? 1 : 0;
     UIntCoder::RAWKEEP = (id & C_RAW_BIT) ? C_RAW_KEEP : rawkeep_env();
     UIntCoder::MATCH = (id & C_MTC_BIT) ? 1 : 0;
@@ -2578,6 +2668,7 @@ bool codec_encode(uint16_t id, const std::vector<const Col*>& cols,
         if (P > 0 && P != 100) {
             pdt = ctx->ensure(n, P, &pm);
             if (!pdt) { err = "座標がない"; return false; }
+            g_resid_ord = pm;                   // 残差は符号化順に並ぶ
         }
         {
             // **空間予測を掛けるときは、最初から符号化順に差を作る。**
@@ -2639,8 +2730,9 @@ bool codec_encode(uint16_t id, const std::vector<const Col*>& cols,
         int P = param[0];
         size_t n = cols[0]->size();
         const std::vector<int32_t>* pm = nullptr;
-            const std::vector<int32_t>* pdt = ctx->ensure(n, P, &pm);
-            if (!pdt) { err = "座標がない"; return false; }
+        const std::vector<int32_t>* pdt = ctx->ensure(n, P, &pm);
+        if (!pdt) { err = "座標がない"; return false; }
+        g_resid_ord = pm;                       // 残差は符号化順に並ぶ（戻りの種類の文脈に要る）
         // **入力列を複製してはいけない。**候補ごとに n*8 byte を余分に取ることになり、
         // 並列に走る本数だけ積み上がる（200 万点・16 並列で 256 MB）。
         if (id == C_ATTR_COLOR) {
@@ -2688,16 +2780,21 @@ bool codec_decode(uint16_t id, const std::vector<uint8_t>& param,
         int fsym, raw;
         int mtc, bnd, lms, sgb, ray, srf, dcd;
         const Col* rbf;
+        const std::vector<int32_t>* ord;
+        const uint8_t* bmr;
         FlagGuard() : fsym(UIntCoder::FSYM), raw(UIntCoder::RAWKEEP),
                       mtc(UIntCoder::MATCH), bnd(UIntCoder::BUNDLE),
                       lms(g_lms), sgb(g_sgnbits), ray(g_ray), srf(g_surf),
-                      dcd(g_decoding), rbf(g_ray_bf) {}
+                      dcd(g_decoding), rbf(g_ray_bf), ord(g_resid_ord), bmr(g_bm_rate) {}
         ~FlagGuard() { UIntCoder::FSYM = fsym; UIntCoder::RAWKEEP = raw;
                        UIntCoder::MATCH = mtc; UIntCoder::BUNDLE = bnd;
                        g_lms = lms; g_sgnbits = sgb; g_ray = ray; g_ray_bf = rbf;
-                       g_surf = srf; g_decoding = dcd; }
+                       g_surf = srf; g_decoding = dcd; g_resid_ord = ord; g_bm_rate = bmr; }
     } flag_guard;
+    g_resid_ord = nullptr;
+    // PCC2 の符号器は出現回数で適応の速さを変える模型を使う（rangecoder.hpp）
     g_decoding = 1;                       // 実験用の環境変数を読まない
+    g_bm_rate = (id & C_FAST_BIT) ? bm_rate_flag() : bm_rate_pcc2();   // g_decoding を決めてから
     UIntCoder::FSYM = (id & C_FSYM_BIT) ? 1 : 0;
     UIntCoder::RAWKEEP = (id & C_RAW_BIT) ? C_RAW_KEEP : rawkeep_env();
     UIntCoder::MATCH = (id & C_MTC_BIT) ? 1 : 0;
@@ -2813,13 +2910,20 @@ bool codec_decode(uint16_t id, const std::vector<uint8_t>& param,
         int P = param[0];
         // 配列は 1 本で足りる。残差 → 復元 → 参照列を足す、をその場で行う。
         std::vector<std::vector<int64_t>> d;
+        // 戻りの種類の文脈を使う流れは、残差をほどく前に順序表が要る
+        const std::vector<int32_t>* pm = nullptr;
+        const std::vector<int32_t>* pdt = nullptr;
+        if (P > 0 && P != 100 && g_ray) {
+            pdt = ctx->ensure(n, P, &pm);
+            if (!pdt) { err = "座標がない"; return false; }
+            g_resid_ord = pm;
+        }
         dec_resid(data, len, n, 1, d);
         if (P == 100) {
             int64_t acc = 0;
             for (size_t i = 0; i < n; ++i) { acc += d[0][i]; d[0][i] = acc; }
         } else if (P > 0) {
-            const std::vector<int32_t>* pm = nullptr;
-            const std::vector<int32_t>* pdt = ctx->ensure(n, P, &pm);
+            if (!pdt) pdt = ctx->ensure(n, P, &pm);
             if (!pdt) { err = "座標がない"; return false; }
             spatial_restore(d[0], *pm, *pdt, P, n, d[0]);
         }
@@ -2835,9 +2939,15 @@ bool codec_decode(uint16_t id, const std::vector<uint8_t>& param,
         // 同じ波で走る他の流れが、表が建つまで残差の復号を始められない。
         // 先にほどけば、表の構築と他の流れの復号が重なる（200 万点で 0.12 s）。
         std::vector<std::vector<int64_t>> res;
-        dec_resid(data, len, n, ncol, res);
         const std::vector<int32_t>* pm = nullptr;
-        const std::vector<int32_t>* pdt = ctx->ensure(n, P, &pm);
+        const std::vector<int32_t>* pdt = nullptr;
+        if (g_ray) {                            // 戻りの種類の文脈は順序表が先に要る
+            pdt = ctx->ensure(n, P, &pm);
+            if (!pdt) { err = "座標がない"; return false; }
+            g_resid_ord = pm;
+        }
+        dec_resid(data, len, n, ncol, res);
+        if (!pdt) pdt = ctx->ensure(n, P, &pm);
         if (!pdt) { err = "座標がない"; return false; }
         for (size_t c = 0; c < ncol; ++c)
             spatial_restore(res[c], *pm, *pdt, P, n, res[c]);   // その場で復元する
@@ -2935,6 +3045,8 @@ static double entropy_spatial_diff(const Col& a, const Col& b,
 // 「double free or corruption」で落ちることがあった（ThreadSanitizer で 101 件）。
 // 読むだけの static（名前の表）は問題ない。
 std::string cand_name(uint16_t c, const std::vector<uint8_t>& p) {
+    if (c & C_FAST_BIT)
+        return cand_name((uint16_t)(c & ~C_FAST_BIT), p) + "速";
     if (c & C_RAW_BIT)
         return cand_name((uint16_t)(c & ~C_RAW_BIT), p) + "生";
     if (c & C_MTC_BIT)
@@ -3290,14 +3402,32 @@ static void post_flags(Stream& best, size_t& bestsz, const std::vector<const Col
     // red-rocks の中央 200 万点（勝者 幾何v1記）で実際にそうなっていた。
     const uint16_t bid0 = (uint16_t)(b0 & ~C_FLAG_MASK);
     const int gp0 = best.param.empty() ? 0 : best.param[0];
+    // 属性の残差符号器（差分・文脈つき差分・参照・空間予測・色）も符号つきの文脈を持つ
+    // （enc_resid と enc_cols の mode 1〜3）。PCC_ATTR_SGN=0 で外せる（測り比べ用）。
+    static const bool ATTR_SGN = [] {
+        const char* e = getenv("PCC_ATTR_SGN"); return !e || e[0] != '0'; }();
+    const bool attr_sgn = ATTR_SGN &&
+        (bid0 == C_RANGE_DELTA || bid0 == C_RANGE_CTX || bid0 == C_RANGE_CTX2 ||
+         bid0 == C_ATTR_XREF || bid0 == C_ATTR_SPATIAL || bid0 == C_ATTR_COLOR);
     const bool sgn_ok =
         (bid0 == C_GEOM_XYZ && (gp0 == 3 || gp0 == 4)) ||
         bid0 == C_GEOM_ROT ||
-        (bid0 == C_GEOM_SCAN && (gp0 == 3 || gp0 == 4));
+        (bid0 == C_GEOM_SCAN && (gp0 == 3 || gp0 == 4)) || attr_sgn;
+    // 属性の流れにも 3 通り（符1・符2・符4）を全部試す。
+    // **2 段（まず符1、勝ったら符2・符4）にすると速いが、縮む量の大半を失う。**
+    // 15 件の中央 200 万点で符号化 39.34 → 36.36 s（全部試す前は 34.71）になる代わりに、
+    // AHN4 _21 は −0.244 → −0.030 bpp、fullwave は −0.231 → 0 bpp。符2・符4 は
+    // **符1 だけでは無印に勝てない流れ**で勝っていた。サイズが第一なので既定は全部。
+    // PCC_ATTR_SGN_STAGED=1 で 2 段にできる（符号化器だけの選択で、器は変わらない）。
+    static const bool SGN_STAGED = [] {
+        const char* e = getenv("PCC_ATTR_SGN_STAGED"); return e && e[0] == '1'; }();
+    const bool sgn_staged = attr_sgn && SGN_STAGED;
     if (!(b0 & (C_LMS_BIT | C_SGN2_BIT)) && sgn_ok) {
         pc.push_back({(uint16_t)(b0 | C_LMS_BIT), best.param});
-        pc.push_back({(uint16_t)(b0 | C_SGN2_BIT), best.param});
-        pc.push_back({(uint16_t)(b0 | C_LMS_BIT | C_SGN2_BIT), best.param});
+        if (!sgn_staged) {
+            pc.push_back({(uint16_t)(b0 | C_SGN2_BIT), best.param});
+            pc.push_back({(uint16_t)(b0 | C_LMS_BIT | C_SGN2_BIT), best.param});
+        }
     }
     // **光線モデル**（同一パルスの戻りは 1 本の直線に乗る）。実装したのは
     // enc_geom_x（幾何v3・回転）と enc_geom_w（幾何v4）の 2 経路。
@@ -3323,6 +3453,34 @@ static void post_flags(Stream& best, size_t& bestsz, const std::vector<const Col
         }
     }
     const bool ray_ok = ray_geo && has_cont;
+    // **属性の戻りの種類の文脈**（光線の旗を属性の符号器で使う）。空間予測は残差を
+    // 符号化順に送るので、順序表（g_resid_ord）で点の番号に引き直す。
+    // bit_fields が属性より先に出る並び（走査モデル用の前置き列）でなければ使わない。
+    // 前置き列そのもの（point_source_id・gps_time・bit_fields）には付けない（循環する）。
+    static const bool ATTR_RAY = [] {
+        const char* e = getenv("PCC_ATTR_RAY"); return !e || e[0] != '0'; }();
+    bool ray_attr = false;
+    if (ATTR_RAY && ctx && ctx->bitfields_first && !(b0 & C_RAY_BIT) &&
+        (bid0 == C_RANGE || bid0 == C_RANGE_DELTA || bid0 == C_RANGE_CTX || bid0 == C_RANGE_CTX2 ||
+         bid0 == C_ATTR_XREF || bid0 == C_ATTR_SPATIAL || bid0 == C_ATTR_COLOR)) {
+        bool pre_col = false;
+        for (const auto& c : best.cols)
+            if (c == "point_source_id" || c == "gps_time" || c == "bit_fields") pre_col = true;
+        const Col* bf = (!pre_col && ctx->fr) ? ctx->fr->get("bit_fields") : nullptr;
+        if (bf) {                       // 複数の戻りが 1 つでもあるときだけ（無ければ文脈が 1 つ）
+            const size_t nb = bf->size();
+            for (size_t i = 0; i < nb && !ray_attr; ++i)
+                if ((((uint64_t)(*bf)[i] >> 4) & 15) > 1) ray_attr = true;
+        }
+    }
+    if (ray_attr) {
+        pc.push_back({(uint16_t)(b0 | C_RAY_BIT), best.param});
+        if (!(b0 & (C_LMS_BIT | C_SGN2_BIT))) {
+            pc.push_back({(uint16_t)(b0 | C_RAY_BIT | C_LMS_BIT), best.param});
+            pc.push_back({(uint16_t)(b0 | C_RAY_BIT | C_SGN2_BIT), best.param});
+            pc.push_back({(uint16_t)(b0 | C_RAY_BIT | C_LMS_BIT | C_SGN2_BIT), best.param});
+        }
+    }
     if (ray_ok) {
         pc.push_back({(uint16_t)(b0 | C_RAY_BIT), best.param});
         pc.push_back({(uint16_t)(b0 | C_RAY_BIT | C_LMS_BIT), best.param});
@@ -3360,6 +3518,30 @@ static void post_flags(Stream& best, size_t& bestsz, const std::vector<const Col
             }
         }
     }
+    // 符1 が勝った属性の流れにだけ、符号の履歴を長くした版（符2・符4）を試す。
+    if (sgn_staged && !(b0 & (C_LMS_BIT | C_SGN2_BIT)) && best.codec == (uint16_t)(b0 | C_LMS_BIT)) {
+        std::vector<Cand> ps = {{(uint16_t)(b0 | C_SGN2_BIT), best.param},
+                                {(uint16_t)(b0 | C_LMS_BIT | C_SGN2_BIT), best.param}};
+        std::vector<std::vector<uint8_t>> pb;
+        std::vector<std::string> pe;
+        std::vector<char> pok;
+        encode_many(ps, cv, ctx, pb, pe, pok, false);
+        for (size_t i = 0; i < ps.size(); ++i) {
+            if (!pok[i]) continue;
+            if (trace) {
+                char m[160];
+                snprintf(m, sizeof m, "      %-10s %8.3f bpp（符1 が勝ったので符号の履歴を長くした版）\n",
+                         cand_name(ps[i].codec, ps[i].param).c_str(),
+                         npts ? pb[i].size() * 8.0 / npts : 0.0);
+                *trace += m;
+            }
+            if (pb[i].size() < bestsz) {
+                bestsz = pb[i].size();
+                best.codec = ps[i].codec;
+                best.data = std::move(pb[i]);
+            }
+        }
+    }
     // **2 段目: 曲面による z の予測を、1 段目の勝者に重ねる。**
     // 旗の組み合わせを全部出すと数が爆発するので、1 段目（符号・光線・生・束）で
     // 決まった勝者にだけ、格子の大きさ 3 通りを足して測る。効くのは幾何v4 だけ。
@@ -3388,6 +3570,39 @@ static void post_flags(Stream& best, size_t& bestsz, const std::vector<const Col
                 bestsz = pb2[i].size();
                 best.codec = pc2[i].codec;
                 best.data = std::move(pb2[i]);
+            }
+        }
+    }
+    // **3 段目: 速い後半の適応（速）を、ここまでの勝者に重ねる。**1 本だけ符号化する。
+    // 候補の比較は既定の表（遅い後半）で行い、最後の勝者にだけ速い表を試す
+    // （逆に、既定を速い表にして最後に遅い表を試すと、候補の選び方が変わって
+    // LAS の 6 件で縮みが減った）。二値の模型を通らない符号器（恒等・素の幅・字母）には
+    // 効かないので試さない。
+    {
+        static const bool FAST_ON = [] {
+            const char* e = getenv("PCC_FAST"); return !e || e[0] != '0'; }();
+        const uint16_t b2 = best.codec;
+        const uint16_t bid2 = (uint16_t)(b2 & ~C_FLAG_MASK);
+        if (FAST_ON && !(b2 & C_FAST_BIT) && bid2 != C_RAW64 && bid2 != C_RAW_W &&
+            bid2 != C_RANGE_SYM) {
+            std::vector<Cand> p3 = {{(uint16_t)(b2 | C_FAST_BIT), best.param}};
+            std::vector<std::vector<uint8_t>> pb3;
+            std::vector<std::string> pe3;
+            std::vector<char> pok3;
+            encode_many(p3, cv, ctx, pb3, pe3, pok3, false);
+            if (pok3[0]) {
+                if (trace) {
+                    char m[160];
+                    snprintf(m, sizeof m, "      %-10s %8.3f bpp（勝者を速い後半の適応にした版）\n",
+                             cand_name(p3[0].codec, p3[0].param).c_str(),
+                             npts ? pb3[0].size() * 8.0 / npts : 0.0);
+                    *trace += m;
+                }
+                if (pb3[0].size() < bestsz) {
+                    bestsz = pb3[0].size();
+                    best.codec = p3[0].codec;
+                    best.data = std::move(pb3[0]);
+                }
             }
         }
     }
@@ -4066,7 +4281,8 @@ std::vector<Stream> plan_streams(const Frame& f, bool joint_geom, std::string* l
                 }
                 return false;
             };
-            // cand_name が付ける順（内→外: 記・符・光・面・束・照・生）の逆に剥がす
+            // cand_name が付ける順（内→外: 記・符・光・面・束・照・生・速）の逆に剥がす
+            strip("速", C_FAST_BIT);
             strip("生", C_RAW_BIT);
             strip("照", C_MTC_BIT);
             strip("束", C_BND_BIT);
@@ -4520,7 +4736,8 @@ bool plan_from_binary(const std::vector<uint8_t>& b, const Frame& f, std::string
 // 器の版。**読み方が変わったら上げる。**古い版は黙って読み違えるより、はっきり断る。
 //   1 … 2026-09 まで
 //   2 … LAS の封筒の末尾を「札つきの拡張」に改めた（ヘッダの欄・ユーザーデータを持つ）
-static const uint16_t PCC2_VERSION = 2;
+//   3 … 二値の模型の適応の速さを出現回数で変えるようにした（全部の流れのビット列が変わる）
+static const uint16_t PCC2_VERSION = 3;
 
 bool write_pcc2(const std::string& path, const Frame& f, const std::vector<Stream>& st,
                 uint64_t& bytes_out, std::string& err) {

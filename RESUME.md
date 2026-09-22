@@ -1,15 +1,17 @@
 # 再開手順 / 現在地
 
-最終更新: 2026-09-22。
+最終更新: 2026-09-23。
 
 > **下の作業一覧は日付つきの履歴である。各行はその日の値であって、現在の値ではない。**
 > 2026-09-22 に (1) 落としていた点の次元・VLR・EVLR・ヘッダの欄を全部保存するように
 > し（基準も列も変わったので、それ以前のサイズ・速度とは直接比べられない）、
 > (2) 幾何の予測子を直し、(3) 向き追従の符号器を足した。
-> **現在の値は [`results/standing.md`](results/standing.md)**（到達点）と
-> [`results/losses.md`](results/losses.md)（何をどう直したか）を見ること。
-> 要点: 全列 対 LASzip **−13.9%（15/15）**、幾何単体で **LAZ に 17/17**、
-> 符号化 26.5x・復号 8.3x・527 byte/点。
+> **現在の値は [`results/standing.md`](results/standing.md)**（到達点・数値の正本）と
+> [`results/losses.md`](results/losses.md)（何をどう直したか）を見ること。文書の地図は
+> [`results/INDEX.md`](results/INDEX.md)。
+> 要点（2026-09-23）: 全列 対 LASzip **−14.3%（15/15）**、幾何単体で **LAZ に 17/17**（0.90x）、
+> 符号化 36.5x・復号 9.5x・647 byte/点。
+> 2026-09-23 に器の版を 2 に上げた（`results/defects.md`）。**版 1 の .pcc2 は読めない**ので作り直すこと。
 
 ## 1. 再開時にまずこれを打つ
 
@@ -36,7 +38,9 @@ export LD_LIBRARY_PATH=$HOME/tools/laszip-install/lib:$LD_LIBRARY_PATH
 
 ```bash
 ./cpp/build/pccnorm pack data/raw/small/autzen_trim.laz /tmp/t.pcc2
-# → 「検証  全列一致 = true」「決定性 バイト一致」が出れば正常
+# → 「検証  全列一致 = true」「LAS に書き戻して元と一致 = true」「決定性 バイト一致」が出れば正常
+$PCCPY python/regress_fixes.py     # 作り物で不具合修理を当てる（全項目 OK なら通過）
+$PCCPY -u python/verify_suite.py    # 検証一式（測定と同時に走らせないこと）
 ```
 
 ## 3. 現在地

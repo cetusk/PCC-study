@@ -74,7 +74,7 @@
 | `notes/03_scan_model_codec.md` | 参照 | SM | 走査モデル経由の幾何符号器の設計 |
 | `notes/00_plan.md` | 履歴 | P0 | 最初の前提と段取り |
 | `notes/04_next_steps.md` | 履歴 | SM | 09-20 時点の「今後」。現在の方向は approaches.md |
-| `notes/06_timeline.md` | 履歴 | SM | 09-20 夜までの作業史 |
+| `notes/06_timeline.md` | 履歴 | SM | 09-21 未明までの作業史 |
 
 ### 発見（今も有効な結論）
 
@@ -85,7 +85,7 @@
 | `results/attribute_spatial_finding.md` | 参照（一部訂正）| P1 | 幾何から決めた順序での属性予測 |
 | `results/vendor_generality.md` | 参照 | P1 | 属性の冗長は 9 ベンダで一般的か |
 | `results/ahn4_extrabytes_finding.md` | 参照（訂正済み）| P0/P1 | ExtraBytes 列の冗長 |
-| `results/ahn4_31HZ1_20_4M.md` | 参照 | P0 | AHN4 400 万点のビット内訳 |
+| `results/ahn4_31HZ1_20_4M.md` | 参照 | P0/P1 | AHN4 400 万点のビット内訳（09-18 生成） |
 | `results/externalize_finding.md` | 参照 | P1 | 正規化の後に何が残るか |
 | `results/repeat_survey_finding.md` | 参照 | P1 | 反復測量の差分は幾何の 1.3% しか効かない |
 | `results/subspacing_finding.md` | 参照 | P1 | 点間隔より細かい構造は無い |
@@ -121,8 +121,10 @@
 
 ### 論文
 
+`.tex` は作業木にだけあり、git では PDF だけを追跡する（`.gitignore` の `/paper/*`）。
+
 | 文書 | 札 | 内容 |
 |---|---|---|
-| `paper/pcc.tex` | 現行 | 正規化レイヤーの論文 |
-| `paper/coding.tex` | 現行 | 幾何から導いた順序での属性の可逆符号化 |
-| `paper/order.tex` | 参照 | 入力順がベンチマークを左右すること |
+| `paper/pcc.pdf` | 現行（一部未再測定） | 正規化レイヤーの論文。§e2e（6.3% / 22.3%、295.2 MB）は測り直していない（`notes/07_status.md` §4.5） |
+| `paper/coding.pdf` | 現行 | 幾何から導いた順序での属性の可逆符号化 |
+| `paper/order.pdf` | 参照 | 入力順がベンチマークを左右すること |

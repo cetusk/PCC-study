@@ -189,7 +189,7 @@ def t_lossy(say):
                     x = np.fromfile(k, "<f4").reshape(-1, 4); y = np.fromfile(f"{t}/k.bin", "<f4").reshape(-1, 4)
                     e = float(np.sqrt(((x[:, :3].astype(float) - y[:, :3]) ** 2).sum(1)).max()) if len(x) == len(y) else 1e9
                     same_attr = np.array_equal(x[:, 3].view("<u4"), y[:, 3].view("<u4"))
-                    ok = same_attr and (e <= eps * 1.0001 if eps else e == 0 and x.tobytes() == y.tobytes())
+                    ok = same_attr and (e <= eps * (1 + 1e-9) if eps else e == 0 and x.tobytes() == y.tobytes())
                     errs.append(e)
                 if not ok:
                     bad += 1; say(f"  落ちた: {k.name} eps={eps}")

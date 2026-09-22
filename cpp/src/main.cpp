@@ -183,7 +183,7 @@ static int main_impl(int argc, char** argv) {
         // 実験で測るときだけ PCC_ALLOW_EXPERIMENT=1 を付ける。
         {
             static const char* EXP[] = {"PCC_LMS_KIND", "PCC_LMS_ORD", "PCC_RAY_PRED",
-                                        "PCC_RAY_HIST", "PCC_RAWKEEP"};
+                                        "PCC_RAY_HIST", "PCC_RAWKEEP", "PCC_BM_SCHED", "PCC_BM_SCHED2"};
             const char* allow = getenv("PCC_ALLOW_EXPERIMENT");
             std::string set;
             for (const char* v : EXP) if (getenv(v)) set += std::string(set.empty() ? "" : ", ") + v;
@@ -402,6 +402,7 @@ static int main_impl(int argc, char** argv) {
         std::vector<double> world;
         ctx.fr = &f;
         ctx.force_geom = force_geom;
+        ctx.bitfields_first = joint;         // 走査モデル用の前置き列（bit_fields を含む）が先に出る
         ctx.fast_attr = fast_attr;
         // 実際に空間予測の候補が試されるまで作らない
         if (do_spatial) ctx.want_world = true;
@@ -418,6 +419,7 @@ static int main_impl(int argc, char** argv) {
             sctx.fr = &fs;
             sctx.full = &f;
             sctx.force_geom = force_geom;
+            sctx.bitfields_first = joint;
             sctx.fast_attr = fast_attr;
             if (do_spatial) { frame_world(fs, sworld); sctx.world = &sworld; }
             auto sel = plan_streams(fs, joint, &log, &sctx, trace_all);

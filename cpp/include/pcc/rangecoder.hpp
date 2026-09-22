@@ -1,9 +1,12 @@
 // 決定論的な二値算術符号化器（整数演算のみ）。
 //
-// Python 実装 (python/rangecoder.py) と **バイト単位で一致する** ことを要件とする。
+// 既定の速さの表（BM_RATE_FIXED）では Python 実装 (python/rangecoder.py) と
+// **バイト単位で一致する** ことを要件とする（旧形式の器 PCC1 が使う）。PCC2 の符号器は
+// 出現回数で速さを変える表（BM_RATE_ADAPT）に切り替えるので、Python とは一致しない。
 // 可逆圧縮では符号化側と復号側で丸めが 1 ビットでも違えば復号が破綻するため、
 // 浮動小数は一切使わず、確率状態も 16bit 整数で持つ。
 #pragma once
+#include <array>
 #include <atomic>
 #include <cstdint>
 #include <vector>
@@ -20,8 +23,34 @@ inline constexpr uint32_t TOP = 1u << 24;
 // 1 模型 8 byte になり、文脈が増えたときに当たりが悪くなる。定数にすると 2 byte。
 // 算術は同じなので出力は 1 bit も変わらない。
 inline constexpr int PROB_RATE = 5;
+// **出現回数ごとの適応の速さ。**回数（255 で止める）から速さを引く表を糸ごとに指す。
+//   従来（PCC1・既定）: 全部 PROB_RATE。Python 実装（python/rangecoder.py）とバイト一致する。
+//   PCC2 の符号器（BM_RATE_ADAPT）: 回数の区間 0,1,2,3,4〜7,8〜15,16〜31,32〜63,64〜127,
+//     128〜 に 1,2,2,3,3,4,5,6,6,7。出現の少ない文脈を速く寄せ、長く続いた文脈は遅く
+//     寄せて雑音に振られないようにする。LAS の 15 件で全件が縮んだ。
+//   速い後半（BM_RATE_FAST、旗 C_FAST_BIT）: 同じ区間に 1,2,2,3,3,4,5,5,5,5（後半は従来の
+//     1/32）。場面の変わる KITTI・物体のスキャンでは既定の表より縮むので、流れごとに実測で
+//     選ぶ（results/losses.md）。codec_encode / codec_decode が流れごとに切り替える。
+constexpr std::array<uint8_t, 256> make_bm_rate(const int (&sched)[10]) {
+    std::array<uint8_t, 256> t{};
+    for (int n = 0; n < 256; ++n) {
+        const int slot = n < 4 ? n : (n < 8 ? 4 : (n < 16 ? 5 : (n < 32 ? 6 :
+                         (n < 64 ? 7 : (n < 128 ? 8 : 9)))));
+        t[(size_t)n] = (uint8_t)sched[slot];
+    }
+    return t;
+}
+inline constexpr int BM_SCHED_FIXED[10] = {PROB_RATE, PROB_RATE, PROB_RATE, PROB_RATE, PROB_RATE,
+                                           PROB_RATE, PROB_RATE, PROB_RATE, PROB_RATE, PROB_RATE};
+inline constexpr int BM_SCHED_ADAPT[10] = {1, 2, 2, 3, 3, 4, 5, 6, 6, 7};
+inline constexpr int BM_SCHED_FAST[10]  = {1, 2, 2, 3, 3, 4, 5, 5, 5, 5};
+inline constexpr std::array<uint8_t, 256> BM_RATE_FIXED = make_bm_rate(BM_SCHED_FIXED);
+inline constexpr std::array<uint8_t, 256> BM_RATE_ADAPT = make_bm_rate(BM_SCHED_ADAPT);
+inline constexpr std::array<uint8_t, 256> BM_RATE_FAST  = make_bm_rate(BM_SCHED_FAST);
+inline thread_local const uint8_t* g_bm_rate = BM_RATE_FIXED.data();
 struct BitModel {
     uint16_t p0 = PROB_ONE >> 1;
+    uint8_t n = 0;                       // 出現回数（255 で止める）
     static constexpr int rate = PROB_RATE;
     // 0 や PROB_ONE に張り付くと正規化ループが進まなくなるが、rate >= 1 なら
     // そこには届かない。bit=1 を繰り返しても p0 >> rate が 0 になる 2^rate - 1 で
@@ -29,7 +58,9 @@ struct BitModel {
     // 分岐を使わない。下位ビットはほぼ一様なので分岐予測が当たらず、
     // 1 ビットあたり十数サイクルを取られる。mask は bit が 1 なら全ビット 1。
     inline void update_m(uint32_t mask) {
-        uint32_t up = (PROB_ONE - p0) >> rate, dn = p0 >> rate;
+        const int r = g_bm_rate[n];
+        n = (uint8_t)(n + (n < 255));
+        uint32_t up = (PROB_ONE - p0) >> r, dn = p0 >> r;
         p0 = (uint16_t)(p0 + (up & ~mask) - (dn & mask));
     }
     inline void update(int bit) { update_m((uint32_t)-(uint32_t)(bit != 0)); }

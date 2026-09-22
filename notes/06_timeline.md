@@ -1,6 +1,6 @@
 # 時系列 — これまでにやったこと
 
-> **履歴**（2026-09-23 の索引 `results/INDEX.md` による）: 09-20 夜までの作業史。**現在の数値は `results/standing.md`**。
+> **履歴**（2026-09-23 の索引 `results/INDEX.md` による）: 09-21 未明までの作業史。**現在の数値は `results/standing.md`**。
 
 証拠は git のコミット時刻と `data/work/` のファイル更新時刻。
 節番号は [`results/scan_model_fitting.md`](../results/scan_model_fitting.md) を指す。
