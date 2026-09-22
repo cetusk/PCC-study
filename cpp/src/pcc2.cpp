@@ -561,16 +561,20 @@ static void enc_geom_med(const std::vector<const Col*>& cols,
                          std::vector<uint8_t>& out) {
     size_t nc = cols.size(), n = nc ? cols[0]->size() : 0;
     Encoder e;
-    UIntCoder uc((int)nc * NCTX, 64);
+    const bool sgnctx = sgn_ctx_on();          // 符号つきの文脈（旗 符1/2/4）
+    const int SM = sgnctx ? sgn_mul() : 1;
+    UIntCoder uc((int)nc * NCTX * SM, 64);
     std::vector<MedPred> mp(nc);
-    std::vector<int> ctx(nc, 0);
+    std::vector<int> ctx(nc, 0), sg(nc, 0);
     for (size_t i = 0; i < n; ++i)
         for (size_t c = 0; c < nc; ++c) {
             int64_t x = (*cols[c])[i];
-            uint64_t z = zigzag(x - mp[c].predict());
-            uc.encode(e, z, (int)c * NCTX + ctx[c]);
+            const int64_t r = x - mp[c].predict();
+            uint64_t z = zigzag(r);
+            uc.encode(e, z, ((int)c * NCTX + ctx[c]) * SM + sg[c]);
             mp[c].push(x);
             ctx[c] = ctx_of(z);
+            if (sgnctx) sg[c] = sgn_push(sg[c], r);
         }
     out = e.finish();
 }
@@ -578,16 +582,20 @@ static void dec_geom_med(const uint8_t* data, size_t len, size_t n, size_t nc,
                          std::vector<std::vector<int64_t>>& out) {
     out.assign(nc, std::vector<int64_t>(n));
     Decoder d(data, len);
-    UIntCoder uc((int)nc * NCTX, 64);
+    const bool sgnctx = sgn_ctx_on();
+    const int SM = sgnctx ? sgn_mul() : 1;
+    UIntCoder uc((int)nc * NCTX * SM, 64);
     std::vector<MedPred> mp(nc);
-    std::vector<int> ctx(nc, 0);
+    std::vector<int> ctx(nc, 0), sg(nc, 0);
     for (size_t i = 0; i < n; ++i)
         for (size_t c = 0; c < nc; ++c) {
-            uint64_t z = uc.decode(d, (int)c * NCTX + ctx[c]);
-            int64_t x = mp[c].predict() + unzigzag(z);
+            uint64_t z = uc.decode(d, ((int)c * NCTX + ctx[c]) * SM + sg[c]);
+            const int64_t r = unzigzag(z);
+            int64_t x = mp[c].predict() + r;
             out[c][i] = x;
             mp[c].push(x);
             ctx[c] = ctx_of(z);
+            if (sgnctx) sg[c] = sgn_push(sg[c], r);
         }
 }
 
@@ -965,10 +973,12 @@ static void enc_geom_dir(const std::vector<const Col*>& cols, int pmode,
                          std::vector<uint8_t>& out) {
     size_t n = cols[0]->size();
     Encoder e;
-    UIntCoder uc(3 * NCTX, 64);
+    const bool sgnctx = sgn_ctx_on();          // 符号つきの文脈（旗 符1/2/4）
+    const int SM = sgnctx ? sgn_mul() : 1;
+    UIntCoder uc(3 * NCTX * SM, 64);
     Pred mp[3];
     for (int c = 0; c < 3; ++c) mp[c].mode = pmode;
-    int prev_kx = 0;
+    int prev_kx = 0, sg[3] = {0, 0, 0};
     int64_t px = 0, py = 0, pdx = 0, pdy = 0;
     for (size_t i = 0; i < n; ++i) {
         int k[3] = {0, 0, 0};
@@ -977,12 +987,14 @@ static void enc_geom_dir(const std::vector<const Col*>& cols, int pmode,
         for (int c = 0; c < 3; ++c) {
             int64_t v = (*cols[c])[i];
             int64_t pr = (c == 1) ? dir_pred_y(py, dx, pdx, pdy) : mp[c].predict();
-            uint64_t z = zigzag(wsub(v, pr));
+            const int64_t r = wsub(v, pr);
+            uint64_t z = zigzag(r);
             int ctxc = (c == 0) ? prev_kx : (c == 1 ? k[0] : (k[0] + k[1]) / 2);
             if (ctxc >= NCTX) ctxc = NCTX - 1;
-            uc.encode(e, z, c * NCTX + ctxc);
+            uc.encode(e, z, (c * NCTX + ctxc) * SM + sg[c]);
             mp[c].push(v);
             k[c] = ctx_of(z);
+            if (sgnctx) sg[c] = sgn_push(sg[c], r);
         }
         prev_kx = k[0];
         px = x; py = y; pdx = dx; pdy = dy;
@@ -993,10 +1005,12 @@ static void dec_geom_dir(const uint8_t* data, size_t len, size_t n, int pmode,
                          std::vector<std::vector<int64_t>>& out) {
     out.assign(3, std::vector<int64_t>(n));
     Decoder d(data, len);
-    UIntCoder uc(3 * NCTX, 64);
+    const bool sgnctx = sgn_ctx_on();
+    const int SM = sgnctx ? sgn_mul() : 1;
+    UIntCoder uc(3 * NCTX * SM, 64);
     Pred mp[3];
     for (int c = 0; c < 3; ++c) mp[c].mode = pmode;
-    int prev_kx = 0;
+    int prev_kx = 0, sg[3] = {0, 0, 0};
     int64_t px = 0, py = 0, pdx = 0, pdy = 0;
     for (size_t i = 0; i < n; ++i) {
         int k[3] = {0, 0, 0};
@@ -1004,12 +1018,14 @@ static void dec_geom_dir(const uint8_t* data, size_t len, size_t n, int pmode,
         for (int c = 0; c < 3; ++c) {
             int ctxc = (c == 0) ? prev_kx : (c == 1 ? k[0] : (k[0] + k[1]) / 2);
             if (ctxc >= NCTX) ctxc = NCTX - 1;
-            uint64_t z = uc.decode(d, c * NCTX + ctxc);
+            uint64_t z = uc.decode(d, (c * NCTX + ctxc) * SM + sg[c]);
             int64_t pr = (c == 1) ? dir_pred_y(py, dx, pdx, pdy) : mp[c].predict();
-            int64_t v = wadd(pr, unzigzag(z));
+            const int64_t r = unzigzag(z);
+            int64_t v = wadd(pr, r);
             out[c][i] = v;
             mp[c].push(v);
             k[c] = ctx_of(z);
+            if (sgnctx) sg[c] = sgn_push(sg[c], r);
             if (c == 0) { x = v; dx = wsub(x, px); }
         }
         prev_kx = k[0];
@@ -3396,10 +3412,10 @@ static void post_flags(Stream& best, size_t& bestsz, const std::vector<const Col
     // 符号つきの文脈は幾何の符号器にしか効かない。長さの最適値は
     // ファイルで違うので、1 / 2 / 4 個の 3 通りを出して実測で選ばせる。
     //
-    // **実装している経路に限る。**幾何v0/v1/v2 は enc_cols / enc_geom_med /
-    // enc_geom_aux へ行き、走査も var が 3/4 でなければ enc_resid へ行くので、
-    // 旗を立てても**同じバイト列を 3 回符号化するだけ**になる。
-    // red-rocks の中央 200 万点（勝者 幾何v1記）で実際にそうなっていた。
+    // **実装している経路に限る。**旗を読まない符号器に立てても、同じバイト列を
+    // 3 回符号化するだけになる（以前は幾何v1 がそうだった。2026-09-23 に enc_cols・
+    // enc_resid・enc_geom_med・enc_geom_dir にも符号つきの文脈を入れた。幾何v2 の
+    // enc_geom_aux はまだ読まない）。
     const uint16_t bid0 = (uint16_t)(b0 & ~C_FLAG_MASK);
     const int gp0 = best.param.empty() ? 0 : best.param[0];
     // 属性の残差符号器（差分・文脈つき差分・参照・空間予測・色）も符号つきの文脈を持つ
@@ -3412,7 +3428,12 @@ static void post_flags(Stream& best, size_t& bestsz, const std::vector<const Col
     const bool sgn_ok =
         (bid0 == C_GEOM_XYZ && (gp0 == 3 || gp0 == 4)) ||
         bid0 == C_GEOM_ROT ||
-        (bid0 == C_GEOM_SCAN && (gp0 == 3 || gp0 == 4)) || attr_sgn;
+        // 走査モデルは var 3/4 が enc_resid_x、それ以外（1・2・5 = 走査変換）が enc_resid を
+        // 通る。どちらも符号つきの文脈を持つので全部の var で試す（2026-09-23 に広げた）。
+        bid0 == C_GEOM_SCAN || attr_sgn ||
+        // 幾何v0（enc_cols mode 2）・幾何v1 と med3（enc_geom_med）・向き追従（enc_geom_dir）
+        (bid0 == C_GEOM_XYZ && (gp0 == 0 || gp0 == 1)) || bid0 == C_RANGE_MED ||
+        bid0 == C_GEOM_DIR;
     // 属性の流れにも 3 通り（符1・符2・符4）を全部試す。
     // **2 段（まず符1、勝ったら符2・符4）にすると速いが、縮む量の大半を失う。**
     // 15 件の中央 200 万点で符号化 39.34 → 36.36 s（全部試す前は 34.71）になる代わりに、
