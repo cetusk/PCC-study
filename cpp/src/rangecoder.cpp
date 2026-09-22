@@ -24,4 +24,9 @@ void decode_ints(const uint8_t* buf, size_t nbytes, int64_t* out, size_t n,
 
 namespace pcc {
 thread_local int UIntCoder::FSYM = 0;
+// 既定は -1（仮数部を全部模型に通す＝従来どおり）。
+// codec_encode / codec_decode が流れごとに設定する。
+thread_local int UIntCoder::RAWKEEP = -1;
+thread_local int UIntCoder::MATCH = 0;
+thread_local int UIntCoder::BUNDLE = 0;
 }

@@ -1,5 +1,7 @@
 # PCC-study 進行メモ
 
+> **履歴**（2026-09-23 の索引 `results/INDEX.md` による）: 着手時（09-17）の前提と段取り。**現在の数値は `results/standing.md`**。
+
 ## 確定した前提 (2026-09-17)
 - 対象データ: ① float32 実スキャン (LAS/LAZ, ALS) ② 車載LiDAR (KITTI 系)
 - 精度要件: **未確定 / 動かせる** → ノイズ床基準 (near-lossless) を選択肢に含む

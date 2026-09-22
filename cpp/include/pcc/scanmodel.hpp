@@ -43,7 +43,8 @@ inline int64_t med3(int64_t a, int64_t b, int64_t c) {
     return b;
 }
 struct MedPred {
-    int64_t prev = 0, d[3] = {0, 0, 0}; int k = 0;
+    // k は数え続けるので 64 bit にする（int では 2^31 点で負になり d[k % 3] が範囲外）
+    int64_t prev = 0, d[3] = {0, 0, 0}; uint64_t k = 0;
     inline int64_t predict() const {
         return prev + (k >= 3 ? med3(d[0], d[1], d[2]) : (k ? d[(k - 1) % 3] : 0));
     }

@@ -1,5 +1,7 @@
 # C++ 移植の記録
 
+> **履歴**（2026-09-23 の索引 `results/INDEX.md` による）: Python から C++ への移植の記録（09-18）。**現在の数値は `results/standing.md`**。
+
 Python 実装を全て C++ に書き換え、結果の一致と時間を測った。
 外部依存は LASzip・zstd・nanoflann・GUDHI/CGAL のみ。
 

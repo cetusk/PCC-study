@@ -1,5 +1,6 @@
 #include "pcc/normalize.hpp"
 #include <unordered_map>
+#include <cstring>
 #include <algorithm>
 #include <cmath>
 #include <sstream>
@@ -34,7 +35,7 @@ static double entropy0_diff_sampled(const std::vector<int64_t>& a,
                                     const std::vector<size_t>& idx) {
     std::unordered_map<int64_t, uint64_t> c;
     c.reserve(idx.size() / 4 + 16);
-    for (size_t i : idx) ++c[a[i] - b[i]];
+    for (size_t i : idx) ++c[(int64_t)((uint64_t)a[i] - (uint64_t)b[i])];
     double n = (double)idx.size(), h = 0;
     for (auto& kv : c) { double p = kv.second / n; h -= p * std::log2(p); }
     return h;
@@ -43,7 +44,7 @@ static double entropy0_diff_sampled(const std::vector<int64_t>& a,
 double entropy0_diff(const std::vector<int64_t>& a, const std::vector<int64_t>& b) {
     std::unordered_map<int64_t, uint64_t> c;
     c.reserve(a.size() / 4 + 16);
-    for (size_t i = 0; i < a.size(); ++i) ++c[a[i] - b[i]];
+    for (size_t i = 0; i < a.size(); ++i) ++c[(int64_t)((uint64_t)a[i] - (uint64_t)b[i])];
     double n = (double)a.size(), h = 0;
     for (auto& kv : c) { double p = kv.second / n; h -= p * std::log2(p); }
     return h;
@@ -73,20 +74,27 @@ static bool fit_affine(const std::vector<int64_t>& a, const std::vector<int64_t>
     if (std::abs(denom) < 1e-12) return false;
     double A0 = (m * sxy - sx * sy) / denom;
     static const int64_t DENS[] = {1, 2, 4, 5, 8, 10, 100};
+    // 掛け算は 128 bit で行う。実数の列（ビット列を int64 に入れたもの）は
+    // 2^62 を超える値を持つので、64 bit では桁あふれ（未定義動作）になる。
+    // 復元（apply_plan の drop_affine）も同じ 128 bit の式を使う。
+    typedef __int128 i128;
+    if (!std::isfinite(A0) || std::abs(A0) > 4.0e18 / 100) return false;
     for (int64_t d : DENS) {
         int64_t nu = (int64_t)std::llround(A0 * (double)d);
         if (nu == 0) continue;
         if (std::abs((double)nu / (double)d - A0) > 1e-6) continue;
         // rem = a*d - nu*s が全点で同じ定数か
-        int64_t rem0 = a[0] * d - nu * s[0];
+        const i128 rem0 = (i128)a[0] * d - (i128)nu * s[0];
         bool ok = true;
         for (size_t i = 1; i < n; ++i)
-            if (a[i] * d - nu * s[i] != rem0) { ok = false; break; }
+            if ((i128)a[i] * d - (i128)nu * s[i] != rem0) { ok = false; break; }
         if (!ok) continue;
         if (rem0 % d != 0) continue;
-        int64_t bb = rem0 / d;
+        const i128 bw = rem0 / d;
+        if (bw > INT64_MAX || bw < INT64_MIN) continue;   // 切片が int64 に入らない
+        int64_t bb = (int64_t)bw;
         for (size_t i = 0; i < n; ++i)
-            if (a[i] != (nu * s[i] + bb * d) / d) { ok = false; break; }
+            if ((i128)a[i] != ((i128)nu * s[i] + (i128)bb * d) / d) { ok = false; break; }
         if (!ok) continue;
         num = nu; den = d; b = bb;
         return true;
@@ -211,7 +219,7 @@ void apply_plan(const PointCloud& pc, const Plan& plan,
             const auto& a = pc.fields.at(o.target).v;
             const auto& s = pc.fields.at(o.source).v;
             std::vector<int64_t> r(a.size());
-            for (size_t i = 0; i < a.size(); ++i) r[i] = a[i] - s[i];
+            for (size_t i = 0; i < a.size(); ++i) r[i] = (int64_t)((uint64_t)a[i] - (uint64_t)s[i]);   // 桁あふれしないよう符号なしで引く
             external[o.target] = std::move(r);
             drop.insert(o.target);
         } else drop.insert(o.target);
@@ -235,14 +243,21 @@ bool invert_plan(std::map<std::string, std::vector<int64_t>>& f,
             else if (o->kind == "drop_affine") {
                 const auto& s = f[o->source];
                 std::vector<int64_t> a(n);
-                for (size_t i = 0; i < n; ++i) a[i] = (o->num * s[i] + o->b * o->den) / o->den;
+                if (o->den == 0) { err = "計画の drop_affine の分母が 0: " + o->target; return false; }
+                if (s.size() < n) { err = "計画の元の列が短い: " + o->source; return false; }
+                // 符号化側（fit_affine）と同じ 128 bit の式で戻す
+                for (size_t i = 0; i < n; ++i)
+                    a[i] = (int64_t)(((__int128)o->num * s[i] + (__int128)o->b * o->den) / o->den);
                 f[o->target] = std::move(a);
             } else if (o->kind == "residual_code") {
                 auto it = ext.find(o->target);
                 if (it == ext.end()) { err = "外部ストリームが無い: " + o->target; return false; }
                 const auto& s = f[o->source];
+                // 壊れた計画で範囲外を読まないよう、長さを確かめてから足す
+                if (it->second.size() < n || s.size() < n)
+                    { err = "残差か元の列が短い: " + o->target; return false; }
                 std::vector<int64_t> a(n);
-                for (size_t i = 0; i < n; ++i) a[i] = it->second[i] + s[i];
+                for (size_t i = 0; i < n; ++i) a[i] = (int64_t)((uint64_t)it->second[i] + (uint64_t)s[i]);
                 f[o->target] = std::move(a);
             }
             progressed = true;
@@ -287,7 +302,8 @@ static int64_t jint(const std::string& s, size_t& i) {
     while (i < s.size() && (s[i] == ':' || s[i] == ' ')) ++i;
     size_t st = i;
     while (i < s.size() && (isdigit((unsigned char)s[i]) || s[i] == '-' || s[i] == '+')) ++i;
-    return std::stoll(s.substr(st, i - st));
+    // std::stoll は壊れた計画で例外を投げて落ちる。strtoll なら 0 で返る。
+    return (int64_t)strtoll(s.substr(st, i - st).c_str(), nullptr, 10);
 }
 
 Plan Plan::from_json(const std::string& s) {
@@ -298,17 +314,32 @@ Plan Plan::from_json(const std::string& s) {
     if (i != std::string::npos) { i += 11; p.grid_bits = (int)jint(s, i); }
     i = s.find("\"ops\"");
     if (i == std::string::npos) return p;
+    // 鍵が見つからなければそこで止める。以前は find の npos に長さを足して
+    // 先頭近くへ巻き戻り、同じ操作を際限なく足して bad_alloc で落ちていた。
     while ((i = s.find("{\"kind\"", i)) != std::string::npos) {
         size_t j = i + 7;
         Op o;
         o.kind = jstr(s, j);
-        j = s.find("\"target\"", j) + 8; o.target = jstr(s, j);
-        j = s.find("\"source\"", j) + 8; o.source = jstr(s, j);
-        j = s.find("\"value\"", j) + 7;  o.value = jint(s, j);
-        j = s.find("\"num\"", j) + 5;    o.num = jint(s, j);
-        j = s.find("\"den\"", j) + 5;    o.den = jint(s, j);
-        j = s.find("\"b\"", j) + 3;      o.b = jint(s, j);
+        auto key = [&](const char* k) {
+            const size_t at = s.find(k, j);
+            if (at == std::string::npos) return false;
+            j = at + strlen(k);
+            return true;
+        };
+        if (!key("\"target\"")) break;
+        o.target = jstr(s, j);
+        if (!key("\"source\"")) break;
+        o.source = jstr(s, j);
+        if (!key("\"value\"")) break;
+        o.value = jint(s, j);
+        if (!key("\"num\"")) break;
+        o.num = jint(s, j);
+        if (!key("\"den\"")) break;
+        o.den = jint(s, j);
+        if (!key("\"b\"")) break;
+        o.b = jint(s, j);
         p.ops.push_back(o);
+        if (j <= i) break;               // 前に進まないなら止める
         i = j;
     }
     return p;

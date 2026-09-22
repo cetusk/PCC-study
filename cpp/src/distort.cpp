@@ -40,8 +40,11 @@ static void plane_dists(const std::vector<double>& A, size_t na, const KdTree& t
                 ta.knn(&B[i * 3], k, idx.data(), d2.data());
                 double m[3] = {0, 0, 0};
                 int c = 0;
-                for (int j = 0; j < k; ++j) { if (idx[j] < 0) continue;
-                    for (int t = 0; t < 3; ++t) m[t] += A[(size_t)idx[j]*3+t]; ++c; }
+                for (int j = 0; j < k; ++j) {
+                    if (idx[j] < 0 || (size_t)idx[j] >= na) continue;   // 見つからなかった枠
+                    for (int t = 0; t < 3; ++t) m[t] += A[(size_t)idx[j] * 3 + t];
+                    ++c;
+                }
                 if (c < 3) { d[i] = std::sqrt(d2[0]); continue; }
                 for (int t = 0; t < 3; ++t) m[t] /= c;
                 double C[9] = {0,0,0,0,0,0,0,0,0};

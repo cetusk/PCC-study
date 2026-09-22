@@ -195,14 +195,15 @@
 <div class="wrap">
 
   <header>
-    <p class="eyebrow">可逆点群圧縮・実測比較 / 2026-09-21</p>
+    <p class="eyebrow">可逆点群圧縮・実測比較 / 2026-09-23</p>
     <h1>どの点群圧縮を選ぶか</h1>
     <p class="lede prose">
       航空・車載・地上の LiDAR 15 ファイル、各ファイルの<b>中央 200 万点</b>（足りない
       ものは全点）を、G-PCC・LASzip・本手法（PCC2）で符号化して測った。すべて可逆で、
       往復検証とスレッド数を変えた決定性の確認を通っている。単位は
       <span class="num">bpp</span>（1 点あたり bit）。<b>サイズは規模でほとんど動かないが、
-      速度とメモリは動く</b>ので、20 万点の値も併記する。
+      速度とメモリは動く</b>ので、20 万点の値も併記する
+      （全列 −12.4%、符号化 27.6 倍、復号 4.0 倍）。
     </p>
     <div class="keyrow">
       <span class="key"><i style="background:var(--gpcc)"></i>G-PCC（幾何のみ）</span>
@@ -220,7 +221,7 @@
       <div class="vrow pick">
         <dt>サイズだけを重く見る</dt>
         <dd class="pickname" style="color:var(--pcc2)">PCC2</dd>
-        <dd class="why">end-to-end で <span class="num">−10.9%</span>（15 ファイル中 15 件で小さい）。ただし符号化に <span class="num">15.4</span> 倍の時間と <span class="num">6.5</span> 倍のメモリを払う。</dd>
+        <dd class="why">end-to-end で <span class="num">−14.3%</span>（15 ファイル中 15 件で小さい）。ただし符号化に <span class="num">36.5</span> 倍の時間と、1 点あたり <span class="num">647 byte</span> のメモリを払う。</dd>
       </div>
       <div class="vrow alt">
         <dt>速度・メモリ・互換性</dt>
@@ -230,7 +231,7 @@
       <div class="vrow out">
         <dt>ファイル 1 本を丸ごと</dt>
         <dd class="pickname" style="color:var(--ink-3)">G-PCC は候補外</dd>
-        <dd class="why">幾何しか符号化しない。属性が bit の中央値 <span class="num">59.2%</span> を占めるので、単体では成立しない。</dd>
+        <dd class="why">幾何しか符号化しない。属性が bit の中央値 <span class="num">58.5%</span> を占めるので、単体では成立しない。</dd>
       </div>
     </dl>
   </section>
@@ -248,8 +249,8 @@
     <figure>
       <div class="chart" id="c-share"><div class="tip"></div></div>
       <figcaption>
-        LASzip が使う bit の内訳。濃い側が属性。中央値 <span class="num">59.2%</span>、
-        幅 <span class="num">27.7〜71.9%</span>。<b>色を持たない 4 件が、割合の下位 4 件と
+        LASzip が使う bit の内訳。濃い側が属性。中央値 <span class="num">58.5%</span>、
+        幅 <span class="num">25.9〜81.5%</span>。<b>色を持たない 4 件が、割合の下位 4 件と
         正確に一致する。</b>色を持つファイルはどれも符号長の半分以上を属性に使う。
       </figcaption>
     </figure>
@@ -260,33 +261,36 @@
       <p class="eyebrow">結果 01</p>
       <h2>end-to-end のサイズ — 全 15 件で PCC2 が小さい</h2>
       <p class="prose" style="color:var(--ink-2)">
-        PCC2 はまだ一部の次元を読んでいない（下の但し書き）。
-        <b>その次元を LASzip が符号化するのに使っている bit をそのまま足して</b>見積もっても、
-        すべてのファイルで小さい。欠けが効くのは <span class="num">fullwave</span>（元の 50.9%）と
-        <span class="num">extra</span>（15.7%）の 2 件だけで、残り 13 件では中央値 0.2% にすぎない。
+        <b>PCC2 は元のファイルの全次元・VLR・EVLR・ヘッダの欄を運んでいる</b>ので、
+        足し戻す「欠けの費用」はもう無い。運ぶようにした時点で中央値は
+        −14.0% から −11.5% まで落ち、そこから予測子と模型を直して、さらに
+        <b>1 パルスの戻りは 1 本の光線に乗る</b>という物理から「同じパルスの続きの点」を
+        別の文脈で送り、傾きの履歴から外すようにして、<span class="num">−14.3%</span> まで上げた。
+        下の棒はその状態の実測である。
       </p>
     </div>
     <figure>
       <div class="chart" id="c-e2e"><div class="tip"></div></div>
       <figcaption>
-        元の .laz に対して小さくなった割合。棒が長いほど良い。中央値 <span class="num">−10.9%</span>。
+        元の .laz に対して小さくなった割合。棒が長いほど良い。中央値 <span class="num">−14.3%</span>、
+        幅 −36.5〜−8.5%。
       </figcaption>
     </figure>
     <div class="stats">
       <div class="stat">
         <span class="v" style="color:var(--pcc2)">15 / 15</span>
         <span class="k">PCC2 が小さかったファイル</span>
-        <span class="s">欠けた次元の費用を足した後</span>
+        <span class="s">全次元を運んだ上での実測</span>
       </div>
       <div class="stat">
-        <span class="v">−10.9%</span>
+        <span class="v">−14.3%</span>
         <span class="k">中央値</span>
-        <span class="s">幅 −35.9% 〜 −5.7%</span>
+        <span class="s">幅 −36.5% 〜 −8.5%</span>
       </div>
       <div class="stat">
-        <span class="v">0.2%</span>
-        <span class="k">欠けた次元が占める割合</span>
-        <span class="s">13 件の中央値。残り 2 件は 15.7% と 50.9%</span>
+        <span class="v">0 件</span>
+        <span class="k">検証で落ちたもの</span>
+        <span class="s">往復 15/15・スレッド数 17/17・次元 0/15</span>
       </div>
     </div>
   </section>
@@ -297,7 +301,7 @@
       <h2>優位は幾何ではなく属性から来ている</h2>
       <p class="prose" style="color:var(--ink-2)">
         同じ入力を全列と幾何のみで測り、差を属性ぶんとした。
-        <b>属性の優位は幾何の 2 倍あり、しかも全ファイルで勝っている。</b>
+        <b>属性の優位は幾何の 1.3 倍あり、いまはどちらも全ファイルで勝っている。</b>
         幾何だけを見れば 3 方式は横並びで、そこだけを見て優劣は言えない。
       </p>
     </div>
@@ -305,8 +309,8 @@
       <div class="chart" id="c-split"><div class="tip"></div></div>
       <figcaption>
         LASzip に対して縮んだ割合。右へ長いほど良い。左に出た棒は負けたもの。
-        幾何は <span class="num">13/15</span> で中央値 <span class="num">−9.2%</span>、
-        属性は <span class="num">15/15</span> で中央値 <span class="num">−18.2%</span>。
+        幾何は <span class="num">15/15</span> で中央値 <span class="num">−13.0%</span>、
+        属性は <span class="num">15/15</span> で中央値 <span class="num">−17.3%</span>。
       </figcaption>
     </figure>
     <p class="note prose">
@@ -319,7 +323,7 @@
   <section>
     <div class="sechead">
       <p class="eyebrow">結果 03</p>
-      <h2>3 つの軸 — サイズで勝ち、速度は相手次第、メモリで負ける</h2>
+      <h2>3 つの軸 — サイズで勝ち、速度とメモリで負ける</h2>
       <p class="prose" style="color:var(--ink-2)">
         3 方式を並べられるのは幾何だけなので、この節は幾何のみ・符号化のみ。
         比は <b>ファイルごとに取ってから中央値</b>を出している。
@@ -328,15 +332,16 @@
     <figure>
       <div class="chart" id="c-axes"><div class="tip"></div></div>
       <figcaption>
-        <span class="num">1.0</span> の線が相手と同等。左が良い。
-        サイズは G-PCC と互角で LASzip より 9% 小さい。速度は G-PCC より速く、
-        LASzip より 11 倍遅い。メモリはどちらにも負けるが、候補を 1 本に固定すれば
+        <span class="num">1.0</span> の線が相手と同等。左が良い。17 ファイル。
+        サイズは G-PCC と互角（0.94）で LASzip より <b>10% 小さい</b>（0.90）。
+        速度は G-PCC より遅く（<b>1.31</b>）、LASzip より
+        <b>18 倍遅い</b>。<b>この軸は取り直すと 10% 動く</b>ので、細かい差は読まないこと。メモリはどちらにも負けるが、候補を 1 本に固定すれば
         全規模で G-PCC を下回る。
       </figcaption>
     </figure>
     <p class="note prose">
-      属性込みで測ると、符号化は LASzip の <span class="num">15.4</span> 倍、復号は
-      <span class="num">7.9</span> 倍になる。符号化が重いのは<b>候補を全部符号化して最短を採る</b>
+      属性込みで測ると、符号化は LASzip の <span class="num">36.5</span> 倍、復号は
+      <span class="num">9.5</span> 倍になる。符号化が重いのは<b>候補を全部符号化して最短を採る</b>
       ためで、復号は選ばれた 1 本しか通らない。<b>復号の比は規模で倍になる</b>
       （20 万点では 4.0 倍）。点数に比例して増える近傍表が効くためで、
       <b>速度を述べるときは規模が要る</b>。
@@ -346,33 +351,35 @@
   <section>
     <div class="sechead">
       <p class="eyebrow">但し書き</p>
-      <h2>まだ LAZ の置き換えではない</h2>
+      <h2>いま残っている弱点</h2>
     </div>
     <div class="caveat">
       <div class="cav">
-        <h3>読まない次元がある</h3>
+        <h3>読まない次元がある — 直した</h3>
         <p>
-          <b>15 ファイル中 13 件</b>で、元の LAS の次元が 1 つ以上戻らない。
-          走査方向・飛行線の端・走査機の番号のビット、分類のフラグ、波形の 7 種、
-          拡張バイトの一部、そして VLR。「全列一致」の検証は
-          <b>PCC2 が列として持ったものしか見ない</b>ので、ここは検証を素通りする。
+          <b>直した。</b>走査方向・飛行線の端・走査機の番号のビット、分類のフラグ、
+          波形の 29 byte、拡張バイトの配列型、VLR・EVLR・ヘッダの欄を全部運ぶ。
+          <b>次元が 1 つでも戻らないファイルは 0/15</b>。
+          書き直した LAS の欄ごとの比較も 14/15 で一致する
+          （残る 1 件は COPC で、比較に使う道具が読めない）。
         </p>
       </div>
       <div class="cav">
-        <h3>メモリが退行している</h3>
+        <h3>速度とメモリ</h3>
         <p>
-          <b>直した。</b>全列 1 点あたり 866 → <span class="num">529 byte</span>、
-          100 万点・幾何のみで 230 → <span class="num">53 MB</span>。
-          候補を 1 本に固定すれば全規模で G-PCC を下回る。
-          原因は 3 か所まで特定済みで、うち 1 つ（使う列が 1 つも無いのに近傍表を作る）は
-          <b>サイズも速度も犠牲にせず約 80 MB 戻せる</b>。未着手。
+          符号化は LASzip の <span class="num">36.5 倍</span>、復号は
+          <span class="num">9.5 倍</span>。候補を全部符号化して最短を採る作りなので、
+          符号化が高い。メモリは全列で 1 点あたり <span class="num">647 byte</span>、
+          幾何だけを G-PCC と比べると <span class="num">4.1 倍</span>使う。
+          <b>速度とメモリは、どちらの相手にも負けている。</b>
         </p>
       </div>
     </div>
     <p class="note prose">
-      サイズの利得（end-to-end で −10.9%）は、この 1 つを直す工事に見合う大きさである。
-      逆に言えば、直すまでは「LASzip より 10% 小さい研究用の符号器」であって、
-      配布形式の置き換えではない。
+      サイズ（−14.3%）・可逆性・全次元の保存は揃った。残るのはメモリで、
+      オクツリーが入力を切って回すのに対し、こちらは全点と試している候補を
+      同時に抱える。<b>非可逆を許す道も入れた</b>（<span class="num">pack --eps</span>、既定では通らない）。
+      車載 LiDAR で誤差上限 2 mm なら可逆比 −17.0%、5 mm なら −34.1%。
     </p>
   </section>
 
@@ -389,9 +396,9 @@
             <tr>
               <th>データ</th>
               <th>LASzip 全体</th>
-              <th>PCC2 読む列</th>
-              <th>欠けの費用</th>
-              <th>PCC2 埋めた</th>
+              <th>PCC2</th>
+              <th>（欠け）</th>
+              <th>PCC2 合計</th>
               <th>対 LASzip</th>
               <th>属性の割合</th>
               <th>幾何の縮み</th>
@@ -403,11 +410,11 @@
       </div>
     </details>
     <p class="note prose">
-      標本は各ファイルの中央 200 万点（足りないものは全点。20 万点でも測って併記、
+      標本は各ファイルの中央 200 万点（足りないものは全点。20 万点でも測った。
+      「結果 03」の三者比較だけは車載・地上型を足した 17 ファイル。
       規模依存を見た測定は 50 万〜400 万点）。
       比較の基準は「PCC2 が読む列だけを書き直した LAZ」で、両側が同じ値を詰めている。
-      「欠けの費用」は元の .laz とその基準 LAZ の差で、3 件で負になるのは基準を書く
-      LAZ 書き出しが元より効率が悪いためであり、費用が負なのではない（0 として扱った）。
+      全次元を運ぶようになったので「欠けの費用」は全件 0 である（欄は残してある）。
       測り直しは <span class="num">bench_all.py</span> / <span class="num">bench_three.py</span> /
       <span class="num">bench_split.py</span> / <span class="num">bench_e2e.py</span> /
       <span class="num">bench_cover.py</span>。
@@ -427,41 +434,42 @@
   "use strict";
 
   /* 中央 200 万点（足りないものは全点）。end-to-end の「欠けの費用」は
-     20 万点で測った割合をそのまま当てている（次元の構成は規模で変わらない）。 */
+     出どころは bench_2m_final.log / bench_split_ray.log / bench_three_v7.log
+     （2026-09-23）。「欠けの費用」は全次元を運ぶようになったので全件 0。 */
   var E2E = [
-    ["AHN4 _20",     69.817, 44.750, 0.035,  44.785, -35.9],
-    ["AHN4 _21",     77.401, 52.997, 0.011,  53.008, -31.5],
-    ["plane",        16.844, 12.484, 0.155,  12.639, -25.0],
-    ["extra",       218.471,132.920,34.208, 167.128, -23.5],
-    ["workshop",     37.091, 30.314, 0.693,  31.007, -16.4],
-    ["fullwave",    149.503, 54.542,76.023, 130.565, -12.7],
-    ["vegetation",   49.845, 43.568, 0.000,  43.568, -12.6],
-    ["red-rocks",    20.749, 18.480, 0.002,  18.482, -10.9],
-    ["USGS NY",      38.710, 34.797, 0.000,  34.797, -10.1],
-    ["autzen_trim",  43.880, 39.262, 0.373,  39.635,  -9.7],
-    ["USGS AK",      35.629, 32.228, 0.169,  32.397,  -9.1],
-    ["AHN5 _20",     59.091, 53.763, 0.009,  53.772,  -9.0],
-    ["autzen-2023",  66.665, 60.720, 0.000,  60.720,  -8.9],
-    ["simple1_4",    17.730, 16.601, 0.069,  16.670,  -6.0],
-    ["AHN3 _20",     53.702, 50.593, 0.044,  50.637,  -5.7]
+    ["extra",       218.471,138.659, 0.000, 138.659, -36.5],
+    ["AHN4 _20",     69.817, 44.565, 0.000,  44.565, -36.2],
+    ["plane",        16.844, 11.277, 0.000,  11.277, -33.1],
+    ["AHN4 _21",     77.401, 52.106, 0.000,  52.106, -32.7],
+    ["simple1_4",    17.730, 12.095, 0.000,  12.095, -31.8],
+    ["fullwave",    149.503,121.517, 0.000, 121.517, -18.7],
+    ["vegetation",   49.845, 41.719, 0.000,  41.719, -16.3],
+    ["workshop",     37.091, 31.801, 0.000,  31.801, -14.3],
+    ["autzen_trim",  43.880, 37.923, 0.000,  37.923, -13.6],
+    ["AHN5 _20",     59.091, 52.263, 0.000,  52.263, -11.6],
+    ["red-rocks",    20.749, 18.476, 0.000,  18.476, -11.0],
+    ["autzen-2023",  66.665, 59.872, 0.000,  59.872, -10.2],
+    ["USGS NY",      38.710, 34.909, 0.000,  34.909,  -9.8],
+    ["AHN3 _20",     53.702, 48.571, 0.000,  48.571,  -9.6],
+    ["USGS AK",      35.629, 32.583, 0.000,  32.583,  -8.5]
   ];
   var SHARE = {
-    "extra":71.9, "AHN4 _20":69.1, "fullwave":61.8, "red-rocks":61.0,
-    "autzen-2023":60.2, "AHN3 _20":59.5, "AHN4 _21":59.4, "plane":59.2,
-    "simple1_4":57.4, "AHN5 _20":55.1, "autzen_trim":51.4, "vegetation":50.1,
-    "workshop":45.6, "USGS AK":28.8, "USGS NY":27.7
+    "fullwave":81.5, "extra":77.9, "AHN4 _20":69.2, "AHN4 _21":61.7,
+    "red-rocks":61.2, "autzen-2023":61.0, "plane":60.4, "simple1_4":58.5,
+    "AHN5 _20":55.8, "AHN3 _20":52.8, "autzen_trim":51.9, "vegetation":50.8,
+    "workshop":38.5, "USGS AK":29.4, "USGS NY":25.9
   };
   var SPLIT = {
-    "AHN3 _20":[-3.0,-8.1], "AHN4 _20":[-15.7,-44.8], "AHN4 _21":[-19.1,-39.2],
-    "AHN5 _20":[-3.4,-13.5], "USGS AK":[-8.0,-11.9], "USGS NY":[-9.8,-18.2],
-    "autzen-2023":[-6.1,-12.8], "autzen_trim":[-0.4,-18.6], "workshop":[-15.9,-18.1],
-    "red-rocks":[-13.3,-9.3], "extra":[-9.2,-35.1], "simple1_4":[1.1,-11.3],
-    "plane":[-9.7,-35.9], "vegetation":[0.0,-25.2], "fullwave":[-9.4,-35.9]
+    "AHN3 _20":[-8.5,-10.5], "AHN4 _20":[-15.8,-45.2], "AHN4 _21":[-19.4,-40.9],
+    "AHN5 _20":[-7.3,-15.0], "USGS AK":[-8.3,-9.1], "USGS NY":[-13.0,-0.7],
+    "autzen-2023":[-7.8,-11.7], "autzen_trim":[-9.6,-17.3], "workshop":[-16.7,-10.4],
+    "red-rocks":[-13.2,-9.5], "extra":[-3.8,-45.8], "simple1_4":[-49.0,-19.6],
+    "plane":[-17.5,-43.2], "vegetation":[-2.3,-29.8], "fullwave":[-14.3,-19.7]
   };
   var AXES = [
-    { k: "サイズ", unit: "bpp",   g: 1.00, l: 0.91 },
-    { k: "速度",   unit: "秒",     g: 0.85, l: 10.65 },
-    { k: "メモリ", unit: "ピーク MB", g: 3.32, l: 6.53 }
+    { k: "サイズ", unit: "bpp",   g: 0.94, l: 0.90 },
+    { k: "速度",   unit: "秒",     g: 1.31, l: 17.64 },
+    { k: "メモリ", unit: "ピーク MB", g: 4.13, l: 8.75 }
   ];
 
   var NS = "http://www.w3.org/2000/svg";

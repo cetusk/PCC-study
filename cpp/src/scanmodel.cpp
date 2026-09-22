@@ -31,22 +31,29 @@ static void cordic_sincos(int64_t z, int64_t& sin_out, int64_t& cos_out) {
 
 // 表は [-2^31, 2^31] を 2^16 分割。線形補間も整数で行う。
 static constexpr int TAN_BITS = 16;
-static int64_t g_tab[(1 << TAN_BITS) + 1];
-static bool g_tab_ready = false;
-
-static void build_tab() {
-    for (int i = 0; i <= (1 << TAN_BITS); ++i) {
-        int64_t z = ((int64_t)i << (32 - TAN_BITS)) - SCAN_ANG_MAX;
-        if (z > SCAN_ANG_MAX) z = SCAN_ANG_MAX;
-        int64_t s, c;
-        cordic_sincos(z, s, c);
-        g_tab[i] = c ? ((s << SCAN_TAN_SH) / c) : 0;
+// **表は一度だけ作る。**以前は「作ったか」の旗を見て各糸が勝手に作っていたので、
+// 走査モデルの候補を並列に符号化すると複数の糸が同じ表を同時に書いていた
+// （ThreadSanitizer が検出。書く値は同じだが未定義動作）。関数内 static の
+// 初期化は C++11 以降、糸をまたいで一度だけ行われることが保証されている。
+struct TanTab {
+    int64_t v[(1 << TAN_BITS) + 1];
+    TanTab() {
+        for (int i = 0; i <= (1 << TAN_BITS); ++i) {
+            int64_t z = ((int64_t)i << (32 - TAN_BITS)) - SCAN_ANG_MAX;
+            if (z > SCAN_ANG_MAX) z = SCAN_ANG_MAX;
+            int64_t s, c;
+            cordic_sincos(z, s, c);
+            v[i] = c ? ((s << SCAN_TAN_SH) / c) : 0;
+        }
     }
-    g_tab_ready = true;
+};
+static const int64_t* tan_tab() {
+    static const TanTab t;
+    return t.v;
 }
 
 int64_t tan_fx(int64_t theta_fx) {
-    if (!g_tab_ready) build_tab();
+    const int64_t* g_tab = tan_tab();
     int64_t u = theta_fx + SCAN_ANG_MAX;
     if (u < 0) u = 0;
     if (u > ((int64_t)1 << 32) - 1) u = ((int64_t)1 << 32) - 1;

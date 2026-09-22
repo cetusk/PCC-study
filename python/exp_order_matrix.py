@@ -201,7 +201,11 @@ def write_las(dst: Path, xyz: np.ndarray, sc, of, pts=None, hdr_src=None) -> Non
 
 
 def laz_geom_bpp(xyz: np.ndarray, scale, offset) -> tuple[float, bool, float, float]:
-    """幾何のみの LAZ。属性を含めると他の 3 列（幾何のみ）と比較できない。"""
+    """幾何のみの LAZ。属性を含めると他の 3 列（幾何のみ）と比較できない。
+
+    返すのは**点データだけ**の bpp（LAS の頭を引く）。相手（G-PCC の bitstream、
+    PCC2 のストリーム）が容器の頭を含まないので、揃えないと比較にならない。
+    """
     n = len(xyz)
     with tempfile.TemporaryDirectory() as d:
         p = Path(d) / "g.laz"
@@ -210,7 +214,12 @@ def laz_geom_bpp(xyz: np.ndarray, scale, offset) -> tuple[float, bool, float, fl
         las = laspy.LasData(hdr)
         las.X, las.Y, las.Z = xyz[:, 0], xyz[:, 1], xyz[:, 2]
         t0 = time.perf_counter(); las.write(str(p)); enc = time.perf_counter() - t0
-        b = p.stat().st_size
+        # **点データだけを数える。**ファイル全体だと LAS の頭（469 byte）が入り、
+        # G-PCC の bitstream や PCC2 のストリームと揃わない。1 万点のファイルでは
+        # 0.35 bpp の下駄になり、比較が LAZ に不利な側へ片寄る。
+        with laspy.open(str(p)) as fh0:
+            hdr_bytes = fh0.header.offset_to_point_data
+        b = p.stat().st_size - hdr_bytes
         t0 = time.perf_counter()
         with laspy.open(str(p)) as fh:
             back = fh.read()

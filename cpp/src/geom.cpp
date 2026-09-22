@@ -51,7 +51,7 @@ void KdTree::knn(const double* q, int k, int64_t* idx, double* d2) const {
 void KdTree::radius(const double* q, double r2, std::vector<int64_t>& out) const {
     std::vector<nanoflann::ResultItem<int64_t, double>> m;
     nanoflann::SearchParameters sp; sp.sorted = false;
-    p_->t->radiusSearch(q, r2, m, sp);
+    (void)p_->t->radiusSearch(q, r2, m, sp);   // 数は m.size() で分かる
     out.clear(); out.reserve(m.size());
     for (auto& e : m) out.push_back(e.first);
 }
@@ -65,7 +65,9 @@ double point_spacing(const std::vector<double>& xyz, size_t sample, uint64_t see
     std::vector<double> d(m);
     for (size_t i = 0; i < m; ++i) {
         size_t j = (m == n) ? i : (rng() % n);
-        int64_t idx[2]; double dd[2];
+        // 見つかった近傍が 2 つ未満だと dd[1] が書かれない。0 で埋めておく
+        // （自分自身しか無い＝重なった点しか無いのと同じ扱い）。
+        int64_t idx[2] = {-1, -1}; double dd[2] = {0.0, 0.0};
         t.knn(&xyz[j * 3], 2, idx, dd);
         d[i] = std::sqrt(dd[1]);
     }

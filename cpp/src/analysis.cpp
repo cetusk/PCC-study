@@ -271,7 +271,8 @@ AcqScore acquisition_score(const std::vector<double>& W, size_t n_all,
             double a0 = std::atan2(raw[(i-1)*3+1], raw[(i-1)*3]);
             double a1 = std::atan2(raw[i*3+1], raw[i*3]);
             double d = a1 - a0;
-            while (d > M_PI) d -= 2*M_PI; while (d < -M_PI) d += 2*M_PI;
+            while (d > M_PI) d -= 2*M_PI;
+            while (d < -M_PI) d += 2*M_PI;
             if (d > 0) ++up;
         }
         S.sig.azimuth_monotonic = (double)up / (n - 1);

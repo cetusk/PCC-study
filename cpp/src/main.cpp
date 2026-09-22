@@ -55,6 +55,65 @@ static double rss_mb() {
 
 static bool g_mem_trace = false;
 
+// 幾何の軸 d の器の型が float32 なら、書き出すときに float に丸まる。
+// 誤差は**利用者が受け取る値**で測る（元の値も float32 なので同じく丸めて比べる）。
+// 以前はこの丸めを数えず、代わりに上限に 2% の余裕を持たせていた。KITTI の
+// 1 frame で、戻した .bin の誤差が上限 0.002 m を 0.000003 m 超えていた。
+static bool geom_is_f32(const Frame& f, int d) {
+    for (const auto& c : f.schema) if (c.name == f.geom[d]) return c.ftype == FType::F32;
+    return false;
+}
+static inline double as_output(const Frame& f, int d, double v) {
+    return geom_is_f32(f, d) ? (double)(float)v : v;
+}
+
+// 非可逆の経路の検証。**属性はビット完全**、幾何だけ誤差上限の中に入っているか。
+// 幾何も一致を求めると通らないし、逆に全部を誤差で見ると属性の壊れを見逃す。
+static bool frames_close(const Frame& a, const Frame& b, double eps,
+                         double& worst, std::string& diff) {
+    if (a.n != b.n) { diff = "点数が違う"; return false; }
+    if (a.schema.size() != b.schema.size()) { diff = "列数が違う"; return false; }
+    for (const auto& c : a.schema) {
+        bool isgeo = false;
+        for (int i = 0; i < 3; ++i) if (c.name == a.geom[i]) isgeo = true;
+        if (isgeo) continue;
+        const Col* x = a.get(c.name);
+        const Col* y = b.get(c.name);
+        if (!x || !y) { diff = "列が無い: " + c.name; return false; }
+        for (size_t i = 0; i < a.n; ++i)
+            if ((*x)[i] != (*y)[i]) {
+                char m[192];
+                snprintf(m, sizeof m, "%s[%zu]: %lld != %lld", c.name.c_str(), i,
+                         (long long)(*x)[i], (long long)(*y)[i]);
+                diff = m; return false;
+            }
+    }
+    std::vector<double> wa, wb;
+    frame_world(a, wa);
+    frame_world(b, wb);
+    for (int d = 0; d < 3; ++d)
+        if (geom_is_f32(a, d))
+            for (size_t i = 0; i < a.n; ++i) {
+                wa[i * 3 + d] = (double)(float)wa[i * 3 + d];
+                wb[i * 3 + d] = (double)(float)wb[i * 3 + d];
+            }
+    worst = 0; size_t at = 0;
+    for (size_t i = 0; i < a.n; ++i) {
+        const double dx = wa[i * 3] - wb[i * 3];
+        const double dy = wa[i * 3 + 1] - wb[i * 3 + 1];
+        const double dz = wa[i * 3 + 2] - wb[i * 3 + 2];
+        const double d = std::sqrt(dx * dx + dy * dy + dz * dz);
+        if (d > worst) { worst = d; at = i; }
+    }
+    // 余裕は倍精度の計算誤差の分だけ（以前は 2%）
+    if (worst > eps * (1 + 1e-12)) {
+        char m[192];
+        snprintf(m, sizeof m, "点 %zu で誤差 %.6g m が上限 %.6g m を超えた", at, worst, eps);
+        diff = m; return false;
+    }
+    return true;
+}
+
 // **ru_maxrss は exec をまたいで引き継がれる。**太った親から起動されると、
 // 子のピークに親の分が乗ったまま出る（起動直後に 1.4 GB と出た）。
 // 本当のピークは自分で /proc/self/statm を刻んで取る。
@@ -87,7 +146,7 @@ static uint64_t fsize(const std::string& p) {
     struct stat st{}; return stat(p.c_str(), &st) == 0 ? (uint64_t)st.st_size : 0;
 }
 
-int main(int argc, char** argv) {
+static int main_impl(int argc, char** argv) {
     if (argc < 3) {
         fprintf(stderr,
             "使い方:\n"
@@ -108,7 +167,8 @@ int main(int argc, char** argv) {
             "  pccnorm pack   <in> <out.pcc2> [--max-points N] [--split-geom]\n"
             "                 [--force-geom <候補名>] [--fast-attr] [--no-fallback]\n"
             "        PCC2 コンテナへ符号化し、往復検証と 5 軸の計測を出す\n"
-            "  pccnorm unpack <in.pcc2> [--las <out.laz>]   PCC2 を復号して中身を出す\n"
+            "  pccnorm unpack <in.pcc2> [--las <out.laz>] [--bin <out.bin>]\n"
+            "        PCC2 を復号して中身を出す（--bin は KITTI .bin として書き戻す）\n"
             "  pccnorm combine <orig.laz> <geom_decoded.ply> <geom_stream.bin> [--max-points N]\n"
             "        幾何を外部符号器に任せ，属性のみ本手法で符号化したときの合計を測る\n");
         return 1;
@@ -117,12 +177,49 @@ int main(int argc, char** argv) {
 
     // ---------------------------------------------------------------- PCC2
     if (cmd == "pack") {
+        // **復号に効くのに器へ記録されない実験用の口**が設定されていたら拒む。
+        // 復号側は常に既定値を使うので、既定以外で符号化した器は正しく戻らない
+        // （pack の自己検証で食い違って分かるが、--no-verify だと黙って壊れた器が残る）。
+        // 実験で測るときだけ PCC_ALLOW_EXPERIMENT=1 を付ける。
+        {
+            static const char* EXP[] = {"PCC_LMS_KIND", "PCC_LMS_ORD", "PCC_RAY_PRED",
+                                        "PCC_RAY_HIST", "PCC_RAWKEEP"};
+            const char* allow = getenv("PCC_ALLOW_EXPERIMENT");
+            std::string set;
+            for (const char* v : EXP) if (getenv(v)) set += std::string(set.empty() ? "" : ", ") + v;
+            if (!set.empty() && !(allow && allow[0] == '1')) {
+                fprintf(stderr, "実験用の環境変数が設定されている（%s）。これらは復号に効くのに"
+                                "器へ記録されないので、既定の復号器では正しく戻らない器になる。"
+                                "測るためだけに使うなら PCC_ALLOW_EXPERIMENT=1 を付けること。\n",
+                        set.c_str());
+                return 1;
+            }
+        }
         if (argc < 4) { fprintf(stderr, "pack <in> <out.pcc2>\n"); return 1; }
-        std::string outp = argv[3];
+        // **作業用の名前に書き、検証が通ってから本来の名前に移す。**
+        // 以前は検証に落ちても（戻り値 2）壊れた器が本来の名前で残り、
+        // 途中で失敗したときも書きかけが残っていた。
+        const std::string final_out = argv[3];
+        std::string outp = final_out + ".part";
+        struct PartGuard {
+            const std::string& p; bool keep = false;
+            ~PartGuard() { if (!keep) remove(p.c_str()); }
+        } part_guard{outp};
+        // rename は既存の出力を置き換える（先に消すと、改名に失敗したとき古い出力まで失う）
+        auto commit = [&]() -> bool {
+            if (rename(outp.c_str(), final_out.c_str()) != 0) {
+                fprintf(stderr, "書き込み失敗: %s に移せない\n", final_out.c_str());
+                return false;
+            }
+            part_guard.keep = true;
+            return true;
+        };
         size_t mp = 0, samp = 0;
         bool joint = true, do_norm = true, do_spatial = true, trace_all = false;
         std::string force_geom;
         bool fast_attr = false, no_fallback = false, no_verify = false;
+        double eps_lossy = 0;
+        std::string lossy_kind;
         for (int i = 4; i < argc; ++i) {
             if (!strcmp(argv[i], "--max-points") && i + 1 < argc) mp = atol(argv[++i]);
             else if (!strcmp(argv[i], "--split-geom")) joint = false;
@@ -138,6 +235,17 @@ int main(int argc, char** argv) {
             // 比べるときに使う（それらは符号化の費用ではない）。
             else if (!strcmp(argv[i], "--no-verify")) no_verify = true;
             else if (!strcmp(argv[i], "--mem-trace")) g_mem_trace = true;
+            // **非可逆の経路**（既定では通らない）。誤差上限 [m] を渡すと、
+            // 浮動小数の座標を極座標格子に量子化してから符号化する。
+            else if (!strcmp(argv[i], "--eps") && i + 1 < argc) {
+                // 数として読めない値・0 以下・NaN を黙って可逆に落とさない
+                char* end = nullptr;
+                eps_lossy = strtod(argv[++i], &end);
+                if (!end || *end || !(eps_lossy > 0) || !std::isfinite(eps_lossy)) {
+                    fprintf(stderr, "--eps には正の数（m）を渡すこと: %s\n", argv[i]);
+                    return 1;
+                }
+            }
         }
         std::string err;
         double t0 = now();
@@ -155,6 +263,9 @@ int main(int argc, char** argv) {
         // （切り出して測るときに点数が違ってしまうため）。
         uint64_t base_bytes = 0;
         std::string basep;              // 基準に書いた LAZ。退避に使うので消さずに残す
+        // 途中で返っても基準の LAZ が残らないように、消すのは後始末に任せる
+        struct BaseGuard { std::string& p; ~BaseGuard() { if (!p.empty()) remove(p.c_str()); } }
+            base_guard{basep};
         PointCloud pc;
         if (is_las) {
             if (!read_las(path, pc, err, mp)) { fprintf(stderr, "読み込み失敗: %s\n", err.c_str()); return 1; }
@@ -176,13 +287,114 @@ int main(int argc, char** argv) {
             base_bytes = f.source_bytes;
         }
         double t_read = now() - t0;
+        // 点が 0 個の器は符号化する中身が無い。通すと「元の点数 == Frame の点数」
+        // が 0 == 0 で真になり、正規化が空の PointCloud を材料に全列を落とす。
+        if (f.n == 0) { fprintf(stderr, "点が 0 個なので符号化しない: %s\n", path.c_str()); return 1; }
 
         double t1 = now();
         // LAS 経路の正規化は frame_from_las_normalized が済ませている。
-        if (do_norm && !is_las && !normalize_frame(f, pc, err)) {
+        // 正規化レイヤーは PointCloud の列を解析して計画を立てるので、
+        // LAS 以外の器（.bin / .ply）では材料が無い。空の PointCloud を渡すと
+        // 「どの列も計画から復元できる」と読まれて全属性が落ちるため、渡さない。
+        if (do_norm && !is_las && pc.n == f.n && !normalize_frame(f, pc, err)) {
             fprintf(stderr, "正規化に失敗: %s\n", err.c_str()); return 1;
         }
         mem_mark("正規化後");
+        // **非可逆の経路。**誤差上限を渡されたときだけ通る。座標が浮動小数で
+        // 入っている器（.bin / .ply）に限る。LAS は既に整数格子なので対象外。
+        if (eps_lossy > 0) {
+            // LAS は器の側が整数格子と scale/offset を宣言しているので対象外。
+            // .bin / .ply は幾何が "f32bits" か、可逆に整数化された "int" で入る。
+            if (is_las) {
+                fprintf(stderr, "--eps は .bin / .ply にしか使えない（LAS は対象外）\n");
+                return 1;
+            }
+            std::vector<double> w;
+            frame_world(f, w);
+            // NaN / 無限大は量子化できない（格子の範囲も誤差も測れない）。
+            // 通すと格子の選択が NaN を比べて、黙って壊れた器ができる。
+            for (double v : w)
+                if (!std::isfinite(v)) {
+                    fprintf(stderr, "--eps: 座標に NaN か無限大がある。非可逆の量子化は使えない\n");
+                    return 1;
+                }
+            // **復号と同じ道を通して測る。**極座標に丸めた誤差だけでは足りない。
+            // 復号は世界座標を元の器（整数格子 / float32）に書き戻すので、
+            // そこでもう一度丸めが入る。1 mm 格子なら最大 0.866 mm 増える。
+            // 符号化時の申告がこれを数えていないと、宣言した上限を超えて出る。
+            auto end_err = [&](const GeomCandidate& g) {
+                double worst = 0;
+                const bool pol = (g.kind == "polar");
+                const double dr = g.r_step, da = g.ang_step;
+                for (size_t i = 0; i < f.n; ++i) {
+                    double v[3];
+                    if (pol) {
+                        const double r = (double)g.streams[0][i] * dr;
+                        const double th = (double)g.streams[1][i] * da;
+                        const double ph = (double)g.streams[2][i] * da;
+                        const double c = std::cos(ph);
+                        v[0] = r * c * std::cos(th) + g.origin[0];
+                        v[1] = r * c * std::sin(th) + g.origin[1];
+                        v[2] = r * std::sin(ph)     + g.origin[2];
+                    } else {
+                        for (int d = 0; d < 3; ++d)
+                            v[d] = (double)g.streams[d][i] * g.step + g.origin[d];
+                    }
+                    for (int d = 0; d < 3; ++d) {
+                        if (f.geom_repr == "f32bits")      v[d] = (double)(float)v[d];
+                        else if (f.geom_repr != "f64bits") {
+                            const double sc = f.scale[d] != 0 ? f.scale[d] : 1.0;
+                            v[d] = std::llround((v[d] - f.offset[d]) / sc) * sc + f.offset[d];
+                        }
+                        v[d] = as_output(f, d, v[d]);   // 器が float32 なら最後にもう一度丸まる
+                    }
+                    const double dx = v[0] - as_output(f, 0, w[i * 3]),
+                                 dy = v[1] - as_output(f, 1, w[i * 3 + 1]),
+                                 dz = v[2] - as_output(f, 2, w[i * 3 + 2]);
+                    const double e = std::sqrt(dx * dx + dy * dy + dz * dz);
+                    if (e > worst) worst = e;
+                }
+                return worst;
+            };
+            GeomCandidate gc;
+            double target = eps_lossy, got = 0;
+            bool fit = false;
+            for (int tries = 0; tries < 6; ++tries) {
+                gc = choose_geometry(w, f.n, target, true, 200000, false);
+                if (gc.kind != "polar" && gc.kind != "grid") break;
+                got = end_err(gc);
+                if (got <= eps_lossy) { fit = true; break; }
+                // 超えたぶんだけ刻みを詰めて測り直す。
+                target *= eps_lossy / got * 0.98;
+            }
+            std::vector<double>().swap(w);
+            if (!fit) {
+                fprintf(stderr, "量子化が誤差上限に収まらなかった"
+                                "（種類 %s / 端から端までの実測誤差 %.6g m）\n",
+                        gc.kind.c_str(), got);
+                return 1;
+            }
+            if (gc.kind == "polar") {
+                f.polar_base = f.geom_repr;
+                for (int c = 0; c < 3; ++c) f.polar_origin[c] = gc.origin[c];
+                f.polar_r_step = gc.r_step;
+                f.polar_ang_step = gc.ang_step;
+                f.geom_repr = "polar";
+            } else {
+                // 粗いデカルト格子は、既にある整数格子の表し方でそのまま言える。
+                // 値 = scale*q + offset。復号側に足すものは無い。
+                for (int c = 0; c < 3; ++c) { f.scale[c] = gc.step; f.offset[c] = gc.origin[c]; }
+                f.geom_repr = "int";
+                // 取り込み時に見つけた可逆の格子（封筒の FGRD）は、もう幾何に当てはまらない。
+                // 残すと .bin に戻すときに古い刻みで割り戻して、座標が数百 m ずれる。
+                drop_grid_cols(f, {f.geom[0], f.geom[1], f.geom[2]});
+            }
+            for (int c = 0; c < 3; ++c) f.col[f.geom[c]] = std::move(gc.streams[c]);
+            f.fid.exact = false;
+            f.fid.declared_eps = eps_lossy;
+            f.fid.measured_max = got;
+            lossy_kind = gc.kind;
+        }
         pc = PointCloud();                    // 正規化が済んだら元の列は要らない
         mem_mark("pc を解放した後");
         // 幾何は属性より先に復号されるので、座標は副情報なしで使える
@@ -213,7 +425,11 @@ int main(int argc, char** argv) {
             // 短い方を採る。全候補を全点で測るより速く、1 位だけを信じるより安全。
             for (auto& s0 : sel) {
                 std::vector<const Col*> cv;
-                for (const auto& c : s0.cols) cv.push_back(f.get(c));
+                for (const auto& c : s0.cols) {
+                    const Col* col = f.get(c);
+                    if (!col) { fprintf(stderr, "列が無い: %s\n", c.c_str()); return 1; }
+                    cv.push_back(col);
+                }
                 Stream s1; s1.cols = s0.cols;
                 bool got = false;
                 std::vector<Cand> tryv{{s0.codec, s0.param}};
@@ -228,6 +444,16 @@ int main(int argc, char** argv) {
                 }
                 if (!got) {
                     fprintf(stderr, "全点での符号化に失敗\n"); return 1;
+                }
+                // **勝者に旗を重ねた版も試す。**best_stream は標本の上では後追いを
+                // しない（全点で測り直すため）ので、ここで足さないと
+                // `--sample-select` の経路では旗が一度も付かない（以前は素通しだけを
+                // 試していて、autzen_trim の X+Y+Z で 0.111 bpp 取り逃していた。
+                // 符号・光線・束ね・曲面は試していなかった）。
+                {
+                    std::string pt;
+                    apply_post_flags(s1, cv, &ctx, trace_all ? &pt : nullptr);
+                    log += pt;
                 }
                 {   // 標本での値ではなく、全点で実測した値を出す
                     std::string nm;
@@ -277,7 +503,7 @@ int main(int argc, char** argv) {
                 }
             }
         }
-        if (!basep.empty()) remove(basep.c_str());
+        if (!basep.empty()) { remove(basep.c_str()); basep.clear(); }
         double t_enc = now() - t1;
 
         if (no_verify) {
@@ -291,7 +517,7 @@ int main(int argc, char** argv) {
             printf("PCC2        %10.1f MB  %8.3f bpp\n", bytes / 1e6, ml0);
             printf("5 軸        enc %.2fs / dec ---- / 読込 %.2fs / ピーク %.2f GB / 検証なし\n",
                    t_enc, t_read, peak_gb());
-            return 0;
+            return commit() ? 0 : 1;
         }
 
         // **決定性の確認を先に済ませる。**これには符号化側の Frame と流れが要る。
@@ -307,13 +533,17 @@ int main(int argc, char** argv) {
             std::vector<uint8_t> ba(bytes), bb(bytes);
             det = a && b && fread(ba.data(), 1, bytes, a) == bytes &&
                   fread(bb.data(), 1, bytes, b) == bytes && ba == bb;
-            if (a) fclose(a); if (b) fclose(b);
+            if (a) fclose(a);
+            if (b) fclose(b);
         }
         remove(p2.c_str());
 
         // 以降で使う覚え書きだけ残して、列の実体と流れを手放す。
         const size_t rep_n = (size_t)f.n, rep_ncol = f.schema.size();
         const std::string rep_src = f.source_kind, rep_geom = f.geom_repr, rep_plan = f.plan;
+        const Fidelity rep_fid = f.fid;
+        const std::string rep_grid = grid_summary(f);
+        const std::string rep_cdiv = coldiv_summary(f);
         std::map<std::string, Col>().swap(f.col);
         std::vector<Stream>().swap(st);
         std::vector<uint8_t>().swap(fe.embed);
@@ -321,6 +551,9 @@ int main(int argc, char** argv) {
 
         double t2 = now();
         Frame g;
+        // 包んだ器を書き出した一時ファイル。下の LAS の照合でも使うので、そこまで残す。
+        // 途中で返っても消えるように、消すのは後始末に任せる。
+        struct TmpFile { std::string p; ~TmpFile() { if (!p.empty()) remove(p.c_str()); } } embed_tmp;
         if (!read_pcc2(outp, g, err)) { fprintf(stderr, "復号失敗: %s\n", err.c_str()); return 1; }
         if (!g.embed.empty()) {
             // 包んであるのは元の器そのもの。書き出して読み直せば列が揃う。
@@ -331,11 +564,19 @@ int main(int argc, char** argv) {
             fclose(tf);
             Frame ge;
             bool okr = load_frame(tp, ge, err, 0);
-            remove(tp.c_str());
-            if (!okr) { fprintf(stderr, "復号失敗: %s\n", err.c_str()); return 1; }
+            if (!okr) { remove(tp.c_str()); fprintf(stderr, "復号失敗: %s\n", err.c_str()); return 1; }
+            embed_tmp.p = tp;
             g = std::move(ge);
-        } else if (!denormalize_frame(g, err)) {
-            fprintf(stderr, "復元失敗: %s\n", err.c_str()); return 1;
+            // **読み直した側も粗い格子で割られている。**load_frame は入力側で
+            // apply_column_grid を通すので、ここで戻さないと比較相手（orig、下で
+            // restore_column_grid を掛ける）と空間が揃わず、正しい出力に対して
+            // 検証が落ちる（fullwave の red が 49 対 25186 = 514×49 になった）。
+            restore_column_grid(g);
+        } else {
+            restore_column_grid(g);          // 計画より先に戻す（上と同じ理由）
+            if (!denormalize_frame(g, err)) {
+                fprintf(stderr, "復元失敗: %s\n", err.c_str()); return 1;
+            }
         }
         double t_dec = now() - t2;
 
@@ -344,11 +585,55 @@ int main(int argc, char** argv) {
         std::string diff;
         Frame orig;
         if (!load_frame(path, orig, err, mp)) { fprintf(stderr, "%s\n", err.c_str()); return 1; }
-        bool ok = frames_equal(orig, g, diff);
+        // **粗い格子で割ってあれば、両方を戻してから比べる。**割った空間どうしで
+        // 比べると、割り算が情報を落としていても、刻みの書き出しが壊れていても
+        // 検証が通ってしまう（どちらの辺も同じ割り算を通っているため）。
+        restore_column_grid(orig);
+        double worst_err = 0;
+        const bool ok = rep_fid.exact
+                      ? frames_equal(orig, g, diff)
+                      : frames_close(orig, g, rep_fid.declared_eps, worst_err, diff);
         orig = Frame();
+        // **unpack --las と同じ道で書き戻し、元のファイルと器として比べる。**
+        // Frame どうしの比較は列しか見ないので、封筒（ヘッダの欄・未記述のバイト・
+        // ユーザーデータ・VLR）の欠落を見逃す。実際に見逃していた（verify_unpack.py で発覚）。
+        bool las_ok = true;
+        std::string las_diff;
+        // 包んだ器（基準の LAZ そのもの）も write_las が書いたものなので、同じく照合する。
+        const bool las_check = ok && is_las && rep_fid.exact;
+        if (las_check && !embed_tmp.p.empty()) {
+            g = Frame();
+            PointCloud pa, pb;
+            if (!read_las(embed_tmp.p, pb, err) || !read_las(path, pa, err, mp))
+                { las_ok = false; las_diff = err; }
+            else las_ok = pointclouds_equal(pa, pb, pa.hdr_n == (uint64_t)pa.n, las_diff);
+        } else if (las_check) {
+            const std::string tp = outp + ".chk.las";
+            PointCloud pw;
+            if (!frame_to_las(g, pw, err)) { las_ok = false; las_diff = err; }
+            else {
+                std::vector<std::string> keep;
+                for (const auto& s : g.schema) if (s.role != Role::Geometry) keep.push_back(s.name);
+                g = Frame();
+                if (!write_las(tp, pw, keep, err)) { las_ok = false; las_diff = err; }
+                pw = PointCloud();
+                PointCloud pa, pb;
+                if (las_ok) {
+                    if (!read_las(tp, pb, err) || !read_las(path, pa, err, mp))
+                        { las_ok = false; las_diff = err; }
+                    else las_ok = pointclouds_equal(pa, pb, pa.hdr_n == (uint64_t)pa.n, las_diff);
+                }
+            }
+            remove(tp.c_str());
+        }
 
         printf("入力        %s\n            %zu 点 / 出所 %s / 幾何 %s / 列 %zu\n",
                path.c_str(), rep_n, rep_src.c_str(), rep_geom.c_str(), rep_ncol);
+        // 浮動小数の器を整数に直したなら、何を見つけたかを出す。
+        // 刻みはデータから見つけたもので、仮定ではない。
+        if (!rep_grid.empty()) printf("格子        %s\n", rep_grid.c_str());
+        // 宣言された分解能より粗い格子に乗っていた列。割ってから符号化している。
+        if (!rep_cdiv.empty()) printf("粗い格子    %s\n", rep_cdiv.c_str());
         if (do_norm && !rep_plan.empty()) {
             Plan pl = Plan::from_json(rep_plan);
             printf("正規化      %s", pl.report().c_str());
@@ -363,20 +648,67 @@ int main(int argc, char** argv) {
         printf("\n");
         printf("中身        %s\n", used_embed ? "元の器を包んだ（自前の符号器より短かった）"
                                               : "自前の符号器");
-        printf("検証        全列一致 = %s%s\n", ok ? "true" : "false",
-               ok ? "" : ("  差異: " + diff).c_str());
+        if (rep_fid.exact) {
+            printf("検証        全列一致 = %s%s\n", ok ? "true" : "false",
+                   ok ? "" : ("  差異: " + diff).c_str());
+            if (las_check)
+                printf("            LAS に書き戻して元と一致 = %s%s\n", las_ok ? "true" : "false",
+                       las_ok ? "" : ("  差異: " + las_diff).c_str());
+        } else {
+            printf("**非可逆**  幾何を%sに量子化した。"
+                   "宣言 %.6g m / 符号化時の実測 %.6g m\n",
+                   lossy_kind == "polar" ? "極座標格子" : "粗いデカルト格子",
+                   rep_fid.declared_eps, rep_fid.measured_max);
+            printf("検証        属性は全列一致・幾何は誤差上限の中 = %s"
+                   "（復号後の実測 %.6g m）%s\n", ok ? "true" : "false", worst_err,
+                   ok ? "" : ("  差異: " + diff).c_str());
+        }
         printf("5 軸        enc %.2fs / dec %.2fs / 読込 %.2fs / ピーク %.2f GB / 決定性 %s\n",
                t_enc, t_dec, t_read, peak_gb(), det ? "バイト一致" : "不一致");
-        if (!ok) return 2;
-        return 0;
+        if (!ok || !las_ok) {
+            fprintf(stderr, "検証に落ちたので %s は書かない\n", final_out.c_str());
+            return 2;
+        }
+        return commit() ? 0 : 1;
     }
 
     if (cmd == "unpack") {
         std::string err; Frame f;
         if (!read_pcc2(path, f, err)) { fprintf(stderr, "復号失敗: %s\n", err.c_str()); return 1; }
+        // **包んであるなら中身は LASzip が書いた器そのものである。**列は 1 本も
+        // 入っていないので、復号して組み立て直す道は無い。バイト列をそのまま出す。
+        // 元ファイルとバイト一致するとは限らない（元が .las なら .laz になり、
+        // 元が .laz でも LASzip の版が違えば並びが変わる）。**中身は一致する。**
+        if (!f.embed.empty()) {
+            printf("中身 元の器を包んだもの（%s、%zu byte）\n",
+                   f.embed_kind.c_str(), f.embed.size());
+            bool wrote = false;
+            for (int i = 3; i < argc; ++i)
+                if ((!strcmp(argv[i], "--las") || !strcmp(argv[i], "--bin")) && i + 1 < argc) {
+                    const char* op = argv[++i];
+                    FILE* of = fopen(op, "wb");
+                    if (!of) { fprintf(stderr, "書き出せない: %s\n", op); return 1; }
+                    size_t w = fwrite(f.embed.data(), 1, f.embed.size(), of);
+                    if (fclose(of) != 0 || w != f.embed.size()) {
+                        fprintf(stderr, "書き出せない: %s\n", op); return 1;
+                    }
+                    printf("包んだ器（%s）をそのまま書いた: %s\n",
+                           f.embed_kind.c_str(), op);
+                    wrote = true;
+                }
+            if (!wrote)
+                printf("（出力先を指定していない。--las <出力.laz> で器が出る）\n");
+            return 0;
+        }
+        // **粗い格子を先に戻す。**正規化の計画は「割る前」の単位で立てられている
+        // ので、割ったままで逆正規化すると、複製を指す操作が別の値を書き戻す。
+        restore_column_grid(f);
         if (!denormalize_frame(f, err)) { fprintf(stderr, "復元失敗: %s\n", err.c_str()); return 1; }
         printf("点数 %zu / 出所 %s / 幾何 %s / 列 %zu\n", (size_t)f.n, f.source_kind.c_str(),
                f.geom_repr.c_str(), f.schema.size());
+
+        // 浮動小数の器を整数に直したなら、何を見つけたかを出す。
+        // 刻みはデータから見つけたもので、仮定ではない。
         printf("精度 %s", f.fid.exact ? "可逆" : "誤差上限つき");
         if (!f.fid.exact) printf("（宣言 %.4g m / 実測 %.4g m）", f.fid.declared_eps, f.fid.measured_max);
         printf("\n計画 %s\n", f.plan.empty() ? "（なし）" : f.plan.c_str());
@@ -388,6 +720,12 @@ int main(int argc, char** argv) {
                 for (const auto& s : f.schema) if (s.role != Role::Geometry) keep.push_back(s.name);
                 if (!write_las(argv[++i], pc, keep, err)) { fprintf(stderr, "%s\n", err.c_str()); return 1; }
                 printf("LAS を書いた: %s\n", argv[i]);
+            }
+        for (int i = 3; i < argc; ++i)
+            if (!strcmp(argv[i], "--bin") && i + 1 < argc) {
+                if (!frame_to_kitti_bin(f, argv[++i], err))
+                    { fprintf(stderr, "%s\n", err.c_str()); return 1; }
+                printf(".bin を書いた: %s\n", argv[i]);
             }
         return 0;
     }
@@ -1193,7 +1531,6 @@ int main(int argc, char** argv) {
     // pc.fields には一切触らない。容器に入れない値は keep から外すだけでよい。
     // 採否は「空間予測ありの合計」と「なしの合計」を両方書いて短い方を採る。
     std::vector<int32_t> perm, pred;
-    bool ycocg_on = false;
     if (spatial) {
         std::vector<double> gxyz(pc.n * 3);
         for (size_t i = 0; i < pc.n; ++i) {
@@ -1249,7 +1586,7 @@ int main(int argc, char** argv) {
                 plan_s.ops.push_back(op);
             }
             plan_s.ops.push_back(Op{"ycocg", "", "", 0,1,1,0,true,""});
-            ycocg_on = true;
+            // （YCoCg を採ったことは色の流れの有無で分かる）
         }
         // 残りのフィールドは候補を並べて選ぶ。
         //   (1) 容器に残す
@@ -1464,7 +1801,7 @@ int main(int argc, char** argv) {
         printf("  空間予測の採否: あり %.3f bpp / なし %.3f bpp → %s\n",
                t_sp * 8.0 / pc.n, t_plain * 8.0 / pc.n, t_sp < t_plain ? "あり" : "なし");
         if (t_sp < t_plain) { plan = plan_s; keep = keep_s; external = ext_s; }
-        else { spatial = false; ycocg_on = false; }
+        else { spatial = false; }
     }
 
     double t_sel = now() - t_sel0;
@@ -1607,4 +1944,15 @@ int main(int argc, char** argv) {
     printf("ピークメモリ %.2f GB\n", peak_gb());
     unlink(tmpA.c_str()); unlink(tmpB.c_str()); unlink(tmpC.c_str());
     return (geom_ok && bad.empty()) ? 0 : 2;
+}
+
+// 例外は最後にここで受ける。受けないと std::terminate で落ち、後始末（作業用の
+// 器を消すなど）が走らない。巻き戻しの途中で各所の後始末が走ってから、ここに来る。
+int main(int argc, char** argv) {
+    try {
+        return main_impl(argc, argv);
+    } catch (const std::exception& e) {
+        fprintf(stderr, "失敗: %s\n", e.what());
+        return 1;
+    }
 }

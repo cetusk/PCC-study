@@ -1,8 +1,10 @@
+#include "pcc/normalize.hpp"
 #include "pcc/pcc2.hpp"
 #include "pcc/rangecoder.hpp"
 #include "pcc/attr.hpp"
 #include "pcc/scanmodel.hpp"
 #include <algorithm>
+#include <stdexcept>
 #include <chrono>
 #include <cmath>
 #include <map>
@@ -17,6 +19,7 @@
 #include <memory>
 #include <condition_variable>
 #include <functional>
+#include <unordered_map>
 #include <deque>
 
 namespace pcc {
@@ -77,6 +80,18 @@ struct Rd {
         if (!ok || p + l > n) { ok = false; return v; }
         v.assign(b + p, b + p + l); p += l; return v;
     }
+    // 可変長整数。小さな値が多い場所（流れの長さ・列の添字）で 8 byte を払わない。
+    uint64_t varint() {
+        uint64_t v = 0; int sh = 0;
+        while (p < n) {
+            uint8_t c = b[p++];
+            v |= (uint64_t)(c & 0x7F) << sh;
+            if (!(c & 0x80)) return v;
+            sh += 7;
+            if (sh > 63) { ok = false; return 0; }
+        }
+        ok = false; return 0;
+    }
 };
 
 inline int bitlen(uint64_t z) { int k = 0; while (z) { ++k; z >>= 1; } return k; }
@@ -91,19 +106,44 @@ inline int64_t fdiv(int64_t a, int64_t b) {         // 負でも切り捨て方�
     if ((a % b) && ((a < 0) != (b < 0))) --q;
     return q;
 }
+static inline int64_t med5(const int64_t* r) {
+    int64_t v[5] = {r[0], r[1], r[2], r[3], r[4]};
+    for (int i = 1; i < 5; ++i) {
+        int64_t t = v[i]; int j = i - 1;
+        while (j >= 0 && v[j] > t) { v[j + 1] = v[j]; --j; }
+        v[j + 1] = t;
+    }
+    return v[2];
+}
 struct Pred {
     MedPred m;
     int64_t q[4] = {0, 0, 0, 0};
-    int k = 0, mode = 0;
+    int64_t r[5] = {0, 0, 0, 0, 0};   // 直近 5 つの差分（mode 3 用）
+    uint64_t k = 0;                    // 2^31 点を超えても負にならないよう 64 bit
+    int mode = 0;
     inline int64_t predict() const {
         if (mode == 0) return m.predict();
         if (mode == 2) return m.prev + fdiv(m.predict() - m.prev, 2);
-        // q[0] には最初の点の絶対座標が入る（prev の初期値が 0 のため）。
-        // 4 つ揃っても 1 巡するまでは差分でないので使わない。
+        // r[0] / q[0] には最初の点の絶対座標が入る（prev の初期値が 0 のため）。
+        // 1 巡して上書きされるまでは差分でないので使わない。
+        if (mode == 3) return k < 6 ? m.predict() : m.prev + med5(r);
+        // 傾きの効かせ方を変えた版。葉群のように隣の点が跳ねる入力では、
+        // 中央値の傾きをそのまま足すと外すので、弱めるか足さないほうが当たる。
+        if (mode >= 4) {
+            if (mode == 6) return m.prev;                 // 傾きを足さない
+            int64_t d = (mode == 7 ? (k < 6 ? m.predict() : m.prev + med5(r))
+                                   : m.predict()) - m.prev;
+            if (mode == 4) return m.prev + fdiv(d, 4);
+            if (mode == 5) return m.prev + d - fdiv(d, 4); // 3/4（掛け算を避ける）
+            return m.prev + fdiv(d, 2);                    // mode 7
+        }
         if (k < 5) return m.predict();
         return m.prev + fdiv(q[0] + q[1] + q[2] + q[3], 4);
     }
-    inline void push(int64_t x) { q[k & 3] = x - m.prev; ++k; m.push(x); }
+    inline void push(int64_t x) {
+        int64_t d = x - m.prev;
+        q[k & 3] = d; r[k % 5] = d; ++k; m.push(x);
+    }
 };
 } // namespace
 
@@ -130,6 +170,305 @@ static void enc_cols(const std::vector<const Col*>& cols, int mode,
             if (mode >= 2) ctx[c] = ctx_of(z);
         }
     out = e.finish();
+}
+
+// 値そのものを、直前の値の下位 8 bit を文脈にして送る。
+// 戻り番号のように系列に型がある列で、桁数の文脈より当たる。
+inline constexpr int PREVCTX = 256;
+
+static void enc_cols_prev(const std::vector<const Col*>& cols,
+                          std::vector<uint8_t>& out) {
+    size_t nc = cols.size(), n = nc ? cols[0]->size() : 0;
+    Encoder e;
+    UIntCoder uc((int)nc * PREVCTX, 64);
+    std::vector<int64_t> prev(nc, 0);
+    for (size_t i = 0; i < n; ++i)
+        for (size_t c = 0; c < nc; ++c) {
+            int64_t x = (*cols[c])[i];
+            uc.encode(e, zigzag(x), (int)c * PREVCTX + (int)((uint64_t)prev[c] & 0xFF));
+            prev[c] = x;
+        }
+    out = e.finish();
+}
+
+static void dec_cols_prev(const uint8_t* data, size_t len, size_t n, size_t ncol,
+                          std::vector<std::vector<int64_t>>& out) {
+    Decoder d(data, len);
+    UIntCoder uc((int)ncol * PREVCTX, 64);
+    out.assign(ncol, std::vector<int64_t>(n));
+    std::vector<int64_t> prev(ncol, 0);
+    for (size_t i = 0; i < n; ++i)
+        for (size_t c = 0; c < ncol; ++c) {
+            int64_t x = unzigzag(uc.decode(d, (int)c * PREVCTX
+                                              + (int)((uint64_t)prev[c] & 0xFF)));
+            out[c][i] = x; prev[c] = x;
+        }
+}
+
+// 値の種類が少ない列を、字母の添字として直接送る。文脈は直前の記号。
+// 字母は先頭に差分＋可変長で書く（列ごと）。
+inline constexpr size_t SYM_MAX = 512;      // これを超える字母は扱わない
+
+// 列ごとの字母。候補によらないので使い回す。
+struct SymAlpha {
+    bool ok = false;
+    std::vector<int64_t> a;
+    std::vector<int32_t> flat;     // 値域が狭いときの平坦な添字表
+    int64_t base = 0;
+    std::map<int64_t, int> idx;    // 広いときの木
+    // 字母に無い値は -1 を返す（呼ぶ側は ok と列の中身が一致する前提だが、
+    // 前提が崩れたときに範囲外を読まないようにしておく）。
+    inline int at(int64_t v) const {
+        if (flat.empty()) { auto it = idx.find(v); return it == idx.end() ? -1 : it->second; }
+        const uint64_t o = (uint64_t)v - (uint64_t)base;
+        return o < flat.size() ? (int)flat[(size_t)o] : -1;
+    }
+    // 使い回し表の鍵の確かめに使う、列の中身の指紋。
+    size_t n = 0;
+    uint64_t fp = 0;
+};
+// 列の中身の指紋（点数と、等間隔に選んだ最大 64 点の値）。**使い回し表の鍵を
+// `Col*` だけにしてはいけない。**予備選別の標本は一時の列で、消えたあとの番地に
+// 別の列が作られると、別の列の字母が当たって範囲外を読む（PCC_PRESELECT_ATTR=1 で
+// 15 回中 5 回 segfault した）。番地が一致しても指紋が違えば作り直す。
+static uint64_t col_fingerprint(const Col* col) {
+    const size_t n = col->size();
+    uint64_t h = 1469598103934665603ull ^ (uint64_t)n;
+    const size_t step = n > 64 ? n / 64 : 1;
+    for (size_t i = 0; i < n; i += step) {
+        h ^= (uint64_t)(*col)[i];
+        h *= 1099511628211ull;
+    }
+    return h;
+}
+struct SymCache {
+    std::mutex mu;
+    std::map<const Col*, std::shared_ptr<const SymAlpha>> by_col;
+};
+
+static std::shared_ptr<const SymAlpha> sym_alpha(const Col* col, const CodecCtx* ctx) {
+    std::shared_ptr<SymCache> cache;
+    if (ctx) {
+        static std::mutex mk;
+        std::lock_guard<std::mutex> lk(mk);
+        if (!ctx->sym_cache) const_cast<CodecCtx*>(ctx)->sym_cache =
+            std::make_shared<SymCache>();
+        cache = std::static_pointer_cast<SymCache>(ctx->sym_cache);
+    }
+    const uint64_t fp = col_fingerprint(col);
+    if (cache) {
+        std::lock_guard<std::mutex> lk(cache->mu);
+        auto it = cache->by_col.find(col);
+        if (it != cache->by_col.end() && it->second->n == col->size() && it->second->fp == fp)
+            return it->second;
+    }
+    auto r = std::make_shared<SymAlpha>();
+    const size_t n = col->size();
+    r->n = n; r->fp = fp;
+    // 先に間引いた標本で見切る。字母が大きい列では全点を走る意味がない。
+    {
+        std::set<int64_t> probe;
+        const size_t step = n > 8192 ? n / 8192 : 1;
+        for (size_t i = 0; i < n; i += step) {
+            probe.insert((*col)[i]);
+            if (probe.size() > SYM_MAX) break;
+        }
+        if (probe.size() > SYM_MAX) {
+            if (cache) { std::lock_guard<std::mutex> lk(cache->mu);
+                         cache->by_col[col] = r; }
+            return r;
+        }
+    }
+    std::set<int64_t> s;
+    for (size_t i = 0; i < n; ++i) {
+        s.insert((*col)[i]);
+        if (s.size() > SYM_MAX) {
+            if (cache) { std::lock_guard<std::mutex> lk(cache->mu);
+                         cache->by_col[col] = r; }
+            return r;
+        }
+    }
+    if (s.empty()) {
+        if (cache) { std::lock_guard<std::mutex> lk(cache->mu); cache->by_col[col] = r; }
+        return r;
+    }
+    r->a.assign(s.begin(), s.end());
+    const uint64_t span = (uint64_t)r->a.back() - (uint64_t)r->a.front();
+    if (span < (1u << 20)) {
+        r->base = r->a.front();
+        r->flat.assign((size_t)span + 1, -1);
+        for (size_t k = 0; k < r->a.size(); ++k)
+            r->flat[(size_t)((uint64_t)r->a[k] - (uint64_t)r->base)] = (int32_t)k;
+    } else {
+        for (size_t k = 0; k < r->a.size(); ++k) r->idx[r->a[k]] = (int)k;
+    }
+    r->ok = true;
+    if (cache) { std::lock_guard<std::mutex> lk(cache->mu); cache->by_col[col] = r; }
+    return r;
+}
+inline constexpr int SYM_REF = 16;          // 参照列から取る文脈の段数
+
+// param から参照列と、その列のどのビット位置を文脈に使うかを取り出す。
+//   param = [shift u8][名前長 u16][名前]
+static bool sym_ref(const std::vector<uint8_t>& p, const CodecCtx* ctx,
+                    const Col*& out, int& shift) {
+    if (p.size() < 3 || !ctx || !ctx->fr) return false;
+    shift = p[0];
+    uint16_t l; memcpy(&l, p.data() + 1, 2);
+    if (p.size() < (size_t)3 + l) return false;
+    std::string nm((const char*)p.data() + 3, l);
+    out = ctx->fr->get(nm);
+    return out != nullptr;
+}
+
+static bool enc_cols_sym(const std::vector<const Col*>& cols,
+                         const Col* ref, int shift, const CodecCtx* ctx,
+                         std::vector<uint8_t>& out) {
+    const size_t nc = cols.size(), n = nc ? cols[0]->size() : 0;
+    if (!n) return false;
+    std::vector<std::shared_ptr<const SymAlpha>> al(nc);
+    for (size_t c = 0; c < nc; ++c) {
+        al[c] = sym_alpha(cols[c], ctx);
+        if (!al[c]->ok) return false;
+    }
+    std::vector<uint8_t> hdr;
+    auto pv = [&](uint64_t v) {
+        while (v >= 0x80) { hdr.push_back((uint8_t)(v | 0x80)); v >>= 7; }
+        hdr.push_back((uint8_t)v);
+    };
+    for (size_t c = 0; c < nc; ++c) {
+        pv(al[c]->a.size());
+        int64_t prev = 0;
+        for (int64_t v : al[c]->a) { pv(zigzag((int64_t)((uint64_t)v - (uint64_t)prev))); prev = v; }
+    }
+    const int R = ref ? SYM_REF : 1;
+    Encoder e;
+    std::vector<std::vector<FreqModel>> mod(nc);
+    for (size_t c = 0; c < nc; ++c) {
+        const int m = (int)al[c]->a.size();
+        mod[c].resize(((size_t)m + 1) * (size_t)R);
+        for (auto& q : mod[c]) q.init(m);
+    }
+    std::vector<int> prev(nc, 0), first(nc, 1);
+    for (size_t i = 0; i < n; ++i) {
+        const int rc = ref ? (int)((((uint64_t)(*ref)[i]) >> shift) & (SYM_REF - 1)) : 0;
+        for (size_t c = 0; c < nc; ++c) {
+            const int sy = al[c]->at((*cols[c])[i]);
+            if (sy < 0) return false;          // 字母に無い値（表と列が食い違った）
+            const int cx = (first[c] ? (int)al[c]->a.size() : prev[c]) * R + rc;
+            e.encode_freq(mod[c][(size_t)cx], sy);
+            prev[c] = sy; first[c] = 0;
+        }
+    }
+    std::vector<uint8_t> body = e.finish();
+    out = std::move(hdr);
+    out.insert(out.end(), body.begin(), body.end());
+    return true;
+}
+
+static bool dec_cols_sym(const uint8_t* data, size_t len, size_t n, size_t ncol,
+                         const Col* ref, int shift,
+                         std::vector<std::vector<int64_t>>& out, std::string& err) {
+    size_t p = 0;
+    auto gv = [&]() -> uint64_t {
+        uint64_t v = 0;
+        for (int sh = 0; p < len && sh < 64; sh += 7) {   // 64 bit 以上のシフトはしない
+            const uint8_t c = data[p++];
+            v |= (uint64_t)(c & 0x7F) << sh;
+            if (!(c & 0x80)) return v;
+        }
+        return v;
+    };
+    // **壊れた器で落ちないように**、字母の大きさと文脈のずらしを確かめる。
+    // m が 0 だと頻度表の合計が 0 になって割り算が落ち、巨大だと確保で落ちる。
+    if (shift < 0 || shift >= 64) { err = "字母: 文脈のずらしが範囲外"; return false; }
+    std::vector<std::vector<int64_t>> alpha(ncol);
+    for (size_t c = 0; c < ncol; ++c) {
+        const uint64_t m = gv();
+        if (m > SYM_MAX || (m == 0 && n > 0)) { err = "字母: 大きさが範囲外"; return false; }
+        alpha[c].resize((size_t)m);
+        int64_t prev = 0;
+        for (size_t k = 0; k < m; ++k) {
+            prev = (int64_t)((uint64_t)prev + (uint64_t)unzigzag(gv()));   // 符号化側と対
+            alpha[c][k] = prev;
+        }
+    }
+    if (p > len) { err = "字母: 頭が長さを超える"; return false; }
+    const int R = ref ? SYM_REF : 1;
+    Decoder d(data + p, len - p);
+    std::vector<std::vector<FreqModel>> mod(ncol);
+    for (size_t c = 0; c < ncol; ++c) {
+        const int m = (int)alpha[c].size();
+        mod[c].resize(((size_t)m + 1) * (size_t)R);
+        for (auto& q : mod[c]) q.init(m);
+    }
+    out.assign(ncol, std::vector<int64_t>(n));
+    std::vector<int> prev(ncol, 0), first(ncol, 1);
+    for (size_t i = 0; i < n; ++i) {
+        const int rc = ref ? (int)((((uint64_t)(*ref)[i]) >> shift) & (SYM_REF - 1)) : 0;
+        for (size_t c = 0; c < ncol; ++c) {
+            const int cx = (first[c] ? (int)alpha[c].size() : prev[c]) * R + rc;
+            const int s = d.decode_freq(mod[c][(size_t)cx]);
+            if (s < 0 || (size_t)s >= alpha[c].size()) { err = "字母: 添字が範囲外"; return false; }
+            out[c][i] = alpha[c][(size_t)s];
+            prev[c] = s; first[c] = 0;
+        }
+    }
+    return true;
+}
+
+// 3 軸を順に送り、後の軸の文脈に前の軸の差の桁数を使う。
+//   dx … 直前の dx の桁
+//   dy … いまの dx の桁 × 直前の dy の桁
+//   dz … いまの dx の桁 × いまの dy の桁
+// 軸ごとに閉じた文脈では見えない相関を掴む（点が動く向きは 3 軸で揃うため）。
+static void enc_geom_cross(const std::vector<const Col*>& cols,
+                           std::vector<uint8_t>& out) {
+    const size_t n = cols[0]->size();
+    Encoder e;
+    UIntCoder uc(NCTX * NCTX * 3, 64);
+    int64_t pv[3] = {0, 0, 0};
+    int pk[3] = {0, 0, 0};
+    for (size_t i = 0; i < n; ++i) {
+        int k[3];
+        for (int c = 0; c < 3; ++c) {
+            const int64_t x = (*cols[c])[i];
+            const uint64_t z = zigzag(x - pv[c]);
+            int cx;
+            if (c == 0)      cx = pk[0];
+            else if (c == 1) cx = NCTX * NCTX + k[0] * NCTX + pk[1];
+            else             cx = 2 * NCTX * NCTX + k[0] * NCTX + k[1];
+            uc.encode(e, z, cx);
+            k[c] = ctx_of(z);
+            pv[c] = x;
+        }
+        for (int c = 0; c < 3; ++c) pk[c] = k[c];
+    }
+    out = e.finish();
+}
+
+static void dec_geom_cross(const uint8_t* data, size_t len, size_t n,
+                           std::vector<std::vector<int64_t>>& out) {
+    Decoder d(data, len);
+    UIntCoder uc(NCTX * NCTX * 3, 64);
+    out.assign(3, std::vector<int64_t>(n));
+    int64_t pv[3] = {0, 0, 0};
+    int pk[3] = {0, 0, 0};
+    for (size_t i = 0; i < n; ++i) {
+        int k[3];
+        for (int c = 0; c < 3; ++c) {
+            int cx;
+            if (c == 0)      cx = pk[0];
+            else if (c == 1) cx = NCTX * NCTX + k[0] * NCTX + pk[1];
+            else             cx = 2 * NCTX * NCTX + k[0] * NCTX + k[1];
+            const uint64_t z = uc.decode(d, cx);
+            const int64_t x = pv[c] + unzigzag(z);
+            out[c][i] = x;
+            k[c] = ctx_of(z);
+            pv[c] = x;
+        }
+        for (int c = 0; c < 3; ++c) pk[c] = k[c];
+    }
 }
 
 // 差分の値が繰り返す列に効く。gps_time の差分は値の種類が少ないのに桁が大きく、
@@ -284,29 +623,710 @@ static void dec_geom_aux(const uint8_t* data, size_t len, size_t n, size_t nc,
 // 幾何 v3: 軸をまたぐ文脈。LASzip は Y を符号化するとき X の残差が
 // 何ビットだったかを文脈に使い、Z には X と Y の平均を使う。
 // 走査線上では 3 軸の残差の大きさが連動するので、これが効く。
+// cross=true のとき、z の文脈を (k0+k1)/2 の平均ではなく **2 次元の組**にする。
+// 平均は k0=2,k1=6 と k0=6,k1=2 を同じ文脈にしてしまう。
+static inline int64_t wsub(int64_t a, int64_t b);
+static inline int64_t wadd(int64_t a, int64_t b);
+
+// 適応フィルタ（MPEG-4 ALS / Monkey's Audio と同じ構え）。
+// 予測子が出した値に「直近 LMS_ORD 個の残差から作る補正」を足す。
+// 重みは**符号×符号**で 1 ずつ動かす。乗算も割り算も要らず、桁も溢れない。
+// 履歴の末尾は定数 1 に固定してあるので、JPEG-LS の偏り補正も兼ねる。
+//
+// **両側が同じ復号済みの残差から同じ重みを作る**ので、副情報は 1 ビットも増えない。
+// 履歴は int32 に切り詰める（f64bits の幾何は残差が int64 の端まで使う）。
+struct LmsPred {
+    // **重みには歯止めが要る。**符号×符号の更新は歩幅が入力の大きさに依らないので、
+    // 縛らないと重みが乱歩で大きくなり、補正が残差より大きくなって暴れる。
+    // 全タップの合計が「直近の残差 1 個ぶん」を超えないところで止める。
+    static const int32_t WMAX = (int32_t)((1 << LMS_SH) / LMS_ORD);
+    int32_t w[LMS_ORD] = {0};
+    int32_t h[LMS_ORD] = {0};
+    int ord = LMS_ORD;
+    static inline int32_t clip32(int64_t v) {
+        const int64_t M = (int64_t)1 << 30;
+        return (int32_t)(v > M ? M : (v < -M ? -M : v));
+    }
+    static inline int sgn(int64_t v) { return (v > 0) - (v < 0); }
+    inline int64_t corr() const {
+        int64_t dot = 0;
+        for (int j = 0; j < ord; ++j) dot += (int64_t)w[j] * (int64_t)h[j];
+        const int64_t c = dot >> LMS_SH;
+        const int64_t M = (int64_t)1 << 30;
+        return c > M ? M : (c < -M ? -M : c);
+    }
+    inline void push(int64_t d) {
+        const int sd = sgn(d);
+        if (sd)
+            for (int j = 0; j < ord; ++j) {
+                int32_t v = w[j] + sd * sgn(h[j]);
+                if (v > WMAX) v = WMAX;
+                if (v < -WMAX) v = -WMAX;
+                w[j] = v;
+            }
+        for (int j = ord - 1; j > 0; --j) h[j] = h[j - 1];
+        h[0] = clip32(d);
+        h[ord - 1] = 1;                     // 定数項（偏りの補正）
+    }
+};
+// 次数を外から変えて測るための口。既定は LMS_ORD。1 なら定数項だけ。
+// **復号は環境変数を読まない。**以下の実験用の口（PCC_LMS_KIND / PCC_LMS_ORD /
+// PCC_RAY_PRED / PCC_RAY_HIST / PCC_RAWKEEP）は符号化にも復号にも効くのに、
+// 器に記録されない。以前は復号も同じ値を読んだので、別の値で復号すると
+// 誤りを出さずに別の点群が戻った（査読が再現した）。いまは復号中は常に既定値を使う。
+// 符号化で既定以外を使うと、pack の自己検証（既定値の復号）で必ず食い違うので分かる。
+// pack は既定以外の値を PCC_ALLOW_EXPERIMENT=1 が無ければ拒む（main.cpp）。
+static thread_local int g_decoding = 0;
+static const int LMS_ORD_ENV = [] {
+    if (const char* e = getenv("PCC_LMS_ORD")) {
+        int v = atoi(e);
+        if (v >= 1 && v <= LMS_ORD) return v;
+    }
+    return (int)LMS_ORD;
+}();
+static inline int lms_ord() { return g_decoding ? (int)LMS_ORD : LMS_ORD_ENV; }
+
+// **文脈ごとの偏り補正**（JPEG-LS / CALIC と同じ考え）。
+// 予測子は平均して当たっている前提で作ってあるが、文脈ごとに見ると偏る。
+// 文脈ごとに残差の和と個数を持ち、その平均を予測に足す。個数が上限に達したら
+// 両方を半分にして、直近を重く見る。**両側が同じ復号済みの残差から作る**ので
+// 副情報は増えない。和は f64bits の幾何で桁が跳ねるので必ず縛る。
+struct BiasTab {
+    static constexpr int32_t NMAX = 64;
+    static constexpr int64_t BMAX = (int64_t)1 << 40;
+    std::vector<int64_t> B;
+    std::vector<int32_t> N;
+    explicit BiasTab(size_t nctx) : B(nctx, 0), N(nctx, 0) {}
+    inline int64_t at(int cx) const {
+        const int32_t n = N[(size_t)cx];
+        return n ? B[(size_t)cx] / n : 0;
+    }
+    inline void push(int cx, int64_t d) {
+        int64_t b = B[(size_t)cx] + d;
+        if (b > BMAX) b = BMAX;
+        if (b < -BMAX) b = -BMAX;
+        int32_t n = N[(size_t)cx] + 1;
+        if (n >= NMAX) { b >>= 1; n >>= 1; }
+        B[(size_t)cx] = b;
+        N[(size_t)cx] = n;
+    }
+};
+// 0 = 文脈ごとの偏り補正、1 = 適応フィルタ、2 = **符号つきの文脈**。
+// 2 が本命。我々の文脈は残差の桁数だけで**符号を捨てている**ので、
+// 条件付き分布が対称になり、偏りも向きも掴めない。JPEG-LS が条件にしているのは
+// 符号つきの勾配である。直前の残差の符号を文脈に 1 ビット足す。
+// 無傾（傾きを足さない）が勝つファイルでは残差が生の差分なので、向きが続く。
+static const int LMS_KIND_ENV = [] {
+    if (const char* e = getenv("PCC_LMS_KIND")) return atoi(e);
+    return 2;
+}();
+static inline int lms_kind() { return g_decoding ? 2 : LMS_KIND_ENV; }
+// 符号の履歴を何個取るか。流れごとに旗で決まる（1 / 2 / 4）。
+static thread_local int g_sgnbits = 1;
+static inline int sgn_mul() { return 1 << g_sgnbits; }
+static inline int sgn_push(int prev, int64_t d) {
+    return ((prev << 1) | ((d > 0) ? 1 : 0)) & (sgn_mul() - 1);
+}
+
+// 光線モデル（C_RAY_BIT）。bit_fields は幾何より先に復号されるので、
+// 符号化・復号の両側が同じ列を引ける。codec_encode / codec_decode が設定する。
+static thread_local int g_ray = 0;
+static thread_local const Col* g_ray_bf = nullptr;
+// **効いているのは予測ではなく、履歴と文脈を分けることである。**
+// 続きの点を「前の戻り＋戻り間ベクトル」で予測する部分は、実際の勝者（幾何v4W4）が
+// 続きの点を既にほぼ同じ精度で送っているので効かない（USGS NY で残差 21.25 →
+// 20.82 bit/点、符号長ではかえって伸びた）。効くのは次の 2 つ:
+//   1. 続きの点を**予測子の履歴に入れない**。傾きを足す予測子（幾何v4W4傾 など）は
+//      履歴の差分から傾きを作るので、戻り間の 10〜27 m の跳びで傾きが汚れる。
+//      AHN5 で 24.591 → 23.916 bpp。
+//   2. 続きの点に**別の文脈**を割り当てる（分布が違う）。
+// 予測部分は PCC_RAY_PRED=1 で戻せる。
+//   PCC_RAY_HIST=1 … 続きの点も予測子の履歴に入れる（切り分け用）
+static const int RAY_PRED_ENV = [] { const char* e = getenv("PCC_RAY_PRED"); return e ? atoi(e) : 0; }();
+static const int RAY_HIST_ENV = [] { const char* e = getenv("PCC_RAY_HIST"); return e ? atoi(e) : 0; }();
+static inline int ray_pred() { return g_decoding ? 0 : RAY_PRED_ENV; }
+static inline int ray_hist() { return g_decoding ? 0 : RAY_HIST_ENV; }
+struct RayPred {
+    int64_t gap[16][3];
+    RayPred() { for (auto& g : gap) g[0] = g[1] = g[2] = 0; }
+    // i 番目の点が、直前の点と**同じパルスの続き**か。戻り番号が 1 増え、
+    // 戻り総数が同じなら同じパルスとみなす（LAS は 1 パルスの戻りを続けて書く）。
+    static inline bool cont(size_t i, int& rn) {
+        rn = 0;
+        if (!g_ray || !g_ray_bf || i == 0) return false;
+        const uint64_t a = (uint64_t)(*g_ray_bf)[i], b = (uint64_t)(*g_ray_bf)[i - 1];
+        const int r1 = (int)(a & 15), n1 = (int)((a >> 4) & 15);
+        const int r0 = (int)(b & 15), n0 = (int)((b >> 4) & 15);
+        rn = r1;
+        return r1 >= 2 && r1 == r0 + 1 && n1 == n0;
+    }
+};
+
+// 曲面による z の予測（C_SURF_A / C_SURF_B）。0 なら切。それ以外は格子の桁数。
+static thread_local int g_surf = 0;
+// __int128 の丸め付き割り算（0 から遠いほうへ半分を丸める）。
+static inline __int128 rdiv128(__int128 a, __int128 b) {
+    if (b < 0) { a = -a; b = -b; }
+    return a >= 0 ? (a + b / 2) / b : -((-a + b / 2) / b);
+}
+struct SurfPred {
+    int S;
+    std::unordered_map<uint64_t, std::array<int64_t, 3>> g;
+    int64_t se[3] = {0, 0, 0};        // 減衰誤差（桁数 ×16 の固定小数）
+    explicit SurfPred(int s) : S(s) {}
+    static inline uint64_t key(int64_t gx, int64_t gy) {
+        return ((uint64_t)(uint32_t)(int32_t)gx << 32) | (uint64_t)(uint32_t)(int32_t)gy;
+    }
+    static inline int64_t zbits(int64_t d) {
+        const uint64_t z = zigzag(d);
+        return (int64_t)(64 - __builtin_clzll(z | 1));
+    }
+    // 3 つの z の予測を出す: [0] いまの予測子 / [1] (x,y) の最近傍 / [2] 近傍に当てた平面。
+    // 近傍が無ければ全部いまの予測子。**整数だけで計算する**（両側で厳密に一致させるため）。
+    void preds(int64_t x, int64_t y, int64_t cur, int64_t pr[3]) const {
+        pr[0] = pr[1] = pr[2] = cur;
+        const int64_t gx = x >> S, gy = y >> S;
+        std::array<int64_t, 3> nb[9]; int m = 0;
+        // **近傍として使うのは、本当に隣のマスにある点だけ。**鍵は 32 bit に
+        // 切り詰めているので、座標が広い範囲に散る入力（double のビット列を持つ
+        // 幾何など）では遠い点が同じ鍵に入る。そのまま差を 2 乗すると __int128 でも
+        // 溢れうる（符号つきの溢れは未定義動作）。隣の 3×3 マスに入る点なら
+        // |dx|, |dy| < 3·2^S なので、2^(S+2) を超えるものは捨てる。
+        const int64_t nlim = (int64_t)1 << (S + 2);
+        for (int ax = -1; ax <= 1; ++ax)
+            for (int ay = -1; ay <= 1; ++ay) {
+                auto it = g.find(key(gx + ax, gy + ay));
+                if (it == g.end()) continue;
+                const int64_t dx = wsub(it->second[0], x), dy = wsub(it->second[1], y);
+                if (dx > nlim || dx < -nlim || dy > nlim || dy < -nlim) continue;
+                nb[m++] = it->second;
+            }
+        if (m == 0) return;
+        int bi = 0; __int128 bd = -1;
+        for (int t = 0; t < m; ++t) {
+            const __int128 dx = (__int128)nb[t][0] - x, dy = (__int128)nb[t][1] - y;
+            const __int128 q = dx * dx + dy * dy;
+            if (bd < 0 || q < bd) { bd = q; bi = t; }
+        }
+        pr[1] = pr[2] = nb[bi][2];
+        if (m < 3) return;
+        // 平面 z = a·X + b·Y + c を、原点を (x, y)、z を最近傍の z からの差で解く。
+        // 予測は c（＋最近傍の z）。値はどれも小さいので __int128 で溢れない。
+        const int64_t z0 = nb[bi][2];
+        // z の差も縛る。|dz| が 2^40 を超える近傍は平面に使わない（最近傍で済ませる）。
+        for (int t = 0; t < m; ++t) {
+            const int64_t dz = wsub(nb[t][2], z0);
+            if (dz > ((int64_t)1 << 40) || dz < -((int64_t)1 << 40)) return;
+        }
+        __int128 Sx = 0, Sy = 0, Sz = 0, Sxx = 0, Sxy = 0, Syy = 0, Sxz = 0, Syz = 0;
+        for (int t = 0; t < m; ++t) {
+            const __int128 X_ = (__int128)nb[t][0] - x, Y_ = (__int128)nb[t][1] - y;
+            const __int128 Z_ = (__int128)nb[t][2] - z0;
+            Sx += X_; Sy += Y_; Sz += Z_;
+            Sxx += X_ * X_; Sxy += X_ * Y_; Syy += Y_ * Y_; Sxz += X_ * Z_; Syz += Y_ * Z_;
+        }
+        const __int128 M = m;
+        const __int128 det = Sxx * (Syy * M - Sy * Sy) - Sxy * (Sxy * M - Sy * Sx)
+                           + Sx * (Sxy * Sy - Syy * Sx);
+        if (det == 0) return;
+        const __int128 dc = Sxx * (Syy * Sz - Syz * Sy) - Sxy * (Sxy * Sz - Syz * Sx)
+                          + Sxz * (Sxy * Sy - Syy * Sx);
+        const __int128 c = rdiv128(dc, det);
+        const __int128 lim = (__int128)1 << 40;
+        if (c > lim || c < -lim) return;      // 退化した当てはめは使わない
+        pr[2] = wadd(z0, (int64_t)c);
+    }
+    // 直近の減衰誤差が最も小さい予測子（同点なら番号の小さいほう）。
+    int pick() const {
+        int k = 0;
+        for (int t = 1; t < 3; ++t) if (se[t] < se[k]) k = t;
+        return k;
+    }
+    void update(int64_t z, const int64_t pr[3]) {
+        for (int t = 0; t < 3; ++t) se[t] = se[t] - (se[t] >> 4) + zbits(wsub(z, pr[t])) * 16;
+    }
+    void insert(int64_t x, int64_t y, int64_t z) { g[key(x >> S, y >> S)] = {x, y, z}; }
+};
+static thread_local int g_lms = 0;
+
 static void enc_geom_x(const std::vector<const Col*>& cols,
-                       int pmode, std::vector<uint8_t>& out) {
+                       int pmode, std::vector<uint8_t>& out, bool cross = false,
+                       const Col* aux = nullptr, int amask = 0, int cshift = 0,
+                       bool sshare = false) {
     size_t n = cols[0]->size();
     Encoder e;
-    UIntCoder uc(3 * NCTX, 64);
-    Pred mp[3];
-    for (int c = 0; c < 3; ++c) mp[c].mode = pmode;
+    const int NC0 = cross ? (2 * NCTX + NCTX * NCTX) : (3 * NCTX);
+    const bool sgnctx = (g_lms && lms_kind() == 2);
+    const int RAYM = g_ray ? 2 : 1;
+    UIntCoder uc((sgnctx ? NC0 * sgn_mul() : NC0) * RAYM, 64);
+    const size_t ns = (aux && amask) ? (size_t)amask + 1 : 1;
+    std::vector<Pred> mps(ns * 3);
+    for (auto& q : mps) q.mode = pmode;
+    int psg[3] = {0, 0, 0};
+    LmsPred lms[3];
+    for (auto& q : lms) q.ord = lms_ord();
+    BiasTab bias((size_t)NC0);
+    RayPred ray;
     int prev_kx = 0;
     for (size_t i = 0; i < n; ++i) {
+        Pred* mp = &mps[(ns == 1 ? 0 : (size_t)((uint64_t)(*aux)[i] & (uint64_t)amask)) * 3];
+        int rn = 0;
+        const bool ct = RayPred::cont(i, rn);
         int k[3] = {0, 0, 0};
         for (int c = 0; c < 3; ++c) {
-            int64_t x = (*cols[c])[i];
-            uint64_t z = zigzag(x - mp[c].predict());
-            int ctxc = (c == 0) ? prev_kx : (c == 1 ? k[0] : (k[0] + k[1]) / 2);
-            if (ctxc >= NCTX) ctxc = NCTX - 1;
-            uc.encode(e, z, c * NCTX + ctxc);
-            mp[c].push(x);
+            int cx;
+            if (cross && c == 2) cx = 2 * NCTX + (k[0] >> cshift) * NCTX + (k[1] >> cshift);
+            else {
+                int ctxc = (c == 0) ? prev_kx : (c == 1 ? k[0] : (k[0] + k[1]) / 2);
+                ctxc >>= cshift;
+                if (ctxc >= NCTX) ctxc = NCTX - 1;
+                cx = c * NCTX + ctxc;
+            }
+            const int64_t x = (*cols[c])[i];
+            int64_t p;
+            if (ct && ray_pred()) p = wadd((*cols[c])[i - 1], ray.gap[rn][c]);
+            else {
+                p = mp[c].predict();
+                if (g_lms && lms_kind() == 1) p = wadd(p, lms[c].corr());
+                if (g_lms && lms_kind() == 0) p = wadd(p, bias.at(cx));
+            }
+            const int64_t dd = wsub(x, p);
+            const uint64_t z = zigzag(dd);
+            int cx2 = sgnctx ? cx * sgn_mul() + psg[c] : cx;
+            if (g_ray) cx2 = cx2 * 2 + (ct ? 1 : 0);
+            uc.encode2(e, z, cx2, sshare ? c : cx2);
+            if (g_lms) {
+                if (lms_kind() == 1) lms[c].push(dd);
+                else if (lms_kind() == 0) bias.push(cx, dd);
+                else psg[c] = sgn_push(psg[c], dd);
+            }
+            if (ct) ray.gap[rn][c] = wsub(x, (*cols[c])[i - 1]);
+            if (!ct || ray_hist()) mp[c].push(x);
             k[c] = ctx_of(z);
         }
         prev_kx = k[0];
     }
     out = e.finish();
 }
+// 幾何の列は `f64bits` のとき **double のビット列を int64 として持つ**ので、
+// 負の値が約 -4.6e18 になり、正の値との差が int64 をはみ出す。
+// 符号つきの溢れは未定義動作で、**往復検証は同じ二値の同じ最適化で走るため
+// すり抜ける**。符号なしで回してから戻す（2 の補数の巻き戻しは規定済みで、
+// zigzag / unzigzag はその巻き戻しに対して完全な逆写像になっている）。
+static inline int64_t wsub(int64_t a, int64_t b) {
+    return (int64_t)((uint64_t)a - (uint64_t)b);
+}
+static inline int64_t wadd(int64_t a, int64_t b) {
+    return (int64_t)((uint64_t)a + (uint64_t)b);
+}
+
+// 向き追従 — y の予測に、その点の dx と直前の向き (前の dx, 前の dy) を使う。
+// 予測は整数だけで作る。積は int64 で溢れうるので 128 bit を経由する。
+// 割り算は fdiv（床）に合わせる。このファイルの他の予測子が全部 fdiv なので、
+// ここだけ 0 方向に切り捨てると負の傾きの区間で予測が偏る。
+static inline int64_t dir_pred_y(int64_t prev_y, int64_t dx, int64_t pdx, int64_t pdy) {
+    if (pdx == 0) return wadd(prev_y, pdy);    // 向きが分からない回は直前の dy
+    __int128 num = (__int128)dx * (__int128)pdy;
+    __int128 den = (__int128)pdx;
+    __int128 t = num / den;
+    if ((num % den != 0) && ((num < 0) != (den < 0))) --t;   // 床に合わせる
+    if (t > INT64_MAX / 4) t = INT64_MAX / 4;
+    if (t < INT64_MIN / 4) t = INT64_MIN / 4;
+    return wadd(prev_y, (int64_t)t);
+}
+static void enc_geom_dir(const std::vector<const Col*>& cols, int pmode,
+                         std::vector<uint8_t>& out) {
+    size_t n = cols[0]->size();
+    Encoder e;
+    UIntCoder uc(3 * NCTX, 64);
+    Pred mp[3];
+    for (int c = 0; c < 3; ++c) mp[c].mode = pmode;
+    int prev_kx = 0;
+    int64_t px = 0, py = 0, pdx = 0, pdy = 0;
+    for (size_t i = 0; i < n; ++i) {
+        int k[3] = {0, 0, 0};
+        int64_t x = (*cols[0])[i], y = (*cols[1])[i];
+        const int64_t dx = wsub(x, px), dy = wsub(y, py);
+        for (int c = 0; c < 3; ++c) {
+            int64_t v = (*cols[c])[i];
+            int64_t pr = (c == 1) ? dir_pred_y(py, dx, pdx, pdy) : mp[c].predict();
+            uint64_t z = zigzag(wsub(v, pr));
+            int ctxc = (c == 0) ? prev_kx : (c == 1 ? k[0] : (k[0] + k[1]) / 2);
+            if (ctxc >= NCTX) ctxc = NCTX - 1;
+            uc.encode(e, z, c * NCTX + ctxc);
+            mp[c].push(v);
+            k[c] = ctx_of(z);
+        }
+        prev_kx = k[0];
+        px = x; py = y; pdx = dx; pdy = dy;
+    }
+    out = e.finish();
+}
+static void dec_geom_dir(const uint8_t* data, size_t len, size_t n, int pmode,
+                         std::vector<std::vector<int64_t>>& out) {
+    out.assign(3, std::vector<int64_t>(n));
+    Decoder d(data, len);
+    UIntCoder uc(3 * NCTX, 64);
+    Pred mp[3];
+    for (int c = 0; c < 3; ++c) mp[c].mode = pmode;
+    int prev_kx = 0;
+    int64_t px = 0, py = 0, pdx = 0, pdy = 0;
+    for (size_t i = 0; i < n; ++i) {
+        int k[3] = {0, 0, 0};
+        int64_t x = 0, dx = 0;
+        for (int c = 0; c < 3; ++c) {
+            int ctxc = (c == 0) ? prev_kx : (c == 1 ? k[0] : (k[0] + k[1]) / 2);
+            if (ctxc >= NCTX) ctxc = NCTX - 1;
+            uint64_t z = uc.decode(d, c * NCTX + ctxc);
+            int64_t pr = (c == 1) ? dir_pred_y(py, dx, pdx, pdy) : mp[c].predict();
+            int64_t v = wadd(pr, unzigzag(z));
+            out[c][i] = v;
+            mp[c].push(v);
+            k[c] = ctx_of(z);
+            if (c == 0) { x = v; dx = wsub(x, px); }
+        }
+        prev_kx = k[0];
+        const int64_t y = out[1][i];
+        pdx = dx; pdy = wsub(y, py);
+        px = x; py = y;
+    }
+}
+
+// 区間ごとに予測子を切り替える。模型は通しで持つ。
+// 選択は符号化側が区間ごとに全部の予測子の桁数を数えて決め、流れの先頭に書く。
+static void seg_choose(const std::vector<const Col*>& cols, size_t seg,
+                       std::vector<uint8_t>& pick) {
+    const size_t n = cols[0]->size();
+    const size_t ns = (n + seg - 1) / seg;
+    pick.assign(ns, 0);
+    Pred mp[8][3];
+    for (int m = 0; m < 8; ++m) for (int c = 0; c < 3; ++c) mp[m][c].mode = m;
+    std::vector<uint64_t> acc(8, 0);
+    size_t s0 = 0;
+    for (size_t i = 0; i < n; ++i) {
+        for (int m = 0; m < 8; ++m)
+            for (int c = 0; c < 3; ++c) {
+                const int64_t v = (*cols[c])[i];
+                acc[m] += (uint64_t)ctx_of(zigzag(wsub(v, mp[m][c].predict())));
+            }
+        for (int m = 0; m < 8; ++m) for (int c = 0; c < 3; ++c) mp[m][c].push((*cols[c])[i]);
+        if ((i + 1) % seg == 0 || i + 1 == n) {
+            int bm = 0;
+            for (int m = 1; m < 8; ++m) if (acc[m] < acc[bm]) bm = m;
+            pick[s0++] = (uint8_t)bm;
+            std::fill(acc.begin(), acc.end(), 0ull);
+        }
+    }
+}
+// 選んだ予測子で通しに符号化する（模型は区間で切らない）。
+// **8 本すべての予測子の状態を進める。**切り替えた先がその時点の履歴を
+// 持っていなければ、切り替えた直後だけ予測が外れる。
+template <class STEP>
+static void seg_walk(size_t n, size_t seg, const std::vector<uint8_t>& pick, STEP step) {
+    Pred mp[8][3];
+    for (int m = 0; m < 8; ++m) for (int c = 0; c < 3; ++c) mp[m][c].mode = m;
+    int prev_kx = 0;
+    for (size_t i = 0; i < n; ++i) {
+        const int m = pick[i / seg] & 7;
+        int k[3] = {0, 0, 0};
+        for (int c = 0; c < 3; ++c) {
+            const int ctxc = (c == 0) ? prev_kx : (c == 1 ? k[0] : (k[0] + k[1]) / 2);
+            const int cx = c * NCTX + (ctxc >= NCTX ? NCTX - 1 : ctxc);
+            const int64_t pr = mp[m][c].predict();
+            const int64_t v = step(i, c, pr, cx);
+            k[c] = ctx_of(zigzag(wsub(v, pr)));      // 実際に送った残差の桁数
+            for (int q = 0; q < 8; ++q) mp[q][c].push(v);
+        }
+        prev_kx = k[0];
+    }
+}
+static bool enc_geom_seg(const std::vector<const Col*>& cols, int lg,
+                         std::vector<uint8_t>& out, std::string& err) {
+    const size_t n = cols[0]->size();
+    const size_t seg = (size_t)1 << lg;
+    if (n < seg * 4) { err = "点数が区間に足りない"; return false; }
+    std::vector<uint8_t> pick;
+    seg_choose(cols, seg, pick);
+    Encoder e;
+    UIntCoder uc(3 * NCTX, 64);
+    seg_walk(n, seg, pick, [&](size_t i, int c, int64_t pr, int cx) {
+        const int64_t v = (*cols[c])[i];
+        uc.encode(e, zigzag(wsub(v, pr)), cx);
+        return v;
+    });
+    std::vector<uint8_t> body = e.finish();
+    // 選択表は 1 区間 1 byte（3 bit しか使わないが、範囲符号にかけない素の表）
+    out.clear();
+    out.reserve(pick.size() + body.size());
+    out.insert(out.end(), pick.begin(), pick.end());
+    out.insert(out.end(), body.begin(), body.end());
+    return true;
+}
+static bool dec_geom_seg(const uint8_t* data, size_t len, size_t n, int lg,
+                         std::vector<std::vector<int64_t>>& out, std::string& err) {
+    const size_t seg = (size_t)1 << lg;
+    const size_t ns = (n + seg - 1) / seg;
+    if (len < ns) { err = "流れが短い"; return false; }
+    std::vector<uint8_t> pick(data, data + ns);
+    out.assign(3, std::vector<int64_t>(n));
+    Decoder d(data + ns, len - ns);
+    UIntCoder uc(3 * NCTX, 64);
+    seg_walk(n, seg, pick, [&](size_t i, int c, int64_t pr, int cx) {
+        const int64_t v = wadd(pr, unzigzag(uc.decode(d, cx)));
+        out[c][i] = v;
+        return v;
+    });
+    return true;
+}
+
+// 座標系の回転 — せん断 3 回で 1 平面を回す。整数のまま完全に可逆。
+//
+// 順: x -= (t*y)>>SH ; y += (s*x)>>SH ; x -= (t*y)>>SH
+// 逆: x += (t*y)>>SH ; y -= (s*x)>>SH ; x += (t*y)>>SH
+// 各段は相手の座標をそのときの値で使うので、順に戻せば厳密に元へ戻る。
+// flip=1 は「この平面を π 回す」＝両軸の符号反転。誤差ゼロで行える。
+// 角が ±π に近いと tan(ang/2) が発散して係数が格納できないので、
+// π ぶんを符号反転に出して、残りの小さい角だけをせん断にする。
+// π の回転は同じ平面の回転と可換なので、せん断の前後どちらに置いてもよい。
+struct RotPlane { int a, b; int32_t t, s; int8_t flip; };
+static inline void rot_apply(std::vector<int64_t>* col, const RotPlane& p, bool inv) {
+    std::vector<int64_t>& X = col[p.a];
+    std::vector<int64_t>& Y = col[p.b];
+    const int64_t t = p.t, s = p.s;
+    const size_t n = X.size();
+    // **順は「符号反転 → せん断」、逆は「せん断の逆 → 符号反転」。**
+    // 整数のせん断は符号反転と厳密には可換でない（算術右シフトは −∞ 方向に
+    // 丸めるので、-(t*y>>SH) と (t*(-y))>>SH が 1 だけ食い違う）。
+    auto flip = [&]() {
+        if (!p.flip) return;
+        for (size_t i = 0; i < n; ++i) {
+            X[i] = (int64_t)(0ull - (uint64_t)X[i]);
+            Y[i] = (int64_t)(0ull - (uint64_t)Y[i]);
+        }
+    };
+    if (!inv) {
+        flip();
+        for (size_t i = 0; i < n; ++i) {
+            X[i] = wsub(X[i], (t * Y[i]) >> ROT_SH);
+            Y[i] = wadd(Y[i], (s * X[i]) >> ROT_SH);
+            X[i] = wsub(X[i], (t * Y[i]) >> ROT_SH);
+        }
+    } else {
+        for (size_t i = 0; i < n; ++i) {
+            X[i] = wadd(X[i], (t * Y[i]) >> ROT_SH);
+            Y[i] = wsub(Y[i], (s * X[i]) >> ROT_SH);
+            X[i] = wadd(X[i], (t * Y[i]) >> ROT_SH);
+        }
+        flip();
+    }
+}
+// 3x3 の対称行列の固有分解（ヤコビ法）。**符号化側でしか使わない**ので
+// 浮動小数でよい。結果から作った係数を整数に丸めて格納する。
+static void jacobi3(double A[3][3], double V[3][3]) {
+    for (int i = 0; i < 3; ++i) for (int j = 0; j < 3; ++j) V[i][j] = (i == j);
+    for (int sweep = 0; sweep < 32; ++sweep) {
+        double off = 0;
+        for (int i = 0; i < 3; ++i) for (int j = i + 1; j < 3; ++j) off += A[i][j] * A[i][j];
+        if (off < 1e-24) break;
+        for (int p = 0; p < 3; ++p) for (int q = p + 1; q < 3; ++q) {
+            if (std::fabs(A[p][q]) < 1e-30) continue;
+            double th = 0.5 * (A[q][q] - A[p][p]) / A[p][q];
+            double tt = (th >= 0 ? 1.0 : -1.0) / (std::fabs(th) + std::sqrt(th * th + 1.0));
+            double c = 1.0 / std::sqrt(tt * tt + 1.0), sn = tt * c;
+            for (int k = 0; k < 3; ++k) {
+                double akp = A[k][p], akq = A[k][q];
+                A[k][p] = c * akp - sn * akq; A[k][q] = sn * akp + c * akq;
+            }
+            for (int k = 0; k < 3; ++k) {
+                double apk = A[p][k], aqk = A[q][k];
+                A[p][k] = c * apk - sn * aqk; A[q][k] = sn * apk + c * aqk;
+            }
+            for (int k = 0; k < 3; ++k) {
+                double vkp = V[k][p], vkq = V[k][q];
+                V[k][p] = c * vkp - sn * vkq; V[k][q] = sn * vkp + c * vkq;
+            }
+        }
+    }
+}
+// 差分の共分散から主軸を求め、せん断の係数 3 組を作る。
+static bool rot_fit(const std::vector<const Col*>& cols, RotPlane out[3]) {
+    const size_t n = cols[0]->size();
+    if (n < 64) return false;
+    double m[3] = {0, 0, 0}, C[3][3] = {{0, 0, 0}, {0, 0, 0}, {0, 0, 0}};
+    const size_t step = n > 200000 ? n / 200000 : 1;
+    size_t cnt = 0;
+    for (size_t i = step; i < n; i += step) {
+        double d[3];
+        for (int c = 0; c < 3; ++c) d[c] = (double)((*cols[c])[i] - (*cols[c])[i - step]);
+        for (int a = 0; a < 3; ++a) { m[a] += d[a]; for (int b = 0; b < 3; ++b) C[a][b] += d[a] * d[b]; }
+        ++cnt;
+    }
+    if (cnt < 32) return false;
+    for (int a = 0; a < 3; ++a) for (int b = 0; b < 3; ++b) C[a][b] = C[a][b] / cnt - m[a] * m[b] / (double)cnt / (double)cnt;
+    double V[3][3];
+    jacobi3(C, V);
+    // 固有値は A の対角に残る。大きい順に並べ替える
+    double ev[3] = {C[0][0], C[1][1], C[2][2]};
+    int ord[3] = {0, 1, 2};
+    for (int i = 0; i < 3; ++i) for (int j = i + 1; j < 3; ++j)
+        if (ev[ord[j]] > ev[ord[i]]) std::swap(ord[i], ord[j]);
+    double R[3][3];                       // 行ベクトルに掛ける行列の転置
+    for (int i = 0; i < 3; ++i) for (int j = 0; j < 3; ++j) R[i][j] = V[j][ord[i]];
+    if (R[0][0] * (R[1][1] * R[2][2] - R[1][2] * R[2][1])
+      - R[0][1] * (R[1][0] * R[2][2] - R[1][2] * R[2][0])
+      + R[0][2] * (R[1][0] * R[2][1] - R[1][1] * R[2][0]) < 0)
+        for (int j = 0; j < 3; ++j) R[2][j] = -R[2][j];
+    // オイラー角（ZYX）に分ける
+    double bb = -std::asin(std::max(-1.0, std::min(1.0, R[2][0])));
+    double aa, gg;
+    if (std::fabs(std::cos(bb)) > 1e-8) {
+        aa = std::atan2(R[1][0], R[0][0]); gg = std::atan2(R[2][1], R[2][2]);
+    } else { aa = 0; gg = std::atan2(-R[1][2], R[1][1]); }
+    double ang[3] = {gg, bb, aa};
+    const int pa[3] = {1, 2, 0}, pb[3] = {2, 0, 1};
+    const double LIM = (double)(1ll << (ROT_SH + 2));
+    const double PI = 3.14159265358979323846;
+    for (int i = 0; i < 3; ++i) {
+        // ±π に近い角は tan(ang/2) が発散する。π ぶんを符号反転に出す。
+        int8_t fl = 0;
+        if (ang[i] > PI / 2) { ang[i] -= PI; fl = 1; }
+        else if (ang[i] < -PI / 2) { ang[i] += PI; fl = 1; }
+        double t = std::tan(ang[i] / 2.0) * (double)(1ll << ROT_SH);
+        double sv = std::sin(ang[i]) * (double)(1ll << ROT_SH);
+        if (!(std::fabs(t) < LIM) || !(std::fabs(sv) < LIM)) return false;
+        out[i] = {pa[i], pb[i], (int32_t)std::llround(t), (int32_t)std::llround(sv), fl};
+    }
+    return true;
+}
+
+// 持ち上げ変換 — 粗い層を先に送り、細かい層は前後で挟んで内挿する。
+//
+// 段 l（刻み step = 2^l）で送るのは「step の奇数倍の位置」であり、その前後
+// （p ± step）は 1 つ粗い段で既に確定している。だから内挿してよい。
+// 最も粗い層（2^L の倍数の位置）だけは従来どおり直前からの差で送る。
+// 文脈は「挟んだ幅」の桁数。復号側も両端を持っているので副情報は生じない。
+static inline int64_t lift_pred(int64_t a, int64_t b) {
+    // 床で割る。両側で同じ式にすること（fdiv はこのファイルの他の予測子と同じ）。
+    return a + fdiv(b - a, 2);
+}
+template <class GET, class PUT>
+static void lift_walk(size_t n, int levels, GET get, PUT put) {
+    // 最も粗い層: 2^L の倍数の位置を、直前の粗い点からの差で送る
+    const size_t step0 = (size_t)1 << levels;
+    int64_t prev[3] = {0, 0, 0};
+    int pk[3] = {0, 0, 0};
+    for (size_t p = 0; p < n; p += step0) {
+        for (int c = 0; c < 3; ++c) {
+            const int cx = c * NCTX + (pk[c] < NCTX ? pk[c] : NCTX - 1);
+            const int64_t v = put(p, c, prev[c], cx, get(p, c));
+            pk[c] = ctx_of(zigzag(wsub(v, prev[c])));
+            prev[c] = v;
+        }
+    }
+    // 細かい段へ。刻みを半分にしながら、step の奇数倍の位置を内挿で送る。
+    for (int l = levels - 1; l >= 0; --l) {
+        const size_t step = (size_t)1 << l;
+        for (size_t p = step; p < n; p += 2 * step) {
+            const size_t lo = p - step;
+            const size_t hi = (p + step < n) ? (p + step) : lo;
+            for (int c = 0; c < 3; ++c) {
+                const int64_t a = get(lo, c), b = get(hi, c);
+                const int64_t pr = (hi == lo) ? a : lift_pred(a, b);
+                // 挟んだ幅を文脈にする（両端は復号側も持っている）
+                int sp = ctx_of(zigzag(wsub(b, a)));
+                if (sp >= NCTX) sp = NCTX - 1;
+                put(p, c, pr, 3 * NCTX + c * NCTX + sp, get(p, c));
+            }
+        }
+    }
+}
+static void enc_geom_lift(const std::vector<const Col*>& cols, int levels,
+                          std::vector<uint8_t>& out) {
+    const size_t n = cols[0]->size();
+    Encoder e;
+    UIntCoder uc(6 * NCTX, 64);
+    auto get = [&](size_t i, int c) { return (*cols[c])[i]; };
+    auto put = [&](size_t, int, int64_t pr, int cx, int64_t v) {
+        uc.encode(e, zigzag(wsub(v, pr)), cx);
+        return v;
+    };
+    lift_walk(n, levels, get, put);
+    out = e.finish();
+}
+static void dec_geom_lift(const uint8_t* data, size_t len, size_t n, int levels,
+                          std::vector<std::vector<int64_t>>& out) {
+    out.assign(3, std::vector<int64_t>(n));
+    Decoder d(data, len);
+    UIntCoder uc(6 * NCTX, 64);
+    auto get = [&](size_t i, int c) { return out[c][i]; };
+    auto put = [&](size_t i, int c, int64_t pr, int cx, int64_t) {
+        const int64_t v = wadd(pr, unzigzag(uc.decode(d, cx)));
+        out[c][i] = v;
+        return v;
+    };
+    lift_walk(n, levels, get, put);
+}
+
+// dec_geom_x は下で定義する（回転の復号がそれを使う）。
+static void dec_geom_x(const uint8_t* data, size_t len, size_t n, int pmode,
+                       std::vector<std::vector<int64_t>>& out, bool cross = false,
+                       const Col* aux = nullptr, int amask = 0, int cshift = 0,
+                       bool sshare = false);
+
+// 回した座標を、既存の幾何v3 の仕組みで符号化する。
+// 係数は流れの先頭に 24 byte 置く（復号側で三角関数を計算しない）。
+static bool enc_geom_rot(const std::vector<const Col*>& cols, int pmode,
+                         std::vector<uint8_t>& out, std::string& err) {
+    RotPlane rp[3];
+    if (!rot_fit(cols, rp)) { err = "回転を当てはめられない"; return false; }
+    const size_t n = cols[0]->size();
+    // せん断の掛け算が int64 を溢れない範囲か。f64bits の幾何はここで落ちる。
+    const int64_t LIM = 1ll << 40;
+    for (int c = 0; c < 3; ++c)
+        for (size_t i = 0; i < n; ++i) {
+            const int64_t v = (*cols[c])[i];
+            if (v > LIM || v < -LIM) { err = "値が大きすぎる"; return false; }
+        }
+    std::vector<int64_t> q[3];
+    for (int c = 0; c < 3; ++c) q[c] = cols[c]->to_vector();
+    for (int i = 0; i < 3; ++i) rot_apply(q, rp[i], false);
+    Col cc[3];
+    std::vector<const Col*> cv(3);
+    // **素の並びは詰めた直後に手放す。**両方抱えると 200 万点で 48 MB 余分に要る。
+    for (int c = 0; c < 3; ++c) {
+        cc[c] = std::move(q[c]);
+        std::vector<int64_t>().swap(q[c]);
+        cv[c] = &cc[c];
+    }
+    std::vector<uint8_t> body;
+    enc_geom_x(cv, pmode, body);
+    out.clear();
+    out.reserve(27 + body.size());
+    for (int i = 0; i < 3; ++i) {
+        const uint32_t t = (uint32_t)rp[i].t, sv = (uint32_t)rp[i].s;
+        for (int k = 0; k < 4; ++k) out.push_back((uint8_t)(t >> (8 * k)));
+        for (int k = 0; k < 4; ++k) out.push_back((uint8_t)(sv >> (8 * k)));
+        out.push_back((uint8_t)rp[i].flip);
+    }
+    out.insert(out.end(), body.begin(), body.end());
+    return true;
+}
+static bool dec_geom_rot(const uint8_t* data, size_t len, size_t n, int pmode,
+                         std::vector<std::vector<int64_t>>& out, std::string& err) {
+    if (len < 27) { err = "流れが短い"; return false; }
+    const int pa[3] = {1, 2, 0}, pb[3] = {2, 0, 1};
+    RotPlane rp[3];
+    for (int i = 0; i < 3; ++i) {
+        uint32_t t = 0, sv = 0;
+        for (int k = 0; k < 4; ++k) t |= (uint32_t)data[i * 9 + k] << (8 * k);
+        for (int k = 0; k < 4; ++k) sv |= (uint32_t)data[i * 9 + 4 + k] << (8 * k);
+        rp[i] = {pa[i], pb[i], (int32_t)t, (int32_t)sv, (int8_t)data[i * 9 + 8]};
+    }
+    dec_geom_x(data + 27, len - 27, n, pmode, out);
+    for (int i = 2; i >= 0; --i) rot_apply(out.data(), rp[i], true);
+    return true;
+}
+
 // 幾何v4 — 直近 W 点のうち最も近い点から予測し、選んだ点を明示的に送る。
 //
 // v0〜v3 の予測子はどれも「格納順で直前の点」に基づく。格納順が空間的に
@@ -351,29 +1371,62 @@ static void enc_geom_w(const std::vector<const Col*>& cols,
     // 幅つきの列をそのまま引く。探す窓は直近 w 点だけなので、引く回数は増えない。
     const Col &X = *cols[0], &Y = *cols[1], &Z = *cols[2];
     Encoder e;
-    UIntCoder uc(3 * NCTX, 64);
+    const bool sgnctx = (g_lms && lms_kind() == 2);
+    const int RAYM = g_ray ? 2 : 1;
+    const int SRFM = g_surf ? 3 : 1;           // z の文脈に「選んだ予測子」を足す
+    UIntCoder uc((sgnctx ? 3 * NCTX * sgn_mul() : 3 * NCTX) * RAYM * SRFM, 64);
     UIntCoder ui(NCTX, 8);                     // 添字。文脈は直前の添字
     MedPred tp[3];
-    int prev_kx = 0, prev_idx = 0;
+    RayPred ray;
+    SurfPred surf(g_surf);
+    int prev_kx = 0, prev_idx = 0, sg[3] = {0, 0, 0};
     for (size_t i = 0; i < n; ++i) {
-        int back = i ? nn_back(X, Y, Z, i, w) : 0;
-        if (i) ui.encode(e, (uint64_t)back, prev_idx < NCTX ? prev_idx : NCTX - 1);
-        size_t j = i ? i - 1 - (size_t)back : 0;
-        const int64_t p[3] = {i ? X[j] + trend_of(tp[0], tmode) : 0,
-                              i ? Y[j] + trend_of(tp[1], tmode) : 0,
-                              i ? Z[j] + trend_of(tp[2], tmode) : 0};
+        int rn = 0;
+        const bool ct = RayPred::cont(i, rn);
         const int64_t v[3] = {X[i], Y[i], Z[i]};
+        int64_t p[3];
+        int back = 0;
+        const bool use_ray = ct && ray_pred();
+        if (use_ray) {
+            // 同じパルスの続き。最近傍の添字は送らない（復号側も ct を知っている）。
+            const int64_t q[3] = {X[i - 1], Y[i - 1], Z[i - 1]};
+            for (int c = 0; c < 3; ++c) p[c] = wadd(q[c], ray.gap[rn][c]);
+        } else {
+            back = i ? nn_back(X, Y, Z, i, w) : 0;
+            if (i) ui.encode(e, (uint64_t)back, prev_idx < NCTX ? prev_idx : NCTX - 1);
+            size_t j = i ? i - 1 - (size_t)back : 0;
+            p[0] = i ? X[j] + trend_of(tp[0], tmode) : 0;
+            p[1] = i ? Y[j] + trend_of(tp[1], tmode) : 0;
+            p[2] = i ? Z[j] + trend_of(tp[2], tmode) : 0;
+        }
         int k[3] = {0, 0, 0};
+        int64_t zp[3] = {0, 0, 0};
         for (int c = 0; c < 3; ++c) {
-            uint64_t z = zigzag(v[c] - p[c]);
+            int sk = 0;
+            if (c == 2 && surf.S) {
+                // (x, y) は送り終えている。z の予測子を 3 つから直近の成績で選ぶ。
+                surf.preds(v[0], v[1], p[2], zp);
+                sk = surf.pick();
+                p[2] = zp[sk];
+            }
+            const int64_t dd = wsub(v[c], p[c]);
+            uint64_t z = zigzag(dd);
             int ctxc = (c == 0) ? prev_kx : (c == 1 ? k[0] : (k[0] + k[1]) / 2);
             if (ctxc >= NCTX) ctxc = NCTX - 1;
-            uc.encode(e, z, c * NCTX + ctxc);
+            int cc = sgnctx ? (c * NCTX + ctxc) * sgn_mul() + sg[c] : c * NCTX + ctxc;
+            if (g_ray) cc = cc * 2 + (ct ? 1 : 0);
+            if (g_surf) cc = cc * 3 + sk;
+            uc.encode(e, z, cc);
+            if (sgnctx) sg[c] = sgn_push(sg[c], dd);
             k[c] = ctx_of(z);
         }
+        if (surf.S) { surf.update(v[2], zp); surf.insert(v[0], v[1], v[2]); }
         prev_kx = k[0];
-        prev_idx = back;
-        for (int c = 0; c < 3; ++c) tp[c].push(v[c]);
+        if (ct)
+            for (int c = 0; c < 3; ++c)
+                ray.gap[rn][c] = wsub(v[c], c == 0 ? X[i - 1] : (c == 1 ? Y[i - 1] : Z[i - 1]));
+        if (!use_ray) prev_idx = back;
+        if (!ct || ray_hist()) for (int c = 0; c < 3; ++c) tp[c].push(v[c]);
     }
     out = e.finish();
 }
@@ -383,48 +1436,114 @@ static void dec_geom_w(const uint8_t* data, size_t len, size_t n, size_t w, int 
     (void)w;
     out.assign(3, std::vector<int64_t>(n));
     Decoder d(data, len);
-    UIntCoder uc(3 * NCTX, 64);
+    const bool sgnctx = (g_lms && lms_kind() == 2);
+    const int RAYM = g_ray ? 2 : 1;
+    const int SRFM = g_surf ? 3 : 1;
+    UIntCoder uc((sgnctx ? 3 * NCTX * sgn_mul() : 3 * NCTX) * RAYM * SRFM, 64);
     UIntCoder ui(NCTX, 8);
     MedPred tp[3];
-    int prev_kx = 0, prev_idx = 0;
+    RayPred ray;
+    SurfPred surf(g_surf);
+    int prev_kx = 0, prev_idx = 0, sg[3] = {0, 0, 0};
     for (size_t i = 0; i < n; ++i) {
+        int rn = 0;
+        const bool ct = RayPred::cont(i, rn);
+        int64_t p[3];
         int back = 0;
-        if (i) back = (int)ui.decode(d, prev_idx < NCTX ? prev_idx : NCTX - 1);
-        size_t j = i ? i - 1 - (size_t)back : 0;
-        const int64_t p[3] = {i ? out[0][j] + trend_of(tp[0], tmode) : 0,
-                              i ? out[1][j] + trend_of(tp[1], tmode) : 0,
-                              i ? out[2][j] + trend_of(tp[2], tmode) : 0};
+        const bool use_ray = ct && ray_pred();
+        if (use_ray) {
+            for (int c = 0; c < 3; ++c) p[c] = wadd(out[c][i - 1], ray.gap[rn][c]);
+        } else {
+            if (i) back = (int)ui.decode(d, prev_idx < NCTX ? prev_idx : NCTX - 1);
+            // 壊れた入力で先頭より前を指さないように縛る（正しい流れでは起きない）
+            if (i && (size_t)back > i - 1) back = (int)(i - 1);
+            size_t j = i ? i - 1 - (size_t)back : 0;
+            p[0] = i ? out[0][j] + trend_of(tp[0], tmode) : 0;
+            p[1] = i ? out[1][j] + trend_of(tp[1], tmode) : 0;
+            p[2] = i ? out[2][j] + trend_of(tp[2], tmode) : 0;
+        }
         int k[3] = {0, 0, 0};
+        int64_t zp[3] = {0, 0, 0};
         for (int c = 0; c < 3; ++c) {
+            int sk = 0;
+            if (c == 2 && surf.S) {
+                surf.preds(out[0][i], out[1][i], p[2], zp);
+                sk = surf.pick();
+                p[2] = zp[sk];
+            }
             int ctxc = (c == 0) ? prev_kx : (c == 1 ? k[0] : (k[0] + k[1]) / 2);
             if (ctxc >= NCTX) ctxc = NCTX - 1;
-            uint64_t z = uc.decode(d, c * NCTX + ctxc);
-            out[c][i] = p[c] + unzigzag(z);
+            int cc = sgnctx ? (c * NCTX + ctxc) * sgn_mul() + sg[c] : c * NCTX + ctxc;
+            if (g_ray) cc = cc * 2 + (ct ? 1 : 0);
+            if (g_surf) cc = cc * 3 + sk;
+            uint64_t z = uc.decode(d, cc);
+            const int64_t dd = unzigzag(z);
+            out[c][i] = wadd(p[c], dd);
+            if (sgnctx) sg[c] = sgn_push(sg[c], dd);
             k[c] = ctx_of(z);
         }
+        if (surf.S) { surf.update(out[2][i], zp); surf.insert(out[0][i], out[1][i], out[2][i]); }
         prev_kx = k[0];
-        prev_idx = back;
-        for (int c = 0; c < 3; ++c) tp[c].push(out[c][i]);
+        if (ct)
+            for (int c = 0; c < 3; ++c) ray.gap[rn][c] = wsub(out[c][i], out[c][i - 1]);
+        if (!use_ray) prev_idx = back;
+        if (!ct || ray_hist()) for (int c = 0; c < 3; ++c) tp[c].push(out[c][i]);
     }
 }
 
 static void dec_geom_x(const uint8_t* data, size_t len, size_t n, int pmode,
-                       std::vector<std::vector<int64_t>>& out) {
+                       std::vector<std::vector<int64_t>>& out, bool cross,
+                       const Col* aux, int amask, int cshift,
+                       bool sshare) {
     out.assign(3, std::vector<int64_t>(n));
     Decoder d(data, len);
-    UIntCoder uc(3 * NCTX, 64);
-    Pred mp[3];
-    for (int c = 0; c < 3; ++c) mp[c].mode = pmode;
+    const int NC0 = cross ? (2 * NCTX + NCTX * NCTX) : (3 * NCTX);
+    const bool sgnctx = (g_lms && lms_kind() == 2);
+    const int RAYM = g_ray ? 2 : 1;
+    UIntCoder uc((sgnctx ? NC0 * sgn_mul() : NC0) * RAYM, 64);
+    const size_t ns = (aux && amask) ? (size_t)amask + 1 : 1;
+    std::vector<Pred> mps(ns * 3);
+    for (auto& q : mps) q.mode = pmode;
+    int psg[3] = {0, 0, 0};
+    LmsPred lms[3];
+    for (auto& q : lms) q.ord = lms_ord();
+    BiasTab bias((size_t)NC0);
+    RayPred ray;
     int prev_kx = 0;
     for (size_t i = 0; i < n; ++i) {
+        Pred* mp = &mps[(ns == 1 ? 0 : (size_t)((uint64_t)(*aux)[i] & (uint64_t)amask)) * 3];
+        int rn = 0;
+        const bool ct = RayPred::cont(i, rn);
         int k[3] = {0, 0, 0};
         for (int c = 0; c < 3; ++c) {
-            int ctxc = (c == 0) ? prev_kx : (c == 1 ? k[0] : (k[0] + k[1]) / 2);
-            if (ctxc >= NCTX) ctxc = NCTX - 1;
-            uint64_t z = uc.decode(d, c * NCTX + ctxc);
-            int64_t x = mp[c].predict() + unzigzag(z);
+            int cx;
+            if (cross && c == 2) cx = 2 * NCTX + (k[0] >> cshift) * NCTX + (k[1] >> cshift);
+            else {
+                int ctxc = (c == 0) ? prev_kx : (c == 1 ? k[0] : (k[0] + k[1]) / 2);
+                ctxc >>= cshift;
+                if (ctxc >= NCTX) ctxc = NCTX - 1;
+                cx = c * NCTX + ctxc;
+            }
+            int cx2 = sgnctx ? cx * sgn_mul() + psg[c] : cx;
+            if (g_ray) cx2 = cx2 * 2 + (ct ? 1 : 0);
+            const uint64_t z = uc.decode2(d, cx2, sshare ? c : cx2);
+            int64_t p;
+            if (ct && ray_pred()) p = wadd(out[c][i - 1], ray.gap[rn][c]);
+            else {
+                p = mp[c].predict();
+                if (g_lms && lms_kind() == 1) p = wadd(p, lms[c].corr());
+                if (g_lms && lms_kind() == 0) p = wadd(p, bias.at(cx));
+            }
+            const int64_t rr = unzigzag(z);
+            const int64_t x = wadd(p, rr);
             out[c][i] = x;
-            mp[c].push(x);
+            if (g_lms) {
+                if (lms_kind() == 1) lms[c].push(rr);
+                else if (lms_kind() == 0) bias.push(cx, rr);
+                else psg[c] = sgn_push(psg[c], rr);
+            }
+            if (ct) ray.gap[rn][c] = wsub(x, out[c][i - 1]);
+            if (!ct || ray_hist()) mp[c].push(x);
             k[c] = ctx_of(z);
         }
         prev_kx = k[0];
@@ -534,12 +1653,17 @@ template <class T>
 static void enc_resid_x(const std::vector<std::vector<T>>& res, std::vector<uint8_t>& out) {
     size_t n = res[0].size();
     Encoder e;
-    UIntCoder uc(3 * NCTX, 64);
-    int p0 = 0, p1 = 0;
+    // 符号つきの文脈（lms_kind()==2）。文脈は残差の桁数だけで符号を捨てているので、
+    // 直前の残差の符号を 1 ビット足す。enc_geom_x と同じ考え。
+    const bool sgnctx = (g_lms && lms_kind() == 2);
+    UIntCoder uc(sgnctx ? 3 * NCTX * sgn_mul() : 3 * NCTX, 64);
+    int p0 = 0, p1 = 0, sg[3] = {0, 0, 0};
+    auto CX = [&](int c, int k) { return sgnctx ? (c * NCTX + k) * sgn_mul() + sg[c] : c * NCTX + k; };
     for (size_t i = 0; i < n; ++i) {
-        uint64_t a = zigzag((int64_t)res[0][i]); uc.encode(e, a, 0 * NCTX + p0); int k0 = ctx_of(a);
-        uint64_t b = zigzag((int64_t)res[1][i]); uc.encode(e, b, 1 * NCTX + p1); int k1 = ctx_of(b);
-        uint64_t c = zigzag((int64_t)res[2][i]); uc.encode(e, c, 2 * NCTX + (k0 + k1) / 2);
+        uint64_t a = zigzag((int64_t)res[0][i]); uc.encode(e, a, CX(0, p0)); int k0 = ctx_of(a);
+        uint64_t b = zigzag((int64_t)res[1][i]); uc.encode(e, b, CX(1, p1)); int k1 = ctx_of(b);
+        uint64_t c = zigzag((int64_t)res[2][i]); uc.encode(e, c, CX(2, (k0 + k1) / 2));
+        if (sgnctx) for (int t = 0; t < 3; ++t) sg[t] = sgn_push(sg[t], (int64_t)res[t][i]);
         p0 = k0; p1 = k1;
     }
     out = e.finish();
@@ -548,12 +1672,15 @@ static void dec_resid_x(const uint8_t* data, size_t len, size_t n,
                         std::vector<std::vector<int64_t>>& res) {
     res.assign(3, std::vector<int64_t>(n));
     Decoder d(data, len);
-    UIntCoder uc(3 * NCTX, 64);
-    int p0 = 0, p1 = 0;
+    const bool sgnctx = (g_lms && lms_kind() == 2);
+    UIntCoder uc(sgnctx ? 3 * NCTX * sgn_mul() : 3 * NCTX, 64);
+    int p0 = 0, p1 = 0, sg[3] = {0, 0, 0};
+    auto CX = [&](int c, int k) { return sgnctx ? (c * NCTX + k) * sgn_mul() + sg[c] : c * NCTX + k; };
     for (size_t i = 0; i < n; ++i) {
-        uint64_t a = uc.decode(d, 0 * NCTX + p0); res[0][i] = unzigzag(a); int k0 = ctx_of(a);
-        uint64_t b = uc.decode(d, 1 * NCTX + p1); res[1][i] = unzigzag(b); int k1 = ctx_of(b);
-        uint64_t c = uc.decode(d, 2 * NCTX + (k0 + k1) / 2); res[2][i] = unzigzag(c);
+        uint64_t a = uc.decode(d, CX(0, p0)); res[0][i] = unzigzag(a); int k0 = ctx_of(a);
+        uint64_t b = uc.decode(d, CX(1, p1)); res[1][i] = unzigzag(b); int k1 = ctx_of(b);
+        uint64_t c = uc.decode(d, CX(2, (k0 + k1) / 2)); res[2][i] = unzigzag(c);
+        if (sgnctx) for (int t = 0; t < 3; ++t) sg[t] = sgn_push(sg[t], res[t][i]);
         p0 = k0; p1 = k1;
     }
 }
@@ -896,8 +2023,11 @@ static bool enc_geom_scan(const std::vector<const Col*>& cols,
                 fprintf(dump, "\n");
                 // 50 本に 1 本は生データも出す。Python 側で同じ走査線に
                 // scipy の当てはめを掛け、C++ の結果と直接比べるために使う。
+                // PCC_SCAN_DUMP_ALL を付けると全本出す。隣り合う走査線どうしを
+                // 比べたいときに要る（50 本に 1 本では隣が手に入らない）。
+                static const bool DUMP_ALL = getenv("PCC_SCAN_DUMP_ALL") != nullptr;
                 bool fat_fail = (sp_code == 2 && sp_r0 > 1000.0 && n_fat_dumped < 40);
-                if (dump_raw && ((id % 50) == 0 || fat_fail)) {
+                if (dump_raw && (DUMP_ALL || (id % 50) == 0 || fat_fail)) {
                     if (fat_fail) ++n_fat_dumped;
                     fprintf(dump_raw, "# line %zu n %zu code %d r0 %.1f\n",
                             id, bx.size(), sp_code, sp_r0);
@@ -994,6 +2124,15 @@ static bool enc_geom_scan(const std::vector<const Col*>& cols,
         }
         res64[c][t] = v;
     };
+    // PCC_RESID_DUMP=<path> を付けたときだけ、符号化器が実際に払う残差を書き出す。
+    // 当てはめを外で再現すると（Python で組み直すと）別のものを測ってしまうので、
+    // 天井を測るときはここから出した値を使う。符号化の結果には影響しない。
+    FILE* rd = nullptr;
+    if (const char* rp = getenv("PCC_RESID_DUMP")) {
+        rd = fopen(rp, "w");
+        if (rd) fprintf(rd, "line\tok\tx\ty\tz\tr_in\tr_off\tr_z"
+                            "\tr_mdl\tr_alt\n");
+    }
     // z は「同じ掃引・同じ戻り番号の直前の点」から予測する。
     // その系列がまだ空なら、直前に符号化した任意の点の z を使う（掃引をまたぐ）。
     int64_t last_any = 0;
@@ -1019,8 +2158,14 @@ static bool enc_geom_scan(const std::vector<const Col*>& cols,
             int64_t s, off;
             shear_fwd(CX[i], CY[i], sp.t2, sp.sn, s, off);
             int64_t po = mpo[gidx].predict();
-            int64_t ps = sp.ok ? scan_predict(sp, sc.gps(t) - g0[gidx], CZ[i])
-                               : mps[gidx].predict();
+            // 面内には予測子が 2 つある。当てはめ（走査モデル）と、素朴な
+            // 中央値予測（退避路）。今は走査線ごとにどちらか一方を選んでいる。
+            // 当てはめを採らない走査線では scan_predict を呼ばない。
+            // 診断のときだけ、比べるために両方を出す。
+            int64_t ps_alt = mps[gidx].predict();
+            int64_t ps_mdl = (sp.ok || rd)
+                ? scan_predict(sp, sc.gps(t) - g0[gidx], CZ[i]) : ps_alt;
+            int64_t ps = sp.ok ? ps_mdl : ps_alt;
             put_res(0, (size_t)t, s - ps);
             put_res(1, (size_t)t, off - po);
             mps[gidx].push(s); mpo[gidx].push(off);
@@ -1028,10 +2173,17 @@ static bool enc_geom_scan(const std::vector<const Col*>& cols,
             if (!hz[r]) { mz[r] = MedPred(); mz[r].prev = last_any; }
             int64_t pz = use_med ? mz[r].predict() : (hz[r] ? lz[r] : last_any);
             put_res(2, (size_t)t, CZ[i] - pz);
+            if (rd) fprintf(rd, "%d\t%d\t%lld\t%lld\t%lld\t%lld\t%lld\t%lld"
+                                "\t%lld\t%lld\n",
+                            li, (int)sp.ok, (long long)CX[i], (long long)CY[i],
+                            (long long)CZ[i], (long long)(s - ps),
+                            (long long)(off - po), (long long)(CZ[i] - pz),
+                            (long long)(s - ps_mdl), (long long)(s - ps_alt));
             mz[r].push(CZ[i]);
             lz[r] = CZ[i]; hz[r] = true; last_any = CZ[i];
         }
     }
+    if (rd) fclose(rd);
 
     std::vector<int64_t> flags(nsw);
     for (size_t k = 0; k < nsw; ++k) flags[k] = L.split[k];
@@ -1146,21 +2298,25 @@ static bool dec_geom_scan(const std::vector<uint8_t>& param, const uint8_t* data
     uint64_t nsw, nl, nlab, lf, lp, ll, lr;
     if (!rd64(nsw) || !rd64(nl) || !rd64(nlab)) { err = "走査ストリームが短い"; return false; }
     if (nsw != sc.swp.size() - 1) { err = "掃引数が合わない"; return false; }
-    if (!rd64(lf) || p + lf > len) { err = "フラグが短い"; return false; }
+    // 走査線は掃引ごとに 1 本か 2 本、標識は点ごとに高々 1 つ。
+    // 壊れた数で巨大な配列を取らない・範囲外を書かないよう先に確かめる。
+    if (nl > 2 * nsw || nlab > n) { err = "走査線・標識の数が掃引と合わない"; return false; }
+    if (!rd64(lf) || lf > len - p) { err = "フラグが短い"; return false; }
     std::vector<int64_t> flags(nsw);
     decode_ints(data + p, lf, flags.data(), nsw); p += lf;
-    if (!rd64(lp) || p + lp > len) { err = "パラメタが短い"; return false; }
+    if (!rd64(lp) || lp > len - p) { err = "パラメタが短い"; return false; }
     std::vector<int64_t> pars(nl * 8);
     decode_ints(data + p, lp, pars.data(), nl * 8); p += lp;
-    if (!rd64(ll) || p + ll > len) { err = "標識が短い"; return false; }
+    if (!rd64(ll) || ll > len - p) { err = "標識が短い"; return false; }
     std::vector<int64_t> labs(nlab);
     if (nlab) {
         Decoder d(data + p, ll); UIntCoder uc(2, 2);
         int prev = 0;
-        for (size_t i = 0; i < nlab; ++i) { labs[i] = (int64_t)uc.decode(d, prev); prev = (int)labs[i]; }
+        // 標識は 0/1。文脈は 2 つしかないので、壊れた値で範囲外を引かないよう 0/1 に縛る。
+        for (size_t i = 0; i < nlab; ++i) { labs[i] = (int64_t)uc.decode(d, prev); prev = labs[i] ? 1 : 0; }
     }
     p += ll;
-    if (!rd64(lr) || p + lr > len) { err = "残差が短い"; return false; }
+    if (!rd64(lr) || lr > len - p) { err = "残差が短い"; return false; }
     std::vector<std::vector<int64_t>> res;
     double t_a = now_sec();
     if (use_xctx) dec_resid_x(data + p, lr, n, res); else dec_resid(data + p, lr, n, 3, res);
@@ -1191,8 +2347,10 @@ static bool dec_geom_scan(const std::vector<uint8_t>& param, const uint8_t* data
     L.label.assign(n, 0);
     { size_t q = 0;
       for (size_t k = 0; k < nsw; ++k)
-          if (L.split[k]) for (int32_t t = sc.swp[k]; t < sc.swp[k + 1]; ++t)
-              L.label[t] = (uint8_t)labs[q++]; }
+          if (L.split[k]) for (int32_t t = sc.swp[k]; t < sc.swp[k + 1]; ++t) {
+              if (q >= nlab) { err = "標識が足りない"; return false; }
+              L.label[t] = (uint8_t)labs[q++];
+          } }
 
     out.assign(3, std::vector<int64_t>(n, 0));
     int64_t last_any = 0;
@@ -1234,12 +2392,24 @@ static bool dec_geom_scan(const std::vector<uint8_t>& param, const uint8_t* data
 }
 
 // param の 2 バイト目以降に入っている名前で、既に復号済みの列を引く
-static const Col* aux_col(const std::vector<uint8_t>& param, const CodecCtx* ctx) {
-    if (!ctx || !ctx->fr || param.size() < 3) return nullptr;
-    uint16_t l; memcpy(&l, param.data() + 1, 2);
-    if (param.size() < 3u + l) return nullptr;
-    std::string nm((const char*)param.data() + 3, l);
+// 仮数部のうち上から何ビットを模型に通すか。-1 で従来どおり全部。
+// **測ってから既定を決める**ための入口で、最終的には定数にする。
+static const int RAWKEEP_ENV = [] {
+    const char* e = getenv("PCC_RAWKEEP");
+    return e ? atoi(e) : -1;
+}();
+static inline int rawkeep_env() { return g_decoding ? -1 : RAWKEEP_ENV; }
+
+static const Col* aux_col_at(const std::vector<uint8_t>& param,
+                             const CodecCtx* ctx, size_t off) {
+    if (!ctx || !ctx->fr || param.size() < off + 2) return nullptr;
+    uint16_t l; memcpy(&l, param.data() + off, 2);
+    if (param.size() < off + 2u + l) return nullptr;
+    std::string nm((const char*)param.data() + off + 2, l);
     return ctx->fr->get(nm);
+}
+static const Col* aux_col(const std::vector<uint8_t>& param, const CodecCtx* ctx) {
+    return aux_col_at(param, ctx, 1);
 }
 
 // 候補ごとに確保していた作業領域。糸ごとに使い回す。
@@ -1255,8 +2425,46 @@ bool codec_encode(uint16_t id, const std::vector<const Col*>& cols,
                   const std::vector<uint8_t>& param, std::vector<uint8_t>& out,
                   std::string& err, const CodecCtx* ctx) {
     if (cols.empty()) { err = "列がない"; return false; }
+    // **抜けるときに戻す。**enc_best と同じで、設定しっぱなしにすると
+    // この関数を通らない経路（encode_ints など）が直前の候補の旗を拾う。
+    struct FlagGuard {
+        int fsym, raw;
+        int mtc, bnd, lms, sgb, ray, srf, dcd;
+        const Col* rbf;
+        FlagGuard() : fsym(UIntCoder::FSYM), raw(UIntCoder::RAWKEEP),
+                      mtc(UIntCoder::MATCH), bnd(UIntCoder::BUNDLE),
+                      lms(g_lms), sgb(g_sgnbits), ray(g_ray), srf(g_surf),
+                      dcd(g_decoding), rbf(g_ray_bf) {}
+        ~FlagGuard() { UIntCoder::FSYM = fsym; UIntCoder::RAWKEEP = raw;
+                       UIntCoder::MATCH = mtc; UIntCoder::BUNDLE = bnd;
+                       g_lms = lms; g_sgnbits = sgb; g_ray = ray; g_ray_bf = rbf;
+                       g_surf = srf; g_decoding = dcd; }
+    } flag_guard;
+    g_decoding = 0;
     UIntCoder::FSYM = (id & C_FSYM_BIT) ? 1 : 0;
-    id = (uint16_t)(id & ~C_FSYM_BIT);
+    UIntCoder::RAWKEEP = (id & C_RAW_BIT) ? C_RAW_KEEP : rawkeep_env();
+    UIntCoder::MATCH = (id & C_MTC_BIT) ? 1 : 0;
+    UIntCoder::BUNDLE = (id & C_BND_BIT) ? 1 : 0;
+    {
+        const int sv = ((id & C_LMS_BIT) ? 1 : 0) | ((id & C_SGN2_BIT) ? 2 : 0);
+        g_lms = sv ? 1 : 0;
+        g_sgnbits = (sv == 1) ? 1 : (sv == 2 ? 2 : 4);
+    }
+    {
+        const int sv = ((id & C_SURF_A) ? 1 : 0) | ((id & C_SURF_B) ? 2 : 0);
+        g_surf = sv ? 5 + sv : 0;             // 1/2/3 → 格子 2^6 / 2^7 / 2^8
+    }
+    g_ray = (id & C_RAY_BIT) ? 1 : 0;
+    g_ray_bf = nullptr;
+    if (g_ray) {
+        // 光線モデルは bit_fields（幾何より先に復号される）が要る。無ければ候補にならない。
+        const Col* bf = (ctx && ctx->fr) ? ctx->fr->get("bit_fields") : nullptr;
+        if (!bf || bf->size() != cols[0]->size()) {
+            err = "光線モデルに bit_fields が無い"; return false;
+        }
+        g_ray_bf = bf;
+    }
+    id = (uint16_t)(id & ~C_FLAG_MASK);
     switch (id) {
     case C_RAW64: {
         size_t nc = cols.size(), n = cols[0]->size();
@@ -1273,6 +2481,61 @@ bool codec_encode(uint16_t id, const std::vector<const Col*>& cols,
     case C_RANGE_CTX2:   enc_cols(cols, 3, out); return true;
     case C_RANGE_MED:    enc_geom_med(cols, out); return true;
     case C_RANGE_CACHE:  enc_cols_cache(cols, out); return true;
+    case C_RANGE_PREV:   enc_cols_prev(cols, out); return true;
+    case C_RANGE_SYM: {
+        const Col* rf = nullptr; int sh = 0;
+        if (!param.empty() && !sym_ref(param, ctx, rf, sh)) { err = "参照列がない"; return false; }
+        if (rf && rf->size() < cols[0]->size()) { err = "参照列が短い"; return false; }
+        if (!enc_cols_sym(cols, rf, sh, ctx, out)) { err = "字母が大きすぎる"; return false; }
+        return true;
+    }
+    case C_GEOM_CROSS:
+        if (cols.size() != 3) { err = "交差軸は 3 軸"; return false; }
+        enc_geom_cross(cols, out); return true;
+    case C_GEOM_DIR:
+        if (cols.size() != 3) { err = "向き追従は 3 軸"; return false; }
+        enc_geom_dir(cols, param.empty() ? 0 : (param[0] & 7), out); return true;
+    case C_GEOM_ROT:
+        if (cols.size() != 3) { err = "回転は 3 軸"; return false; }
+        return enc_geom_rot(cols, param.empty() ? 0 : (param[0] & 7), out, err);
+    case C_GEOM_SEG: {
+        if (cols.size() != 3) { err = "区間ごとは 3 軸"; return false; }
+        const int lg = param.empty() ? 12 : (int)param[0];
+        if (lg < 4 || lg > 24) { err = "区間の大きさが範囲外"; return false; }
+        return enc_geom_seg(cols, lg, out, err);
+    }
+    case C_GEOM_LIFT: {
+        if (cols.size() != 3) { err = "持ち上げは 3 軸"; return false; }
+        int L = param.empty() ? 8 : (int)param[0];
+        if (L < 1 || L > 24) { err = "段数が範囲外"; return false; }
+        if (cols[0]->size() < ((size_t)1 << L)) { err = "点数が段数に足りない"; return false; }
+        enc_geom_lift(cols, L, out); return true;
+    }
+    case C_RAW_W: {
+        const int w = param.empty() ? 8 : (int)param[0];
+        const bool sg = param.size() > 1 && param[1];
+        if (w < 1 || w > 8) { err = "幅が範囲外"; return false; }
+        const size_t nc = cols.size(), n2 = nc ? cols[0]->size() : 0;
+        out.clear(); out.reserve(nc * n2 * (size_t)w);
+        for (size_t i = 0; i < n2; ++i)
+            for (size_t c = 0; c < nc; ++c) {
+                const int64_t v = (*cols[c])[i];
+                // **入らない値があれば候補ごと外す。**切り詰めて黙って壊さない。
+                const uint64_t u = (uint64_t)v;
+                int64_t back;
+                if (w == 8) back = v;
+                else {
+                    const uint64_t m = (1ull << (w * 8)) - 1;
+                    const uint64_t t = u & m;
+                    back = sg ? (int64_t)(t ^ (1ull << (w * 8 - 1))) -
+                                (int64_t)(1ull << (w * 8 - 1))
+                              : (int64_t)t;
+                }
+                if (back != v) { err = "幅に入らない値がある"; out.clear(); return false; }
+                for (int b2 = 0; b2 < w; ++b2) out.push_back((uint8_t)(u >> (8 * b2)));
+            }
+        return true;
+    }
     case C_GEOM_XYZ: {
         int var = param.empty() ? 0 : param[0];
         if (var == 4) {
@@ -1285,7 +2548,14 @@ bool codec_encode(uint16_t id, const std::vector<const Col*>& cols,
             enc_geom_aux(cols, *a, out);
         } else if (var == 3) {
             if (cols.size() != 3) { err = "幾何v3 は 3 軸"; return false; }
-            enc_geom_x(cols, param.size() > 1 ? param[1] : 0, out);
+            const int pm = param.size() > 1 ? param[1] : 0;
+            const Col* a = nullptr; int am = 0;
+            if (pm & 8) {                       // param = [3][pm][覆い][名前長 u16][名前]
+                am = param.size() > 2 ? param[2] : 0;
+                a = aux_col_at(param, ctx, 3);
+                if (!a || a->size() < cols[0]->size()) { err = "補助列がない"; return false; }
+            }
+            enc_geom_x(cols, (pm & 3) | ((pm >> 5) & 4), out, (pm & 4) != 0, a, am, (pm >> 4) & 3, (pm & 64) != 0);
         } else if (var == 1) enc_geom_med(cols, out);
         else enc_cols(cols, 2, out);
         return true;
@@ -1412,8 +2682,44 @@ bool codec_decode(uint16_t id, const std::vector<uint8_t>& param,
                   const uint8_t* data, size_t len, size_t n, size_t ncol,
                   std::vector<std::vector<int64_t>>& out, std::string& err,
                   const CodecCtx* ctx) {
+    // **抜けるときに戻す。**enc_best と同じで、設定しっぱなしにすると
+    // この関数を通らない経路（encode_ints など）が直前の候補の旗を拾う。
+    struct FlagGuard {
+        int fsym, raw;
+        int mtc, bnd, lms, sgb, ray, srf, dcd;
+        const Col* rbf;
+        FlagGuard() : fsym(UIntCoder::FSYM), raw(UIntCoder::RAWKEEP),
+                      mtc(UIntCoder::MATCH), bnd(UIntCoder::BUNDLE),
+                      lms(g_lms), sgb(g_sgnbits), ray(g_ray), srf(g_surf),
+                      dcd(g_decoding), rbf(g_ray_bf) {}
+        ~FlagGuard() { UIntCoder::FSYM = fsym; UIntCoder::RAWKEEP = raw;
+                       UIntCoder::MATCH = mtc; UIntCoder::BUNDLE = bnd;
+                       g_lms = lms; g_sgnbits = sgb; g_ray = ray; g_ray_bf = rbf;
+                       g_surf = srf; g_decoding = dcd; }
+    } flag_guard;
+    g_decoding = 1;                       // 実験用の環境変数を読まない
     UIntCoder::FSYM = (id & C_FSYM_BIT) ? 1 : 0;
-    id = (uint16_t)(id & ~C_FSYM_BIT);
+    UIntCoder::RAWKEEP = (id & C_RAW_BIT) ? C_RAW_KEEP : rawkeep_env();
+    UIntCoder::MATCH = (id & C_MTC_BIT) ? 1 : 0;
+    UIntCoder::BUNDLE = (id & C_BND_BIT) ? 1 : 0;
+    {
+        const int sv = ((id & C_LMS_BIT) ? 1 : 0) | ((id & C_SGN2_BIT) ? 2 : 0);
+        g_lms = sv ? 1 : 0;
+        g_sgnbits = (sv == 1) ? 1 : (sv == 2 ? 2 : 4);
+    }
+    {
+        const int sv = ((id & C_SURF_A) ? 1 : 0) | ((id & C_SURF_B) ? 2 : 0);
+        g_surf = sv ? 5 + sv : 0;             // 1/2/3 → 格子 2^6 / 2^7 / 2^8
+    }
+    g_ray = (id & C_RAY_BIT) ? 1 : 0;
+    g_ray_bf = nullptr;
+    if (g_ray) {
+        // 復号側でも bit_fields は幾何より前の流れから既に戻っている。
+        const Col* bf = (ctx && ctx->fr) ? ctx->fr->get("bit_fields") : nullptr;
+        if (!bf || bf->size() != n) { err = "光線モデルに bit_fields が無い"; return false; }
+        g_ray_bf = bf;
+    }
+    id = (uint16_t)(id & ~C_FLAG_MASK);
     switch (id) {
     case C_RAW64: {
         if (len != ncol * n * 8) { err = "RAW64 の長さが合わない"; return false; }
@@ -1428,6 +2734,53 @@ bool codec_decode(uint16_t id, const std::vector<uint8_t>& param,
     case C_RANGE_CTX2:   dec_cols(data, len, n, ncol, 3, out); return true;
     case C_RANGE_MED:    dec_geom_med(data, len, n, ncol, out); return true;
     case C_RANGE_CACHE:  dec_cols_cache(data, len, n, ncol, out); return true;
+    case C_RANGE_PREV:   dec_cols_prev(data, len, n, ncol, out); return true;
+    case C_RANGE_SYM: {
+        const Col* rf = nullptr; int sh = 0;
+        if (!param.empty() && !sym_ref(param, ctx, rf, sh)) { err = "参照列がない"; return false; }
+        if (rf && rf->size() < n) { err = "参照列が短い"; return false; }
+        return dec_cols_sym(data, len, n, ncol, rf, sh, out, err);
+    }
+    case C_GEOM_CROSS:
+        if (ncol != 3) { err = "交差軸は 3 軸"; return false; }
+        dec_geom_cross(data, len, n, out); return true;
+    case C_GEOM_DIR:
+        if (ncol != 3) { err = "向き追従は 3 軸"; return false; }
+        dec_geom_dir(data, len, n, param.empty() ? 0 : (param[0] & 7), out); return true;
+    case C_GEOM_ROT:
+        if (ncol != 3) { err = "回転は 3 軸"; return false; }
+        return dec_geom_rot(data, len, n, param.empty() ? 0 : (param[0] & 7), out, err);
+    case C_GEOM_SEG: {
+        if (ncol != 3) { err = "区間ごとは 3 軸"; return false; }
+        const int lg = param.empty() ? 12 : (int)param[0];
+        if (lg < 4 || lg > 24) { err = "区間の大きさが範囲外"; return false; }
+        return dec_geom_seg(data, len, n, lg, out, err);
+    }
+    case C_GEOM_LIFT: {
+        if (ncol != 3) { err = "持ち上げは 3 軸"; return false; }
+        int L = param.empty() ? 8 : (int)param[0];
+        if (L < 1 || L > 24) { err = "段数が範囲外"; return false; }
+        if (n < ((size_t)1 << L)) { err = "点数が段数に足りない"; return false; }
+        dec_geom_lift(data, len, n, L, out); return true;
+    }
+    case C_RAW_W: {
+        const int w = param.empty() ? 8 : (int)param[0];
+        const bool sg = param.size() > 1 && param[1];
+        if (w < 1 || w > 8) { err = "幅が範囲外"; return false; }
+        if (len < ncol * n * (size_t)w) { err = "流れが短い"; return false; }
+        out.assign(ncol, std::vector<int64_t>(n));
+        size_t q = 0;
+        for (size_t i = 0; i < n; ++i)
+            for (size_t c = 0; c < ncol; ++c) {
+                uint64_t u = 0;
+                for (int b2 = 0; b2 < w; ++b2) u |= (uint64_t)data[q++] << (8 * b2);
+                if (w == 8) out[c][i] = (int64_t)u;
+                else if (sg) out[c][i] = (int64_t)(u ^ (1ull << (w * 8 - 1))) -
+                                         (int64_t)(1ull << (w * 8 - 1));
+                else out[c][i] = (int64_t)u;
+            }
+        return true;
+    }
     case C_GEOM_XYZ: {
         int var = param.empty() ? 0 : param[0];
         if (var == 4) {
@@ -1440,7 +2793,14 @@ bool codec_decode(uint16_t id, const std::vector<uint8_t>& param,
             dec_geom_aux(data, len, n, ncol, *a, out);
         } else if (var == 3) {
             if (ncol != 3) { err = "幾何v3 は 3 軸"; return false; }
-            dec_geom_x(data, len, n, param.size() > 1 ? param[1] : 0, out);
+            const int pm = param.size() > 1 ? param[1] : 0;
+            const Col* a = nullptr; int am = 0;
+            if (pm & 8) {
+                am = param.size() > 2 ? param[2] : 0;
+                a = aux_col_at(param, ctx, 3);
+                if (!a || a->size() < n) { err = "補助列がない"; return false; }
+            }
+            dec_geom_x(data, len, n, (pm & 3) | ((pm >> 5) & 4), out, (pm & 4) != 0, a, am, (pm >> 4) & 3, (pm & 64) != 0);
         } else if (var == 1) dec_geom_med(data, len, n, ncol, out);
         else dec_cols(data, len, n, ncol, 2, out);
         return true;
@@ -1569,12 +2929,32 @@ static double entropy_spatial_diff(const Col& a, const Col& b,
     return g_dc.entropy(m);
 }
 
+// **書き込む static を使わないこと。**`--trace` のときは列ごとの best_stream が
+// プールで並列に走り、ここを同時に呼ぶ。以前は名前の文字列を関数内の static に
+// 作って返していたので、糸どうしがヒープ上の同じ文字列を書き換え、
+// 「double free or corruption」で落ちることがあった（ThreadSanitizer で 101 件）。
+// 読むだけの static（名前の表）は問題ない。
 std::string cand_name(uint16_t c, const std::vector<uint8_t>& p) {
-    if (c & C_FSYM_BIT) {
-        static std::string s2;
-        s2 = cand_name((uint16_t)(c & ~C_FSYM_BIT), p) + "記";
-        return s2;
+    if (c & C_RAW_BIT)
+        return cand_name((uint16_t)(c & ~C_RAW_BIT), p) + "生";
+    if (c & C_MTC_BIT)
+        return cand_name((uint16_t)(c & ~C_MTC_BIT), p) + "照";
+    if (c & C_BND_BIT)
+        return cand_name((uint16_t)(c & ~C_BND_BIT), p) + "束";
+    if (c & (C_SURF_A | C_SURF_B)) {
+        const int sv = ((c & C_SURF_A) ? 1 : 0) | ((c & C_SURF_B) ? 2 : 0);
+        return cand_name((uint16_t)(c & ~(C_SURF_A | C_SURF_B)), p) +
+               (sv == 1 ? "面6" : (sv == 2 ? "面7" : "面8"));
     }
+    if (c & C_RAY_BIT)
+        return cand_name((uint16_t)(c & ~C_RAY_BIT), p) + "光";
+    if (c & (C_LMS_BIT | C_SGN2_BIT)) {
+        const int sv = ((c & C_LMS_BIT) ? 1 : 0) | ((c & C_SGN2_BIT) ? 2 : 0);
+        const char* sfx = (sv == 1) ? "符1" : (sv == 2 ? "符2" : "符4");
+        return cand_name((uint16_t)(c & ~(C_LMS_BIT | C_SGN2_BIT)), p) + sfx;
+    }
+    if (c & C_FSYM_BIT)
+        return cand_name((uint16_t)(c & ~C_FSYM_BIT), p) + "記";
     char b[32];
     switch (c) {
     case C_RAW64: return "raw64";
@@ -1584,25 +2964,65 @@ std::string cand_name(uint16_t c, const std::vector<uint8_t>& p) {
     case C_RANGE_CTX2: return "ctx2";
     case C_RANGE_MED: return "med3";
     case C_RANGE_CACHE: return "差分表";
+    case C_RANGE_PREV:  return "直前値";
+    case C_GEOM_CROSS:  return "交差軸";
+    case C_RAW_W:
+        snprintf(b, sizeof b, "素%dB", p.empty() ? 8 : (int)p[0]);
+        return b;
+    case C_GEOM_LIFT:
+        snprintf(b, sizeof b, "内挿%d段", p.empty() ? 8 : (int)p[0]);
+        return b;
+    case C_GEOM_ROT: {
+        static const char* MN[8] = {"", "平均4", "半", "中5", "四分", "三四", "無傾", "中5半"};
+        snprintf(b, sizeof b, "回転%s", MN[p.empty() ? 0 : (p[0] & 7)]);
+        return b;
+    }
+    case C_GEOM_SEG:
+        snprintf(b, sizeof b, "区間2^%d", p.empty() ? 12 : (int)p[0]);
+        return b;
+    case C_GEOM_DIR: {
+        static const char* DN[8] = {"", "平均4", "半", "中5", "四分", "三四", "無傾", "中5半"};
+        snprintf(b, sizeof b, "向き%s", DN[p.empty() ? 0 : (p[0] & 7)]);
+        return b;
+    }
+    case C_RANGE_SYM: {
+        if (p.empty()) return "字母";
+        std::string nm;
+        if (p.size() >= 3) { uint16_t l; memcpy(&l, p.data() + 1, 2);
+                             if (p.size() >= (size_t)3 + l)
+                                 nm.assign((const char*)p.data() + 3, l); }
+        // 文脈のずらし（param[0]）を名前に出す。0 と 4 の 2 本が同じ名前で並んでいた。
+        std::string r = "字母<" + nm.substr(0, 6) + ">";
+        if (p[0]) r += ">>" + std::to_string((int)p[0]);
+        return r;
+    }
     case C_GEOM_SCAN: {
-        static char b2[16];
         int v = p.empty() ? 1 : p[0];
         if (v == 5) return "走査変換";
-        snprintf(b2, sizeof b2, "走査v%d", v);
-        return b2;
+        snprintf(b, sizeof b, "走査v%d", v);
+        return b;
     }
     case C_GEOM_XYZ:
         if (p.empty() || p[0] == 0) return "幾何v0";
         if (p[0] == 4) {
-            static char b4[20];
+            char b4[32];
             int tm = p.size() > 2 ? p[2] : 0;
             snprintf(b4, sizeof b4, "幾何v4W%d%s", p.size() > 1 ? p[1] : 16,
                      tm == 0 ? "" : (tm == 1 ? "傾" : "傾半"));
             return b4;
         }
         if (p[0] == 3 && p.size() > 1 && p[1]) {
-            static char b3[20];
-            snprintf(b3, sizeof b3, "幾何v3%s", p[1] == 1 ? "平均4" : "半");
+            char b3[64];
+            const int pm = p[1];
+            char ax[12] = "";
+            if (pm & 8) snprintf(ax, sizeof ax, "補%d", p.size() > 2 ? p[2] : 0);
+            char cs[8] = "";
+            if ((pm >> 4) & 3) snprintf(cs, sizeof cs, "粗%d", (pm >> 4) & 3);
+            static const char* MN[8] = {"", "平均4", "半", "中5",
+                                        "四分", "三四", "無傾", "中5半"};
+            snprintf(b3, sizeof b3, "幾何v3%s%s%s%s%s",
+                     MN[(pm & 3) | ((pm >> 5) & 4)],
+                     (pm & 4) ? "十" : "", cs, (pm & 64) ? "共" : "", ax);
             return b3;
         }
         return p[0] == 1 ? "幾何v1" : (p[0] == 2 ? "幾何v2" : "幾何v3");
@@ -1620,6 +3040,14 @@ std::string cand_name(uint16_t c, const std::vector<uint8_t>& p) {
     }
     }
     return "?";
+}
+
+// 列の型から「素の幅」符号器の param を作る。入らない値があれば符号化側が外す。
+static std::vector<uint8_t> raw_w_param(FType t) {
+    const int w = ftype_size(t);
+    const bool sg = (t == FType::I8 || t == FType::I16 ||
+                     t == FType::I32 || t == FType::I64);
+    return {(uint8_t)(w < 1 ? 8 : (w > 8 ? 8 : w)), (uint8_t)(sg ? 1 : 0)};
 }
 
 // 候補は互いに独立に符号化できる。幾何の候補だけを並列に回す。
@@ -1677,11 +3105,18 @@ public:
                 }
                 f = std::move(q_.front().first); l = q_.front().second; q_.pop_front();
             }
-            f();
+            run(f);
             done(l);
         }
     }
 private:
+    // 仕事の中の例外は糸の外へ出すと std::terminate になる。候補の符号化は
+    // encode_many が、列の仕事は plan_streams が自分で受けて失敗として扱うので、
+    // ここは最後の備えである。
+    static void run(std::function<void()>& f) {
+        try { f(); }
+        catch (const std::exception& e) { fprintf(stderr, "符号化中の例外: %s\n", e.what()); }
+    }
     // **減らすのは錠の中でなければならない。** left は待ち手の述語が読む。
     // 錠の外で減らして通知すると、待ち手が述語を偽と判じてから実際に眠るまでの
     // 隙間に通知が落ちる。待ち手はその眠りから覚めない。
@@ -1702,7 +3137,7 @@ private:
                 if (q_.empty()) continue;
                 f = std::move(q_.front().first); l = q_.front().second; q_.pop_front();
             }
-            f();
+            run(f);
             done(l);
         }
     }
@@ -1748,7 +3183,8 @@ static void encode_many(const std::vector<Cand>& cs,
     if (g_pool && nt > 1) {
         std::atomic<size_t> best{(size_t)-1};
         std::atomic<size_t> left{0};
-        for (size_t i = 0; i < m; ++i)
+        for (size_t i = 0; i < m; ++i) {
+
             g_pool->add([&, i] {
                 const std::atomic<size_t>* save = enc_best;
                 enc_best = abort_long ? &best : nullptr;
@@ -1756,6 +3192,10 @@ static void encode_many(const std::vector<Cand>& cs,
                     ok[i] = codec_encode(cs[i].codec, cv, cs[i].param, blobs[i], errs[i], ctx) ? 1 : 0;
                 } catch (const EncAbort&) {
                     ok[i] = 0; errs[i] = "最短を超えたので打ち切り"; blobs[i].clear();
+                } catch (const std::exception& e) {
+                    // 糸の外へ出すと std::terminate。候補の失敗として扱う（どの候補も
+                    // 失敗すれば恒等符号器で書くので、器は壊れない）。
+                    ok[i] = 0; errs[i] = std::string("例外: ") + e.what(); blobs[i].clear();
                 }
                 enc_best = save;
                 if (ok[i]) {
@@ -1769,17 +3209,23 @@ static void encode_many(const std::vector<Cand>& cs,
                     }
                 }
             }, left);
+        }
         g_pool->help_until(left);
         return;
     }
     if (nt <= 1) {
         std::atomic<size_t> best{(size_t)-1};
+        // 呼び手の打ち切り基準を戻せるよう覚えておく（糸の中から入れ子で呼ばれうる。
+        // 以前は nullptr に戻していたので、呼び手の打ち切りが消えていた）。
+        const std::atomic<size_t>* save = enc_best;
         enc_best = abort_long ? &best : nullptr;
         for (size_t i = 0; i < m; ++i) {
             try {
                 ok[i] = codec_encode(cs[i].codec, cv, cs[i].param, blobs[i], errs[i], ctx) ? 1 : 0;
             } catch (const EncAbort&) {
                 ok[i] = 0; errs[i] = "最短を超えたので打ち切り"; blobs[i].clear();
+            } catch (const std::exception& e) {
+                ok[i] = 0; errs[i] = std::string("例外: ") + e.what(); blobs[i].clear();
             }
             if (ok[i]) {
                 if (sizes) (*sizes)[i] = blobs[i].size();
@@ -1787,7 +3233,7 @@ static void encode_many(const std::vector<Cand>& cs,
                     best.store(blobs[i].size(), std::memory_order_relaxed);
             }
         }
-        enc_best = nullptr;
+        enc_best = save;
         return;
     }
     std::atomic<size_t> next{0};
@@ -1802,6 +3248,10 @@ static void encode_many(const std::vector<Cand>& cs,
                     ok[i] = codec_encode(cs[i].codec, cv, cs[i].param, blobs[i], errs[i], ctx) ? 1 : 0;
                 } catch (const EncAbort&) {
                     ok[i] = 0; errs[i] = "最短を超えたので打ち切り"; blobs[i].clear();
+                } catch (const std::exception& e) {
+                    // 糸の外へ出すと std::terminate。候補の失敗として扱う（どの候補も
+                    // 失敗すれば恒等符号器で書くので、器は壊れない）。
+                    ok[i] = 0; errs[i] = std::string("例外: ") + e.what(); blobs[i].clear();
                 }
                 if (ok[i]) {
                     if (sizes) (*sizes)[i] = blobs[i].size();
@@ -1814,6 +3264,139 @@ static void encode_many(const std::vector<Cand>& cs,
             enc_best = nullptr;
         });
     for (auto& x : th) x.join();
+}
+
+// **勝者に旗を重ねた版を測る（後追い）。**best_stream の最後と、標本で選んで
+// 全点で測り直す経路（pack --sample-select）の両方から呼ぶ。以前は後者が
+// 素通し（生）しか試さず、符号・光線・束ね・曲面の旗が一度も付かなかった。
+// `--force-geom` で名前ごと固定された勝者には何も足さない（固定した名前と
+// 違う符号器で書かれてしまうため）。
+static void post_flags(Stream& best, size_t& bestsz, const std::vector<const Col*>& cv,
+                       const CodecCtx* ctx, std::string* trace, size_t npts) {
+    if (ctx && !ctx->force_geom.empty() && cand_name(best.codec, best.param) == ctx->force_geom)
+        return;
+    const uint16_t b0 = best.codec;
+    std::vector<Cand> pc;
+    // 素通しの旗は UIntCoder の下位ビットに効く。模型を通らない符号器
+    // （恒等・素の幅）では同じバイト列になるので測らない。
+    const bool no_model = ((b0 & ~C_FLAG_MASK) == C_RAW64 || (b0 & ~C_FLAG_MASK) == C_RAW_W);
+    if (!(b0 & C_RAW_BIT) && !no_model) pc.push_back({(uint16_t)(b0 | C_RAW_BIT), best.param});
+    // 符号つきの文脈は幾何の符号器にしか効かない。長さの最適値は
+    // ファイルで違うので、1 / 2 / 4 個の 3 通りを出して実測で選ばせる。
+    //
+    // **実装している経路に限る。**幾何v0/v1/v2 は enc_cols / enc_geom_med /
+    // enc_geom_aux へ行き、走査も var が 3/4 でなければ enc_resid へ行くので、
+    // 旗を立てても**同じバイト列を 3 回符号化するだけ**になる。
+    // red-rocks の中央 200 万点（勝者 幾何v1記）で実際にそうなっていた。
+    const uint16_t bid0 = (uint16_t)(b0 & ~C_FLAG_MASK);
+    const int gp0 = best.param.empty() ? 0 : best.param[0];
+    const bool sgn_ok =
+        (bid0 == C_GEOM_XYZ && (gp0 == 3 || gp0 == 4)) ||
+        bid0 == C_GEOM_ROT ||
+        (bid0 == C_GEOM_SCAN && (gp0 == 3 || gp0 == 4));
+    if (!(b0 & (C_LMS_BIT | C_SGN2_BIT)) && sgn_ok) {
+        pc.push_back({(uint16_t)(b0 | C_LMS_BIT), best.param});
+        pc.push_back({(uint16_t)(b0 | C_SGN2_BIT), best.param});
+        pc.push_back({(uint16_t)(b0 | C_LMS_BIT | C_SGN2_BIT), best.param});
+    }
+    // **光線モデル**（同一パルスの戻りは 1 本の直線に乗る）。実装したのは
+    // enc_geom_x（幾何v3・回転）と enc_geom_w（幾何v4）の 2 経路。
+    // bit_fields が幾何より前に出ているファイルでしか使えない。
+    // 符号つき文脈とは独立に効くので、符号の 4 通り（無・1・2・4）と組にして出す。
+    // **続きの点が 1 つも無いファイルでは出さない。**多重戻りの無い入力
+    // （plane・TLS・KITTI など）では続きの判定が一度も立たず、光線版は
+    // 無印と同じ予測になる。文脈の数だけ倍になるが使われないので、
+    // 同じ長さのバイト列を 4 回符号化するだけになる。
+    const bool ray_geo =
+        ((bid0 == C_GEOM_XYZ && (gp0 == 3 || gp0 == 4)) || bid0 == C_GEOM_ROT) &&
+        !(b0 & C_RAY_BIT);
+    // 続きの点を探すのは光線版を出しうる幾何の流れだけ（属性の流れごとに
+    // bit_fields を全点なめていた）。
+    bool has_cont = false;
+    if (const Col* bf = (ray_geo && ctx && ctx->fr) ? ctx->fr->get("bit_fields") : nullptr) {
+        const size_t nb = bf->size();
+        for (size_t i = 1; i < nb && !has_cont; ++i) {
+            const uint64_t a = (uint64_t)(*bf)[i], b = (uint64_t)(*bf)[i - 1];
+            const int r1 = (int)(a & 15), n1 = (int)((a >> 4) & 15);
+            const int r0 = (int)(b & 15), n0 = (int)((b >> 4) & 15);
+            if (r1 >= 2 && r1 == r0 + 1 && n1 == n0) has_cont = true;
+        }
+    }
+    const bool ray_ok = ray_geo && has_cont;
+    if (ray_ok) {
+        pc.push_back({(uint16_t)(b0 | C_RAY_BIT), best.param});
+        pc.push_back({(uint16_t)(b0 | C_RAY_BIT | C_LMS_BIT), best.param});
+        pc.push_back({(uint16_t)(b0 | C_RAY_BIT | C_SGN2_BIT), best.param});
+        pc.push_back({(uint16_t)(b0 | C_RAY_BIT | C_LMS_BIT | C_SGN2_BIT), best.param});
+    }
+    if ((b0 & C_FSYM_BIT) && !(b0 & C_BND_BIT)) {
+        pc.push_back({(uint16_t)(b0 | C_BND_BIT), best.param});
+        // **組合せ（素通し＋束ね）も要る。**外したら extra が
+        // 138.659 → 138.682 bpp に伸びた。要約行（中央値と四分位）は
+        // 動かないので、**ファイルごとの行を見ないと気づかない**。
+        // 候補が同時に生きるぶんメモリーは 592 → 634 byte/点 になるが、
+        // 指標の順はサイズが先である。
+        if (!(b0 & C_RAW_BIT))
+            pc.push_back({(uint16_t)(b0 | C_RAW_BIT | C_BND_BIT), best.param});
+    }
+    if (!pc.empty()) {
+        std::vector<std::vector<uint8_t>> pb;
+        std::vector<std::string> pe;
+        std::vector<char> pok;
+        encode_many(pc, cv, ctx, pb, pe, pok, false);
+        for (size_t i = 0; i < pc.size(); ++i) {
+            if (!pok[i]) continue;
+            if (trace) {
+                char m[160];
+                snprintf(m, sizeof m, "      %-10s %8.3f bpp（勝者に旗を重ねた版）\n",
+                         cand_name(pc[i].codec, pc[i].param).c_str(),
+                         npts ? pb[i].size() * 8.0 / npts : 0.0);
+                *trace += m;
+            }
+            if (pb[i].size() < bestsz) {
+                bestsz = pb[i].size();
+                best.codec = pc[i].codec;
+                best.data = std::move(pb[i]);
+            }
+        }
+    }
+    // **2 段目: 曲面による z の予測を、1 段目の勝者に重ねる。**
+    // 旗の組み合わせを全部出すと数が爆発するので、1 段目（符号・光線・生・束）で
+    // 決まった勝者にだけ、格子の大きさ 3 通りを足して測る。効くのは幾何v4 だけ。
+    const uint16_t b1 = best.codec;
+    const uint16_t bid1 = (uint16_t)(b1 & ~C_FLAG_MASK);
+    const int gp1 = best.param.empty() ? 0 : best.param[0];
+    if (bid1 == C_GEOM_XYZ && gp1 == 4 && !(b1 & (C_SURF_A | C_SURF_B))) {
+        std::vector<Cand> pc2 = {
+            {(uint16_t)(b1 | C_SURF_A), best.param},
+            {(uint16_t)(b1 | C_SURF_B), best.param},
+            {(uint16_t)(b1 | C_SURF_A | C_SURF_B), best.param}};
+        std::vector<std::vector<uint8_t>> pb2;
+        std::vector<std::string> pe2;
+        std::vector<char> pok2;
+        encode_many(pc2, cv, ctx, pb2, pe2, pok2, false);
+        for (size_t i = 0; i < pc2.size(); ++i) {
+            if (!pok2[i]) continue;
+            if (trace) {
+                char m[160];
+                snprintf(m, sizeof m, "      %-10s %8.3f bpp（勝者に曲面を重ねた版）\n",
+                         cand_name(pc2[i].codec, pc2[i].param).c_str(),
+                         npts ? pb2[i].size() * 8.0 / npts : 0.0);
+                *trace += m;
+            }
+            if (pb2[i].size() < bestsz) {
+                bestsz = pb2[i].size();
+                best.codec = pc2[i].codec;
+                best.data = std::move(pb2[i]);
+            }
+        }
+    }
+}
+
+void apply_post_flags(Stream& s, const std::vector<const Col*>& cv, const CodecCtx* ctx,
+                      std::string* trace) {
+    size_t sz = s.data.size();
+    post_flags(s, sz, cv, ctx, trace, cv.empty() ? 0 : cv[0]->size());
 }
 
 Stream best_stream(const Frame& f, const std::vector<std::string>& cols,
@@ -1860,7 +3443,13 @@ Stream best_stream(const Frame& f, const std::vector<std::string>& cols,
         }();
         for (const auto& c : candidates) {
             cand2.push_back(c);
-            if (c.codec == C_RAW64) continue;
+            // `--force-geom` で名前ごと固定した候補には記号版の対を作らない
+            // （記号版が勝つと固定した名前と違う符号器で書かれる）
+            if (ctx && !ctx->force_geom.empty() && cand_name(c.codec, c.param) == ctx->force_geom)
+                continue;
+            // 模型を通らない符号器（恒等・素の幅）には旗が効かない。対を作っても
+            // 同じバイト列をもう一度符号化するだけになる。
+            if (c.codec == C_RAW64 || c.codec == C_RAW_W) continue;
             if (PAIR_MODE == 2) {
                 bool sp = (c.codec == C_ATTR_SPATIAL || c.codec == C_ATTR_COLOR) ||
                           (c.codec == C_ATTR_XREF && !c.param.empty() &&
@@ -1870,6 +3459,9 @@ Stream best_stream(const Frame& f, const std::vector<std::string>& cols,
             cand2.push_back({(uint16_t)(c.codec | C_FSYM_BIT), c.param});
         }
     }
+    // **素通し版を候補として出すのは、幾何でも割に合わなかった。**候補が倍になると
+    // 標本での順位が崩れ、全点での最良が上位から押し出される（KITTI が
+    // 16.830 → 17.010 に伸びた）。上位数本への後追い（下の RAW_TRY）で止める。
     const std::vector<Cand>& cands = FSYM_CAND ? cand2 : candidates;
     // 候補が多いときは、まず先頭の標本で順位を付け、上位だけを全点で測る。
     // 全候補を全点で符号化すると、幾何だけで十数候補 × 全点になる。
@@ -1881,12 +3473,15 @@ Stream best_stream(const Frame& f, const std::vector<std::string>& cols,
         const char* e = getenv("PCC_PRESELECT");
         return e ? atol(e) : -1;
     }();
-    // 上位いくつを全点で測るか。1 でも 2 でも 17 件で出力は変わらないが、
-    // 予測子を足す前は 1 だと TLS p1 が伸びた（24.252 → 25.462 bpp）ので、
-    // 余裕を 1 本だけ残す。3 から 2 で符号化が 0.23 s → 0.20 s になる。
+    // 上位いくつを全点で測るか。**標本の 1 位が全点でも 1 位とは限らない。**
+    // 候補が増えるほど標本での順位が競り合い、2 本では全点の最良が押し出される。
+    // 実測（200 万点、幾何のみ）: 2 → 4 で KITTI 17.077 → 16.899（−1.0%）、
+    // TLS p1 25.554 → 25.457（−0.4%）。4 より増やしても 1 件も動かない。
+    // 代償は符号化の時間で +2〜8%（autzen-2023 の全列で 2.58 → 2.74 s）。
+    // **サイズが第一**という順位なので 4 を採る。
     static const size_t PRE_KEEP = [] {
         const char* e = getenv("PCC_PREKEEP");
-        return e ? (size_t)atol(e) : (size_t)2;
+        return e ? (size_t)atol(e) : (size_t)4;
     }();
     size_t PRE_SAMP;
     if (PRE_OPT >= 0) PRE_SAMP = (size_t)PRE_OPT;
@@ -1899,14 +3494,52 @@ Stream best_stream(const Frame& f, const std::vector<std::string>& cols,
         if (PRE_SAMP > 25000) PRE_SAMP = 25000;
     }
     std::vector<Cand> use = cands;
+    // 標本での順位を、選択のあとでも使えるように外に出す。
+    // **勝者と同じ族だけを後から詳しく測る**ために要る（全族を厚くすると
+    // 符号化が 70% 伸びてサイズは 1 ビットも動かなかった）。
+    std::vector<std::pair<size_t, Cand>> pre_rank;
+    auto cand_family = [](const Cand& c) -> int {
+        const uint16_t id = c.codec & ~C_FLAG_MASK;
+        if (id == C_GEOM_SCAN) return 1;
+        if (id == C_ATTR_SPATIAL || id == C_ATTR_COLOR) return 2;
+        if (id == C_ATTR_XREF && !c.param.empty() &&
+            c.param[0] != 0 && c.param[0] != 100) return 2;
+        if (id == C_GEOM_XYZ && !c.param.empty() && c.param[0] == 4) return 3;
+        if (id == C_GEOM_DIR) return 4;
+        if (id == C_GEOM_ROT) return 5;
+        return 0;
+    };
     // 属性でも「どちらの版か」だけを標本で決める案を試したが、標本パスの費用が
     // 節約を上回った（全列の比が 14.6〜15.5 倍から 17 倍に伸びた）。入れない。
     if (preselect && PRE_SAMP && cands.size() > PRE_KEEP + 1 &&
         ncols_n > PRE_SAMP * 2) {
+        // 標本は列の先頭から取る。**等間隔に置いた連続した塊に変える案は、
+        // 測って落とした。**先頭 200 万点で測ると red-rocks が 0.090 bpp 縮んだが、
+        // それは外側の標本（--max-points）が先頭だったことの副作用で、
+        // 全点（400 万点）では塊 1 と 2 が同値だった。一方、中央の 200 万点では
+        // autzen-2023 が 0.142 bpp 伸びる。3 以上では塊が掃引を切り、
+        // AHN4 _21 が 0.056 bpp 伸びる。PCC_PRE_CHUNKS で再現できる。
+        static const int PRE_CHUNKS = [] {
+            const char* e = getenv("PCC_PRE_CHUNKS");
+            return e ? atoi(e) : 1;
+        }();
+        std::vector<size_t> idx;
+        idx.reserve(PRE_SAMP);
+        {
+            const int nc = PRE_CHUNKS > 0 ? PRE_CHUNKS : 1;
+            const size_t per = PRE_SAMP / (size_t)nc;
+            for (int b = 0; b < nc && idx.size() < PRE_SAMP; ++b) {
+                // 塊の先頭を等間隔に置く。最後の塊が末尾からはみ出さないようにする。
+                size_t start = (ncols_n - per) * (size_t)b / (size_t)(nc > 1 ? nc - 1 : 1);
+                for (size_t i = 0; i < per && idx.size() < PRE_SAMP; ++i)
+                    idx.push_back(start + i);
+            }
+            while (idx.size() < PRE_SAMP) idx.push_back(idx.size());
+        }
         std::vector<Col> sub(cv.size());
         for (size_t k = 0; k < cv.size(); ++k) {
             std::vector<int64_t> t(PRE_SAMP);
-            for (size_t i = 0; i < PRE_SAMP; ++i) t[i] = (*cv[k])[i];
+            for (size_t i = 0; i < PRE_SAMP; ++i) t[i] = (*cv[k])[idx[i]];
             sub[k] = std::move(t);
         }
         std::vector<const Col*> scv;
@@ -1930,6 +3563,7 @@ Stream best_stream(const Frame& f, const std::vector<std::string>& cols,
                       [](const auto& a, const auto& b) { return a.first < b.first; });
             use.clear();
             for (size_t i = 0; i < PRE_KEEP; ++i) use.push_back(pre[i].second);
+            pre_rank = pre;          // 勝者の族を後から測り直すために控える
             // 標本で系統的に不利になる族は、順位に入らなくても 1 つ残す。
             //   走査モデル … 掃引の数が減ると当てはめが効かない
             //                 （AHN3 の走査変換は標本では 6 位以内にも入らないのに
@@ -1945,15 +3579,13 @@ Stream best_stream(const Frame& f, const std::vector<std::string>& cols,
             // 21.315 → 21.328 bpp に伸びた）。逆に記号版だけで数えると、族ごとの
             // 記号版が守れない（autzen-2023 で 走査v3記 が残らず +0.065%）。
             // **族 × 記号版の組で数える。**
-            auto family = [](const Cand& c) -> int {
-                const uint16_t id = c.codec & ~C_FSYM_BIT;
-                if (id == C_GEOM_SCAN) return 1;
-                if (id == C_ATTR_SPATIAL || id == C_ATTR_COLOR) return 2;
-                if (id == C_ATTR_XREF && !c.param.empty() &&
-                    c.param[0] != 0 && c.param[0] != 100) return 2;
-                if (id == C_GEOM_XYZ && !c.param.empty() && c.param[0] == 4) return 3;
-                return 0;
-            };
+            // 族の分け方は外の cand_family と同じ。
+            //   走査モデル … 掃引の数が減ると当てはめが効かない
+            //   空間予測   … 点を間引くと近傍が遠くなる
+            //   幾何v4     … 最近傍の当たり方が場所で変わる
+            //   向き追従   … y の予測が他の族と全く違う
+            //   回転       … 座標系ごと変える
+            auto family = cand_family;
             auto is_fsym = [](const Cand& c) { return (c.codec & C_FSYM_BIT) != 0; };
             // 族の保護は無条件だと重い。走査モデルは全点で 1 本 0.09 s かかり、
             // 既定の符号化時間の半分近くを占める。標本での符号長が最良から
@@ -1963,17 +3595,36 @@ Stream best_stream(const Frame& f, const std::vector<std::string>& cols,
                 return e ? atof(e) : 1e9;
             }();
             const double best_pre = (double)pre[0].first;
-            for (int fam = 1; fam <= 3; ++fam)
+            // **族の番号を足したら、この上限も上げること。**
+            // 向き追従（族 4）を足したとき上限が 3 のままで、族の保護が一度も
+            // 効いていなかった（TLS p1 が 25.457 → 26.765 に伸びた）。
+            static constexpr int FAM_MAX = 5;
+            // **族ごとに 3 本残す。**1 本だと、標本が族の中の順位を取り違えたときに
+            // 全点での最良が守られない。TLS p1 は 向き が最良 25.457 なのに、
+            // 1 本だと 向き無傾 25.606、2 本でも 向き半 25.554 になり、
+            // 3 本で 25.457 に届く。4 本以上は 1 件も動かない。
+            // 代償は符号化の時間で、TLS p1 が 1.10 → 1.61 秒。サイズが第一なので採る。
+            // 族ごとに 1 本。**族の中の順位の取り違えは、勝者の族だけを
+            // 後から詳しく測って直す**（下の「勝者の族を測り直す」）。
+            // 全族を 3 本にすると符号化が 70% 伸びて、サイズは 1 ビットも動かなかった。
+            static const size_t FAM_KEEP = [] {
+                const char* e = getenv("PCC_FAMKEEP");
+                return e ? (size_t)atoi(e) : (size_t)1;
+            }();
+            for (int fam = 1; fam <= FAM_MAX; ++fam)
                 for (int fs = 0; fs < 2; ++fs) {
-                    bool have = false;
+                    size_t have = 0;
                     for (const auto& c : use)
-                        if (family(c) == fam && is_fsym(c) == (fs != 0)) have = true;
-                    if (have) continue;
-                    for (const auto& pr : pre)
-                        if (family(pr.second) == fam && is_fsym(pr.second) == (fs != 0)) {
-                            if ((double)pr.first <= best_pre * FAM_THR) use.push_back(pr.second);
-                            break;
-                        }
+                        if (family(c) == fam && is_fsym(c) == (fs != 0)) ++have;
+                    for (const auto& pr : pre) {
+                        if (have >= FAM_KEEP) break;
+                        if (family(pr.second) != fam || is_fsym(pr.second) != (fs != 0)) continue;
+                        bool dup = false;
+                        for (const auto& c : use)
+                            if (c.codec == pr.second.codec && c.param == pr.second.param) dup = true;
+                        if (dup) continue;
+                        if ((double)pr.first <= best_pre * FAM_THR) { use.push_back(pr.second); ++have; }
+                    }
                 }
             // 族に属さない符号器（delta や range）の記号版も 1 本残す。
             bool have_fsym = false;
@@ -2063,8 +3714,75 @@ Stream best_stream(const Frame& f, const std::vector<std::string>& cols,
             best.data = std::move(blob); first = false;
         }
     }
+    // **勝者と同じ族の控えを、後から全点で測り直す。**
+    // 標本は族の**中の**順位も取り違える（TLS p1 は 向き が最良 25.457 なのに
+    // 標本は 向き無傾 を上位に置き 25.606 になった）。全族を 3 本ずつ厚くすると
+    // 符号化が 70% 伸びてサイズは 1 ビットも動かなかったので、
+    // **勝った族だけ**を詳しく測る。pre_rank は標本の走査（打ち切り無し）で
+    // 作るので決定的である。
+    if (!first && !pre_rank.empty()) {
+        const int fam = cand_family({best.codec, best.param});
+        size_t tried = 0;
+        for (const auto& pr : pre_rank) {
+            if (tried >= 2) break;
+            if (cand_family(pr.second) != fam) continue;
+            bool done = false;
+            for (const auto& c : use)
+                if (c.codec == pr.second.codec && c.param == pr.second.param) done = true;
+            if (done) continue;
+            std::vector<uint8_t> nb; std::string ne;
+            if (!codec_encode(pr.second.codec, cv, pr.second.param, nb, ne, ctx)) continue;
+            ++tried;
+            if (trace) {
+                char m[160];
+                snprintf(m, sizeof m, "      %-10s %8.3f bpp（勝った族の測り直し）\n",
+                         cand_name(pr.second.codec, pr.second.param).c_str(),
+                         f.n ? nb.size() * 8.0 / f.n : 0.0);
+                *trace += m;
+            }
+            if (nb.size() < bestsz) {
+                bestsz = nb.size();
+                best.codec = pr.second.codec; best.param = pr.second.param;
+                best.data = std::move(nb);
+            }
+        }
+    }
     std::sort(rank.begin(), rank.end(),
               [](const auto& a, const auto& b) { return a.first < b.first; });
+    // **勝者に旗を重ねた版を、まとめて測る。**
+    // **`rank` の上位を使ってはいけない。**打ち切り（enc_best）は候補が終わる順で
+    // 効くので、どの候補が rank に残るかはスレッド数で変わる。上位 3 本に広げたら
+    // 17 件中 3 件で md5 がスレッド数によって動いた。**勝者は打ち切りに依らず
+    // 決まる**（打ち切られた候補は必ず勝者より長い）ので、ここだけなら決定的である。
+    // 標本の上では測らない（全点で測り直すので二度手間になる）。
+    // 順に測ると勝者の符号化を 2 回ぶん待つので、**まとめて並列に回す**。
+    // 組合せ（素通し＋束ね）もここで一緒に測れる。
+    // **照合模型（C_MTC_BIT）はここに入れない。**22 列で測って採られたのは 0 列。
+    // 桁長の文脈が既に効いているので、当たり外れの 1 ビットぶんだけ損になる。
+    // 符号器は残してある。記録は losses.md §17。
+    // **どの候補も失敗したら、恒等符号器で書く。**
+    // 器の設計は「恒等候補 raw64 を必ず含むので長さは有限で閉じる」だが、
+    // `--force-geom` は候補を 1 本に絞るので、その 1 本が失敗すると
+    // 恒等候補ごと消える。すると `best` は codec=raw64・data 空のまま書かれ、
+    // 復号が「RAW64 の長さが合わない」で落ちる（tls_scan1.ply を
+    // `--force-geom 素4B` で強制すると再現した。f64bits の座標は 4 byte に
+    // 収まらないので候補が失敗する）。**器を壊すより恒等で書く。**
+    if (first) {
+        std::vector<uint8_t> ib; std::string ie;
+        if (!codec_encode(C_RAW64, cv, {}, ib, ie, ctx)) {
+            // 恒等符号器まで失敗することは無いが、黙って壊れた器を書かない。
+            if (trace) *trace += "      恒等符号器も失敗した: " + ie + "\n";
+        } else {
+            best.codec = C_RAW64;
+            best.param.clear();
+            best.data = std::move(ib);
+            bestsz = best.data.size();
+            first = false;
+            if (trace)
+                *trace += "      どの候補も通らなかったので恒等符号器で書いた\n";
+        }
+    }
+    if (!first && !on_sample) post_flags(best, bestsz, cv, ctx, trace, (size_t)f.n);
     for (size_t i = 1; i < rank.size() && best.alt.size() < KEEP_ALT; ++i)
         best.alt.push_back(rank[i].second);
     // 標本で順位を付けると、空間予測を使う候補が系統的に不利になる。
@@ -2072,8 +3790,11 @@ Stream best_stream(const Frame& f, const std::vector<std::string>& cols,
     // （AHN3 の nir は全点では参照＋空間予測が勝つのに、標本では 4 位にも入らない）。
     // 上位に入らなくても、空間予測を使う最良の候補は必ず 1 つ残す。
     auto uses_spatial = [](const Cand& c) {
-        if (c.codec == C_ATTR_SPATIAL || c.codec == C_ATTR_COLOR) return true;
-        return c.codec == C_ATTR_XREF && !c.param.empty() &&
+        // **旗を剥がしてから比べる。**記号版・素通し版は同じ符号器である
+        // （すぐ上の family は剥がしているのに、ここだけ漏れていた）。
+        const uint16_t id = (uint16_t)(c.codec & ~C_FLAG_MASK);
+        if (id == C_ATTR_SPATIAL || id == C_ATTR_COLOR) return true;
+        return id == C_ATTR_XREF && !c.param.empty() &&
                c.param[0] != 0 && c.param[0] != 100;
     };
     auto same = [](const Cand& a, const Cand& b) {
@@ -2082,8 +3803,12 @@ Stream best_stream(const Frame& f, const std::vector<std::string>& cols,
     bool have = uses_spatial({best.codec, best.param});
     for (const auto& a : best.alt) if (uses_spatial(a)) have = true;
     if (!have)
-        for (const auto& r : rank)
-            if (uses_spatial(r.second)) { best.alt.push_back(r.second); break; }
+        for (const auto& r : rank) {
+            if (!uses_spatial(r.second)) continue;
+            bool dup = same(r.second, {best.codec, best.param});
+            for (const auto& a : best.alt) if (same(r.second, a)) dup = true;
+            if (!dup) { best.alt.push_back(r.second); break; }
+        }
     return best;
 }
 
@@ -2117,7 +3842,13 @@ std::vector<Stream> plan_streams(const Frame& f, bool joint_geom, std::string* l
     } joiner{warm};
     std::vector<Cand> cand{{C_RAW64, {}}, {C_RANGE, {}}, {C_RANGE_DELTA, {}},
                            {C_RANGE_CTX, {}}, {C_RANGE_CTX2, {}}, {C_RANGE_MED, {}},
-                           {C_RANGE_CACHE, {}}};
+                           {C_RANGE_CACHE, {}}, {C_RANGE_PREV, {}}};
+    // PCC_SYM=0 で字母符号器の候補を全部切る。入れた前後を比べるために置く。
+    static const bool SYM_ON = [] {
+        const char* e = getenv("PCC_SYM");
+        return !e || atoi(e) != 0;
+    }();
+    if (SYM_ON) cand.push_back({C_RANGE_SYM, {}});
     // 幾何が揃っていれば、空間予測の候補（予測子 1 / 3 / 5 個）も加える
     // 予測子の数。既定は 1 / 3 / 5。上に余地が無いかは PCC_SPATIAL_PS で測れる。
     static const std::vector<uint8_t> SPS = [] {
@@ -2156,6 +3887,7 @@ std::vector<Stream> plan_streams(const Frame& f, bool joint_geom, std::string* l
         Stream out;
         std::string tr;
         double sec = 0;
+        std::string fail;              // 例外で終わった仕事の理由（空なら成功）
     };
     const double t_plan0 = now_sec();
     const size_t NT = pool_threads();
@@ -2168,7 +3900,7 @@ std::vector<Stream> plan_streams(const Frame& f, bool joint_geom, std::string* l
     std::vector<size_t> order;                 // 出す順。SIZE_MAX は色の判定の位置
     auto defer = [&](std::vector<std::string> cs, std::vector<Cand> cd,
                      bool presel = false) {
-        jobs.push_back(Job{std::move(cs), std::move(cd), presel, {}, {}, 0});
+        jobs.push_back(Job{std::move(cs), std::move(cd), presel, {}, {}, 0, {}});
         return jobs.size() - 1;
     };
 
@@ -2193,6 +3925,14 @@ std::vector<Stream> plan_streams(const Frame& f, bool joint_geom, std::string* l
                 pv.insert(pv.end(), e.begin(), e.end());
                 cs.push_back({C_ATTR_XREF, pv});
             }
+            // 既出の列を「文脈」に使う字母符号器。残差ではなく文脈なので、
+            // 相関が単調でなくても効く（強度は戻り総数で分布が変わる）。
+            if (SYM_ON) for (uint8_t sh : {0, 4}) {
+                std::vector<uint8_t> pv{sh};
+                pv.insert(pv.end(), (uint8_t*)&l, (uint8_t*)&l + 2);
+                pv.insert(pv.end(), e.begin(), e.end());
+                cs.push_back({C_RANGE_SYM, pv});
+            }
         }
         order.push_back(defer({nm}, cs));
         pre_done.push_back(nm);
@@ -2201,15 +3941,59 @@ std::vector<Stream> plan_streams(const Frame& f, bool joint_geom, std::string* l
 
     if (joint_geom) {
         std::vector<std::string> g{f.geom[0], f.geom[1], f.geom[2]};
-        std::vector<Cand> gc{{C_RAW64, {}}, {C_RANGE, {}}, {C_RANGE_DELTA, {}},
+        std::vector<Cand> gc{{C_RAW64, {}}, {C_RAW_W, raw_w_param(FType::I32)},
+                             {C_RANGE, {}}, {C_RANGE_DELTA, {}},
+                             {C_GEOM_CROSS, {}},
+                             // y をその点の dx から予測する版（autzen-2023 の
+                             // y 軸で −1.0 bit の見積り）。
+                             // **param の予測子は x と z にしか効かない**
+                             // （y は常に向き追従で、mp[1] は使われない）。
+                             {C_GEOM_DIR, {0}}, {C_GEOM_DIR, {2}}, {C_GEOM_DIR, {6}},
+                             // 主成分に合わせて座標を回してから符号化する。
+                             // AHN3 −5.0%、TLS p1 −2.5% の実測。
+                             {C_GEOM_ROT, {0}}, {C_GEOM_ROT, {2}}, {C_GEOM_ROT, {6}},
+                             // **区間ごとの切り替え（C_GEOM_SEG）は候補から外した。**
+                             // workshop 19.120 → 21.862 など、測った全部で負けた。
+                             // 見積りの相手が素朴な差分だったのが原因で、実際の
+                             // 勝者（幾何v4・走査・向き・回転）は区間で切り替える
+                             // Pred の 8 通りよりずっと強い。記録は losses.md §16。
+                             // **内挿（C_GEOM_LIFT）は候補から外してある。**
+                             // 10 ファイルで測って全部負けた（+6.4〜27.0%）。
+                             // 段数を 1 まで浅くしても変わらない。理由は
+                             // `results/literature_2026.md` §7 と losses.md §15。
+                             // 符号器は残してあるので、粗い層に強い予測子を使う形で
+                             // やり直すときは候補に戻すだけでよい。
                              {C_GEOM_XYZ, {0}}, {C_GEOM_XYZ, {1}}, {C_GEOM_XYZ, {3}},
                              // 予測子だけを差し替えた 幾何v3。副情報は増えない。
                              // 直近 4 つの差分の平均は TLS と AHN3 で、中央値の
                              // 半分は autzen-2023 で残差が短かった（符号化前の見積り）。
                              {C_GEOM_XYZ, {3, 1}}, {C_GEOM_XYZ, {3, 2}},
+                             // z の文脈を (k0+k1)/2 の平均でなく 2 次元の組にした版。
+                             // 平均は k0=2,k1=6 と k0=6,k1=2 を混ぜてしまう。
+                             {C_GEOM_XYZ, {3, 4}}, {C_GEOM_XYZ, {3, 6}},
+                             {C_GEOM_XYZ, {3, 5}},
+                             // 直近 5 つの差分の中央値。LASzip が座標に使う予測子で、
+                             // 3 つだと 1 点の外れ値で予測が振れる。
+                             {C_GEOM_XYZ, {3, 3}}, {C_GEOM_XYZ, {3, 7}},
+                             // 文脈を粗くする段。LASzip は dx に 2 文脈、dy/dz に
+                             // 20 文脈しか使わない。こちらは 3 軸 × 24 文脈あるので、
+                             // 点数が少ないファイルでは適応模型が薄まる。
+                             {C_GEOM_XYZ, {3, 16}}, {C_GEOM_XYZ, {3, 18}},
+                             {C_GEOM_XYZ, {3, 34}}, {C_GEOM_XYZ, {3, 22}},
+                             // 下位ビットの模型を桁数の文脈と分け、軸ごとに共有する版。
+                             {C_GEOM_XYZ, {3, 64}}, {C_GEOM_XYZ, {3, 66}},
+                             {C_GEOM_XYZ, {3, 70}}, {C_GEOM_XYZ, {3, 82}},
+                             // 傾きの効かせ方（1/4・3/4・足さない・中央値 5 の半分）。
+                             {C_GEOM_XYZ, {3, 128}}, {C_GEOM_XYZ, {3, 129}},
+                             {C_GEOM_XYZ, {3, 130}}, {C_GEOM_XYZ, {3, 131}},
+                             {C_GEOM_XYZ, {3, 134}}, {C_GEOM_XYZ, {3, 146}},
                              // 直近 W 点の最近傍から予測する。格納順が空間的に
                              // 連続していない入力で効く（幾何v4 の注記を参照）。
                              {C_GEOM_XYZ, {4, 4}}, {C_GEOM_XYZ, {4, 16}},
+                             // 窓を広げると、格納順が空間的に飛ぶ入力で効く
+                             // （vegetation は窓 16 で 27.6、4096 で 21.9 bit の見積り）。
+                             // 費用は点あたり O(W) なので、実測で割に合うときだけ残る。
+                             {C_GEOM_XYZ, {4, 64}}, {C_GEOM_XYZ, {4, 255}},
                              // 選んだ点に局所の傾きを足す。副情報は増えない。
                              {C_GEOM_XYZ, {4, 4, 1}}};
         if (!aux.empty()) {
@@ -2218,6 +4002,27 @@ std::vector<Stream> plan_streams(const Frame& f, bool joint_geom, std::string* l
             pv.insert(pv.end(), (uint8_t*)&l, (uint8_t*)&l + 2);
             pv.insert(pv.end(), aux.begin(), aux.end());
             gc.push_back({C_GEOM_XYZ, pv});
+        }
+        // 幾何v3（軸をまたぐ文脈）に、**予測子の状態を補助列ごとに分ける**版を足す。
+        // 幾何v2 は状態を分けるが軸をまたぐ文脈を持たず、幾何v3 は逆で、
+        // 両方を同時に持つ候補が無かった。LASzip は両方を持っている。
+        // 1 発から複数の点が返る入力では、格納順の隣が走査線上の隣ではないので、
+        // 戻り番号ごとに繋ぎ直さないと予測子が混ざる。
+        {
+            std::string ga;
+            for (const auto& e : pre_done) if (e == "bit_fields") ga = e;
+            if (ga.empty()) ga = aux;
+            if (!ga.empty()) {
+                uint16_t l = (uint16_t)ga.size();
+                // 覆い 7 は戻り番号だけ、63 は戻り番号と戻り総数まで。
+                for (uint8_t mask : {7, 63})
+                    for (uint8_t pm : {8, 10, 11, 12, 14, 15}) {
+                        std::vector<uint8_t> pv{3, pm, mask};
+                        pv.insert(pv.end(), (uint8_t*)&l, (uint8_t*)&l + 2);
+                        pv.insert(pv.end(), ga.begin(), ga.end());
+                        gc.push_back({C_GEOM_XYZ, pv});
+                    }
+            }
         }
         // 走査モデル: gps_time と point_source_id が前に出ていれば候補にできる
         bool has_g = false, has_p = false;
@@ -2250,9 +4055,31 @@ std::vector<Stream> plan_streams(const Frame& f, bool joint_geom, std::string* l
             }
         }
         if (ctx && !ctx->force_geom.empty()) {
+            // 名前の末尾の旗（後追いで付くもの）を剥がして元の候補を探し、旗を戻す。
+            // 以前は旗つきの名前（例: 幾何v4符2）を渡すと「候補にならない」になっていた。
+            std::string base = ctx->force_geom;
+            uint16_t fl = 0;
+            auto strip = [&](const char* sfx, uint16_t bits) {
+                const size_t L = strlen(sfx);
+                if (base.size() > L && base.compare(base.size() - L, L, sfx) == 0) {
+                    base.resize(base.size() - L); fl |= bits; return true;
+                }
+                return false;
+            };
+            // cand_name が付ける順（内→外: 記・符・光・面・束・照・生）の逆に剥がす
+            strip("生", C_RAW_BIT);
+            strip("照", C_MTC_BIT);
+            strip("束", C_BND_BIT);
+            if (!strip("面6", C_SURF_A)) if (!strip("面7", C_SURF_B)) strip("面8", C_SURF_A | C_SURF_B);
+            strip("光", C_RAY_BIT);
+            if (!strip("符1", C_LMS_BIT)) if (!strip("符2", C_SGN2_BIT)) strip("符4", C_LMS_BIT | C_SGN2_BIT);
+            strip("記", C_FSYM_BIT);          // 記号版は best_stream が対にして作る
             std::vector<Cand> only;
-            for (const auto& c : gc)
-                if (cand_name(c.codec, c.param) == ctx->force_geom) only.push_back(c);
+            for (const auto& c : gc) {
+                if (cand_name(c.codec, c.param) == ctx->force_geom) { only.push_back(c); continue; }
+                if (fl && cand_name(c.codec, c.param) == base)
+                    only.push_back({(uint16_t)(c.codec | fl), c.param});
+            }
             if (only.empty()) {
                 if (log) *log += "  （--force-geom " + ctx->force_geom +
                                  " はこの入力では候補にならない）\n";
@@ -2304,6 +4131,14 @@ std::vector<Stream> plan_streams(const Frame& f, bool joint_geom, std::string* l
                         pv.insert(pv.end(), (uint8_t*)&l, (uint8_t*)&l + 2);
                         pv.insert(pv.end(), ref.begin(), ref.end());
                         cs.push_back({C_ATTR_XREF, pv});
+                        if (P == 0 && SYM_ON) {   // 文脈として使う版も出す
+                            for (uint8_t sh : {0, 4}) {
+                                std::vector<uint8_t> sv{sh};
+                                sv.insert(sv.end(), (uint8_t*)&l, (uint8_t*)&l + 2);
+                                sv.insert(sv.end(), ref.begin(), ref.end());
+                                cs.push_back({C_RANGE_SYM, sv});
+                            }
+                        }
                     }
                 }
                 s_chain.push_back(defer({ord[i]}, cs));
@@ -2382,13 +4217,22 @@ std::vector<Stream> plan_streams(const Frame& f, bool joint_geom, std::string* l
     }
 
     std::vector<std::string> emitted = pre_done;              // 既に出した列（参照に使える）
+    // `name#0` `name#1` …（ExtraBytes の配列型・波形パケットを 1 byte ずつ持つ列）は
+    // 他の属性と同じ候補を全部試す。**絞る案は 2 つとも測って落とした。**
+    //   まとめて 1 本の流れにする  … fullwave 125.8 → 137.5 bpp
+    //   空間予測の候補を外す        … fullwave 125.8 → 128.9 bpp
+    // どちらも符号化は速くなるが、サイズが第一なので採らない。
+
     for (const auto& c : f.schema) {
         if (skip_col(c)) continue;
         std::vector<Cand> cs = cand_attr;
+        // **その列の自然な幅でそのまま格納する候補。**恒等候補 C_RAW64 は 64 bit
+        // なので、1 byte の列の天井になっていなかった（fullwave の波形バイトが
+        // 素の 8.000 より膨らんで 8.177 bpp になっていた）。
+        cs.push_back({C_RAW_W, raw_w_param(c.ftype)});
         // 既出の列との残差も候補に入れる。標本で相手を 2 つに絞ってから全点で測る。
         // 参照の選定は全点の統計で行う（標本で選ぶと候補の集合が変わる）
         const auto* v = f.get(c.name);
-        const auto* vr = fs_ref.get(c.name);
         if (v && !emitted.empty()) {
             std::vector<std::pair<double, std::string>> sc;
             for (const auto& e : emitted) {
@@ -2443,6 +4287,14 @@ std::vector<Stream> plan_streams(const Frame& f, bool joint_geom, std::string* l
                     pv.insert(pv.end(), ref.begin(), ref.end());
                     cs.push_back({C_ATTR_XREF, pv});
                 }
+                // 既出の列を「文脈」に使う字母符号器。残差ではなく文脈なので、
+                // 相関が単調でなくても効く（強度は戻り総数で分布が変わる）。
+                if (SYM_ON) for (uint8_t sh : {0, 4}) {
+                    std::vector<uint8_t> sv{sh};
+                    sv.insert(sv.end(), (uint8_t*)&l, (uint8_t*)&l + 2);
+                    sv.insert(sv.end(), ref.begin(), ref.end());
+                    cs.push_back({C_RANGE_SYM, sv});
+                }
             }
         }
         {
@@ -2464,8 +4316,10 @@ std::vector<Stream> plan_streams(const Frame& f, bool joint_geom, std::string* l
         if (!pool || jobs.size() <= 1) {
             for (auto& j : jobs) {
                 double t0 = now_sec();
-                j.out = best_stream(f, j.cols, j.cands, ctx, trace_all ? &j.tr : nullptr,
-                                    j.presel);
+                try {
+                    j.out = best_stream(f, j.cols, j.cands, ctx, trace_all ? &j.tr : nullptr,
+                                        j.presel);
+                } catch (const std::exception& e) { j.fail = e.what(); }
                 j.sec = now_sec() - t0;
             }
         } else {
@@ -2473,12 +4327,22 @@ std::vector<Stream> plan_streams(const Frame& f, bool joint_geom, std::string* l
             for (auto& j : jobs)
                 pool->add([&f, &j, ctx, trace_all] {
                     double t0 = now_sec();
-                    j.out = best_stream(f, j.cols, j.cands, ctx,
-                                        trace_all ? &j.tr : nullptr, j.presel);
+                    try {
+                        j.out = best_stream(f, j.cols, j.cands, ctx,
+                                            trace_all ? &j.tr : nullptr, j.presel);
+                    } catch (const std::exception& e) { j.fail = e.what(); }
                     j.sec = now_sec() - t0;
                 }, left);
             pool->help_until(left);
         }
+        // **失敗した列があれば器を作らない。**列の無い流れを書くと、--no-verify では
+        // 壊れた器がそのまま残る（例: 大きな入力でメモリーが尽きたとき）。
+        for (const auto& j : jobs)
+            if (!j.fail.empty()) {
+                std::string nm;
+                for (size_t i = 0; i < j.cols.size(); ++i) nm += (i ? "+" : "") + j.cols[i];
+                throw std::runtime_error("列 " + nm + " の符号化に失敗した: " + j.fail);
+            }
         if (eprof) fprintf(stderr, "  [仕事を流す] %.3fs\n", now_sec() - t_run);
     }
 
@@ -2532,7 +4396,7 @@ std::vector<Stream> plan_streams(const Frame& f, bool joint_geom, std::string* l
 enum : uint16_t {
     T_SRC_KIND = 1, T_SRC_BYTES = 2, T_SCALE = 3, T_OFFSET = 4, T_SCHEMA = 5,
     T_PLAN = 6, T_FIDELITY = 7, T_ENVELOPE = 8, T_GEOM_COLS = 9, T_GEOM_REPR = 10,
-    T_EMBED = 11
+    T_EMBED = 11, T_COLDIV = 12, T_POLAR = 13
 };
 
 static void put_tag(std::vector<uint8_t>& h, uint16_t tag, const std::vector<uint8_t>& body) {
@@ -2540,6 +4404,123 @@ static void put_tag(std::vector<uint8_t>& h, uint16_t tag, const std::vector<uin
     put<uint32_t>(h, (uint32_t)body.size());
     h.insert(h.end(), body.begin(), body.end());
 }
+
+// 計画を二値にする。JSON のままだと 1 万点のファイルで 333 byte = 0.25 bpp かかる。
+// 効くのは**列名を schema の添字に置き換えること**で、"classification" の 14 byte が
+// 1 byte になる。直前のバイトを文脈にした符号化も試したが、この長さでは
+// 256 の文脈を学習しきれず縮まなかった（333 → 330 byte）。
+namespace {
+const char* const OP_KINDS[] = {"drop_constant", "drop_duplicate",
+                                "drop_affine", "residual_code"};
+constexpr int N_OP_KINDS = 4;
+
+void put_varint(std::vector<uint8_t>& o, uint64_t v) {
+    while (v >= 0x80) { o.push_back((uint8_t)(v | 0x80)); v >>= 7; }
+    o.push_back((uint8_t)v);
+}
+bool get_varint(const std::vector<uint8_t>& b, size_t& p, uint64_t& v) {
+    v = 0; int sh = 0;
+    while (p < b.size()) {
+        uint8_t c = b[p++];
+        v |= (uint64_t)(c & 0x7F) << sh;
+        if (!(c & 0x80)) return true;
+        sh += 7;
+        if (sh > 63) return false;
+    }
+    return false;
+}
+
+// 列名 → schema の添字。無ければ 0xFFFF を置いて名前を並べる。
+int name_index(const Frame& f, const std::string& nm) {
+    for (size_t i = 0; i < f.schema.size(); ++i)
+        if (f.schema[i].name == nm) return (int)i;
+    return -1;
+}
+
+std::vector<uint8_t> plan_to_binary(const Frame& f) {
+    const Plan pl = Plan::from_json(f.plan);
+    std::vector<uint8_t> o;
+    put<uint8_t>(o, pl.grid ? 1 : 0);
+    put_varint(o, (uint64_t)(pl.grid_bits < 0 ? 0 : pl.grid_bits));
+    put<double>(o, pl.max_err_m);
+    put_varint(o, pl.ops.size());
+    for (const auto& op : pl.ops) {
+        int k = 0;
+        for (int i = 0; i < N_OP_KINDS; ++i) if (op.kind == OP_KINDS[i]) k = i;
+        put<uint8_t>(o, (uint8_t)k);
+        for (const std::string* nm : {&op.target, &op.source}) {
+            int idx = nm->empty() ? -2 : name_index(f, *nm);
+            if (idx >= 0) { put<uint8_t>(o, 0); put_varint(o, (uint64_t)idx); }
+            else if (idx == -2) { put<uint8_t>(o, 1); }        // 空
+            else { put<uint8_t>(o, 2); put_str(o, *nm); }       // schema に無い
+        }
+        put_varint(o, zigzag(op.value));
+        put_varint(o, zigzag(op.num));
+        put_varint(o, zigzag(op.den));
+        put_varint(o, zigzag(op.b));
+        put<uint8_t>(o, op.exact ? 1 : 0);
+    }
+    return o;
+}
+
+bool plan_from_binary(const std::vector<uint8_t>& b, const Frame& f, std::string& out) {
+    size_t p = 0;
+    auto g8 = [&](uint8_t& v) { if (p >= b.size()) return false; v = b[p++]; return true; };
+    Plan pl;
+    uint8_t gr = 0;
+    if (!g8(gr)) return false;
+    pl.grid = gr != 0;
+    uint64_t v = 0;
+    if (!get_varint(b, p, v)) return false;
+    pl.grid_bits = (int)v;
+    if (p + 8 > b.size()) return false;
+    memcpy(&pl.max_err_m, b.data() + p, 8); p += 8;
+    if (!get_varint(b, p, v)) return false;
+    const size_t nop = (size_t)v;
+    for (size_t i = 0; i < nop; ++i) {
+        Op op;
+        uint8_t k = 0;
+        if (!g8(k) || k >= N_OP_KINDS) return false;
+        op.kind = OP_KINDS[k];
+        for (std::string* nm : {&op.target, &op.source}) {
+            uint8_t how = 0;
+            if (!g8(how)) return false;
+            if (how == 0) {
+                if (!get_varint(b, p, v) || v >= f.schema.size()) return false;
+                *nm = f.schema[(size_t)v].name;
+            } else if (how == 1) {
+                nm->clear();
+            } else {
+                uint16_t l = 0;
+                if (p + 2 > b.size()) return false;
+                memcpy(&l, b.data() + p, 2); p += 2;
+                if (p + l > b.size()) return false;
+                nm->assign((const char*)b.data() + p, l); p += l;
+            }
+        }
+        uint64_t z = 0;
+        if (!get_varint(b, p, z)) return false;
+        op.value = unzigzag(z);
+        if (!get_varint(b, p, z)) return false;
+        op.num = unzigzag(z);
+        if (!get_varint(b, p, z)) return false;
+        op.den = unzigzag(z);
+        if (!get_varint(b, p, z)) return false;
+        op.b = unzigzag(z);
+        uint8_t ex = 0;
+        if (!g8(ex)) return false;
+        op.exact = ex != 0;
+        pl.ops.push_back(std::move(op));
+    }
+    out = pl.to_json();
+    return true;
+}
+}  // namespace
+
+// 器の版。**読み方が変わったら上げる。**古い版は黙って読み違えるより、はっきり断る。
+//   1 … 2026-09 まで
+//   2 … LAS の封筒の末尾を「札つきの拡張」に改めた（ヘッダの欄・ユーザーデータを持つ）
+static const uint16_t PCC2_VERSION = 2;
 
 bool write_pcc2(const std::string& path, const Frame& f, const std::vector<Stream>& st,
                 uint64_t& bytes_out, std::string& err) {
@@ -2556,7 +4537,19 @@ bool write_pcc2(const std::string& path, const Frame& f, const std::vector<Strea
         put<uint8_t>(b, (uint8_t)c.storage);
     }
     put_tag(h, T_SCHEMA, b);
-    b.clear(); { std::vector<uint8_t> pb(f.plan.begin(), f.plan.end()); put_blob(b, pb); }
+    // 計画は二値にして入れる。素の JSON より短くならなければ JSON のまま入れる
+    // （先頭 1 byte がどちらかを言う）。
+    b.clear();
+    {
+        std::vector<uint8_t> pb(f.plan.begin(), f.plan.end());
+        std::vector<uint8_t> bin;
+        if (!f.plan.empty()) bin = plan_to_binary(f);
+        if (!bin.empty() && bin.size() + 4 < pb.size()) {
+            put<uint8_t>(b, 1); put_blob(b, bin);
+        } else {
+            put<uint8_t>(b, 0); put_blob(b, pb);
+        }
+    }
     put_tag(h, T_PLAN, b);
     b.clear(); put<uint8_t>(b, f.fid.exact ? 0 : 1);
                put<double>(b, f.fid.declared_eps);
@@ -2564,32 +4557,71 @@ bool write_pcc2(const std::string& path, const Frame& f, const std::vector<Strea
     b.clear(); put_blob(b, f.envelope);                put_tag(h, T_ENVELOPE, b);
     b.clear(); for (int i = 0; i < 3; ++i) put_str(b, f.geom[i]);  put_tag(h, T_GEOM_COLS, b);
     b.clear(); put_str(b, f.geom_repr);                put_tag(h, T_GEOM_REPR, b);
+    // 極座標格子の目盛り。非可逆の経路でしか付かない。
+    if (f.geom_repr == "polar") {
+        b.clear();
+        for (int i = 0; i < 3; ++i) put<double>(b, f.polar_origin[i]);
+        put<double>(b, f.polar_r_step);
+        put<double>(b, f.polar_ang_step);
+        put_str(b, f.polar_base);
+        put_tag(h, T_POLAR, b);
+    }
+    // 列を粗い格子で割ってあれば、その (最小値, 刻み) を書く。
+    if (!f.coldiv.empty()) {
+        b.clear();
+        put<uint32_t>(b, (uint32_t)f.coldiv.size());
+        for (const auto& kv : f.coldiv) {
+            put_str(b, kv.first);
+            put<int64_t>(b, kv.second.first);
+            put<int64_t>(b, kv.second.second);
+        }
+        // scale/offset は幾何を割ったときだけ要る。属性しか割っていない
+        // ファイルで 48 byte 払うと、小さな入力では測れる損になる。
+        bool geo = false;
+        for (int i = 0; i < 3; ++i) if (f.coldiv.count(f.geom[i])) geo = true;
+        put<uint8_t>(b, geo ? 1 : 0);
+        if (geo) {
+            for (int i = 0; i < 3; ++i) put<double>(b, f.coldiv_scale[i]);
+            for (int i = 0; i < 3; ++i) put<double>(b, f.coldiv_offset[i]);
+        }
+        put_tag(h, T_COLDIV, b);
+    }
     if (!f.embed.empty()) {
         b.clear(); put_str(b, f.embed_kind); put_blob(b, f.embed);  put_tag(h, T_EMBED, b);
     }
 
     std::vector<uint8_t> o;
     o.insert(o.end(), {'P', 'C', 'C', '2'});
-    put<uint16_t>(o, 1);
+    put<uint16_t>(o, PCC2_VERSION);
     put<uint16_t>(o, f.fid.exact ? 0 : 1);
     put<uint64_t>(o, f.n);
     put<uint32_t>(o, (uint32_t)h.size());
     o.insert(o.end(), h.begin(), h.end());
     put<uint32_t>(o, (uint32_t)st.size());
     for (const auto& s : st) {
-        put<uint16_t>(o, (uint16_t)s.cols.size());
-        for (const auto& c : s.cols) put_str(o, c);
+        put_varint(o, (uint64_t)s.cols.size());
+        // 列名は schema にもう入っている。添字で指す（"point_source_id" の
+        // 17 byte が 1 byte になる）。schema に無い名前だけ文字列で書く。
+        for (const auto& c : s.cols) {
+            int idx = name_index(f, c);
+            if (idx >= 0) { put<uint8_t>(o, 0); put_varint(o, (uint64_t)idx); }
+            else { put<uint8_t>(o, 1); put_str(o, c); }
+        }
         put<uint16_t>(o, s.codec);
-        put_blob(o, s.param);
-        put<uint64_t>(o, (uint64_t)s.data.size());
+        // 可変長。1 byte に切ると 255 byte を超える param が壊れる
+        // （走査モデルの param は列名を 3 つ持つ）。
+        put_varint(o, (uint64_t)s.param.size());
+        o.insert(o.end(), s.param.begin(), s.param.end());
+        put_varint(o, (uint64_t)s.data.size());     // 8 byte 固定をやめる
     }
     for (const auto& s : st) o.insert(o.end(), s.data.begin(), s.data.end());
     put<uint64_t>(o, crc64(o.data(), o.size()));
 
     FILE* fp = fopen(path.c_str(), "wb");
     if (!fp) { err = "書き込めない: " + path; return false; }
-    fwrite(o.data(), 1, o.size(), fp);
-    fclose(fp);
+    // 書けたかどうかを確かめる（ディスクが一杯だと短い器が黙って残っていた）。
+    const bool wrote = fwrite(o.data(), 1, o.size(), fp) == o.size();
+    if (fclose(fp) != 0 || !wrote) { err = "書き込みが途中で失敗した: " + path; return false; }
     bytes_out = o.size();
     return true;
 }
@@ -2598,22 +4630,30 @@ bool read_pcc2(const std::string& path, Frame& f, std::string& err) {
     FILE* fp = fopen(path.c_str(), "rb");
     if (!fp) { err = "開けない: " + path; return false; }
     fseek(fp, 0, SEEK_END); long sz = ftell(fp); fseek(fp, 0, SEEK_SET);
+    if (sz < 28) { fclose(fp); err = "PCC2 ではない（短すぎる）"; return false; }
     std::vector<uint8_t> buf(sz);
     if (fread(buf.data(), 1, sz, fp) != (size_t)sz) { fclose(fp); err = "短い"; return false; }
     fclose(fp);
-    if (sz < 28 || memcmp(buf.data(), "PCC2", 4)) { err = "PCC2 ではない"; return false; }
+    if (memcmp(buf.data(), "PCC2", 4)) { err = "PCC2 ではない"; return false; }
     uint64_t want; memcpy(&want, buf.data() + sz - 8, 8);
     if (crc64(buf.data(), sz - 8) != want) { err = "crc64 が合わない"; return false; }
 
     Rd r{buf.data(), (size_t)sz - 8, 4};
     uint16_t ver = r.get<uint16_t>(); r.get<uint16_t>();
-    if (ver != 1) { err = "版が違う"; return false; }
+    if (ver != PCC2_VERSION) {
+        err = "器の版 " + std::to_string(ver) + " は読めない（この復号器は版 " +
+              std::to_string(PCC2_VERSION) + " だけを読む。作り直すこと）";
+        return false;
+    }
     f.n = r.get<uint64_t>();
     uint32_t hl = r.get<uint32_t>();
+    // 長さは**残りと比べて**確かめる（r.p + 長さ は壊れた値で桁あふれしうる）。
+    if (!r.ok || hl > r.n - r.p) { err = "ヘッダの長さが器を超える"; return false; }
     size_t hend = r.p + hl;
     while (r.ok && r.p < hend) {
         uint16_t tag = r.get<uint16_t>();
         uint32_t len = r.get<uint32_t>();
+        if (!r.ok || len > hend - r.p) { r.ok = false; break; }
         size_t next = r.p + len;
         switch (tag) {
         case T_SRC_KIND:  f.source_kind = r.str(); break;
@@ -2632,7 +4672,13 @@ bool read_pcc2(const std::string& path, Frame& f, std::string& err) {
             }
             break;
         }
-        case T_PLAN: { auto pb = r.blob(); f.plan.assign(pb.begin(), pb.end()); break; }
+        case T_PLAN: {
+            uint8_t how = r.get<uint8_t>();
+            auto pb = r.blob();
+            if (how == 0) f.plan.assign(pb.begin(), pb.end());
+            else if (!plan_from_binary(pb, f, f.plan)) { err = "計画が壊れている"; return false; }
+            break;
+        }
         case T_FIDELITY:
             f.fid.exact = r.get<uint8_t>() == 0;
             f.fid.declared_eps = r.get<double>();
@@ -2641,22 +4687,62 @@ bool read_pcc2(const std::string& path, Frame& f, std::string& err) {
         case T_ENVELOPE:  f.envelope = r.blob(); break;
         case T_GEOM_COLS: for (int i = 0; i < 3; ++i) f.geom[i] = r.str(); break;
         case T_GEOM_REPR: f.geom_repr = r.str(); break;
+        case T_POLAR:
+            for (int i = 0; i < 3; ++i) f.polar_origin[i] = r.get<double>();
+            f.polar_r_step = r.get<double>();
+            f.polar_ang_step = r.get<double>();
+            f.polar_base = r.str();
+            break;
         case T_EMBED:     f.embed_kind = r.str(); f.embed = r.blob(); break;
+        case T_COLDIV: {
+            uint32_t k = r.get<uint32_t>();
+            for (uint32_t i = 0; i < k && r.ok; ++i) {
+                std::string nm = r.str();
+                int64_t base = r.get<int64_t>(), step = r.get<int64_t>();
+                f.coldiv[nm] = {base, step};
+            }
+            if (r.get<uint8_t>()) {
+                for (int i = 0; i < 3; ++i) f.coldiv_scale[i] = r.get<double>();
+                for (int i = 0; i < 3; ++i) f.coldiv_offset[i] = r.get<double>();
+            } else {
+                for (int i = 0; i < 3; ++i) { f.coldiv_scale[i] = f.scale[i];
+                                              f.coldiv_offset[i] = f.offset[i]; }
+            }
+            break;
+        }
         default: break;   // 知らないタグは読み飛ばす（前方互換）
         }
+        // 札の中身を読み過ぎたなら壊れている（次の札の頭を読んでいた）
+        if (r.p > next) r.ok = false;
         r.p = next;
     }
     if (!r.ok) { err = "ヘッダが壊れている"; return false; }
 
     uint32_t ns = r.get<uint32_t>();
+    // 流れ 1 本の記述は少なくとも 4 byte（列数・符号器・パラメタ長・データ長）。
+    // 壊れた本数で巨大な配列を確保しない。
+    if (!r.ok || ns > (r.n - r.p) / 4) { err = "ストリームの本数が器に収まらない"; return false; }
     std::vector<Stream> st(ns);
     std::vector<uint64_t> dlen(ns);
     for (uint32_t i = 0; i < ns && r.ok; ++i) {
-        uint16_t nc = r.get<uint16_t>();
-        for (uint16_t k = 0; k < nc; ++k) st[i].cols.push_back(r.str());
+        uint64_t nc = r.varint();
+        for (uint64_t k = 0; k < nc && r.ok; ++k) {
+            uint8_t how = r.get<uint8_t>();
+            if (how == 0) {
+                uint64_t idx = r.varint();
+                if (idx >= f.schema.size()) { err = "列の添字が範囲外"; return false; }
+                st[i].cols.push_back(f.schema[(size_t)idx].name);
+            } else {
+                st[i].cols.push_back(r.str());
+            }
+        }
         st[i].codec = r.get<uint16_t>();
-        st[i].param = r.blob();
-        dlen[i] = r.get<uint64_t>();
+        {
+            uint64_t pl = r.varint();
+            if (!r.ok || pl > r.n - r.p) { r.ok = false; }
+            else { st[i].param.assign(r.b + r.p, r.b + r.p + pl); r.p += (size_t)pl; }
+        }
+        dlen[i] = r.varint();
     }
     if (!r.ok) { err = "ストリーム記述が壊れている"; return false; }
     // 幾何は属性より先に並んでいる。幾何が揃った時点で座標を組み、
@@ -2669,7 +4755,7 @@ bool read_pcc2(const std::string& path, Frame& f, std::string& err) {
     // 順に復号しなくても位置が決まる。
     std::vector<size_t> off(ns);
     for (uint32_t i = 0; i < ns; ++i) {
-        if (r.p + dlen[i] > r.n) { err = "ストリームが短い"; return false; }
+        if (dlen[i] > r.n - r.p) { err = "ストリームが短い"; return false; }
         off[i] = r.p; r.p += dlen[i];
     }
 
@@ -2687,7 +4773,7 @@ bool read_pcc2(const std::string& path, Frame& f, std::string& err) {
     std::vector<std::vector<std::string>> need(ns);
     std::vector<char> need_geom(ns, 0);
     for (uint32_t i = 0; i < ns; ++i) {
-        const uint16_t id = (uint16_t)(st[i].codec & ~C_FSYM_BIT);
+        const uint16_t id = (uint16_t)(st[i].codec & ~C_FLAG_MASK);
         const auto& p = st[i].param;
         if (id == C_ATTR_XREF) {
             names_in(p, 1, 1, need[i]);
@@ -2698,14 +4784,22 @@ bool read_pcc2(const std::string& path, Frame& f, std::string& err) {
             names_in(p, 1, 3, need[i]);
         } else if (id == C_GEOM_XYZ && !p.empty() && p[0] == 2) {
             names_in(p, 1, 1, need[i]);
+        } else if (id == C_GEOM_XYZ && p.size() > 1 && p[0] == 3 && (p[1] & 8)) {
+            names_in(p, 3, 1, need[i]);
+        } else if (id == C_RANGE_SYM && !p.empty()) {
+            // 参照列を文脈に使う版。param = [shift u8][名前長 u16][名前]
+            names_in(p, 1, 1, need[i]);
         }
+        // **光線モデルは bit_fields を名前で引く。**param に名前が無いので、
+        // ここで依存を足さないと、同じ波で並列に復号されて bit_fields が
+        // まだ無い（または書きかけの）まま幾何を戻してしまう。
+        if (st[i].codec & C_RAY_BIT) need[i].push_back("bit_fields");
     }
 
     // **入れ物を先に作ってはいけない。** f.get は「その列がもう有るか」を
     // 空でないことで判断する符号器があるので、空の入れ物を置くと
     // 未復号の列が有ることになってしまう（plane などで落ちた）。
-    // 代わりに、書き込むときだけ排他を取る。
-    std::mutex colmu;
+    // 列は波が終わってから f.col に移す（下の work を参照）。
 
     static const size_t NT = [] {
         if (const char* e = getenv("PCC_THREADS")) { long v = atol(e); if (v > 0) return (size_t)v; }
@@ -2721,7 +4815,7 @@ bool read_pcc2(const std::string& path, Frame& f, std::string& err) {
     {
         std::vector<int>& W = const_cast<std::vector<int>&>(ctx.want_Ps);
         for (uint32_t i = 0; i < ns; ++i) {
-            const uint16_t id = st[i].codec & ~C_FSYM_BIT;
+            const uint16_t id = st[i].codec & ~C_FLAG_MASK;
             if (st[i].param.empty()) continue;
             if (id != C_ATTR_SPATIAL && id != C_ATTR_COLOR && id != C_ATTR_XREF) continue;
             int P = st[i].param[0];
@@ -2750,18 +4844,31 @@ bool read_pcc2(const std::string& path, Frame& f, std::string& err) {
         std::vector<std::string> werr(wave.size());
         std::vector<char> wok(wave.size(), 0);
         std::vector<double> wsec(wave.size(), 0.0);
+        // **波の中では f.col に書かない。**同じ波の別の糸は、錠を取らずに
+        // ctx->fr->get()（std::map の探索）で参照列を引く。挿入と探索が同時に
+        // 走ると木の付け替えの途中を読みうる（未定義動作）。復号した列は波ごとの
+        // 局所の入れ物に置き、波が終わってから（糸が全部合流してから）移す。
+        // 同じ波の流れは互いに依らないので、置き場所を変えても結果は同じ。
+        // 置き場所は幅を詰めた Col にする（int64 のまま波の終わりまで抱えると、
+        // 200 万点の列 1 本で 16 MB ずつ積み上がる）。詰めるのは各糸の中で済ませる。
+        std::vector<std::vector<Col>> wout(wave.size());
         size_t nt = NT < wave.size() ? NT : wave.size();
         auto work = [&](size_t a) {
             uint32_t i = wave[a];
             double t0 = now_sec();
             std::vector<std::vector<int64_t>> outc;
-            if (!codec_decode(st[i].codec, st[i].param, buf.data() + off[i], dlen[i],
-                              f.n, st[i].cols.size(), outc, werr[a], &ctx)) return;
-            {
-                std::lock_guard<std::mutex> lk(colmu);
-                for (size_t c = 0; c < st[i].cols.size(); ++c)
-                    f.col[st[i].cols[c]] = std::move(outc[c]);
+            // 糸の中の例外は外へ出すと std::terminate になる。理由として持ち帰る。
+            try {
+                if (!codec_decode(st[i].codec, st[i].param, buf.data() + off[i], dlen[i],
+                                  f.n, st[i].cols.size(), outc, werr[a], &ctx)) return;
+            } catch (const std::exception& e) {
+                werr[a] = std::string("復号中の例外: ") + e.what(); return;
             }
+            if (outc.size() != st[i].cols.size()) { werr[a] = "列の数が合わない"; return; }
+            for (const auto& oc : outc)
+                if (oc.size() != (size_t)f.n) { werr[a] = "列の長さが点数と合わない"; return; }
+            wout[a].resize(outc.size());
+            for (size_t c = 0; c < outc.size(); ++c) wout[a][c] = std::move(outc[c]);
             wsec[a] = now_sec() - t0;
             wok[a] = 1;
         };
@@ -2801,6 +4908,9 @@ bool read_pcc2(const std::string& path, Frame& f, std::string& err) {
                 err += " / 符号器 " + cand_name(st[i].codec, st[i].param) + "）";
                 return false;
             }
+            for (size_t c = 0; c < st[i].cols.size(); ++c)
+                f.col[st[i].cols[c]] = std::move(wout[a][c]);
+            std::vector<Col>().swap(wout[a]);
             done[i] = 1; --left;
             for (const auto& c : st[i].cols) have.insert(c);
         }

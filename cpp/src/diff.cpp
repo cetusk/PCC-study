@@ -112,6 +112,9 @@ static double zbits(const std::vector<std::vector<int64_t>>& st, size_t n) {
 ResidualDiff nearest_residual(const std::vector<double>& tgt, size_t nt,
                               const std::vector<double>& ref, size_t nr, double v) {
     ResidualDiff R; R.voxel = v;
+    // 参照の点数は ref の長さから決まる（KdTree が ref をそのまま使う）。
+    // 呼ぶ側が渡す nr と食い違っていたら、参照が途中で切れている。
+    if (nr * 3 != ref.size() || nt * 3 > tgt.size()) return R;
     std::vector<std::vector<int64_t>> alone(3, std::vector<int64_t>(nt));
     for (size_t i = 0; i < nt; ++i) for (int d = 0; d < 3; ++d)
         alone[d][i] = (int64_t)std::llround(tgt[i*3+d] / v);

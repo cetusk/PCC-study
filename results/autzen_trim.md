@@ -1,5 +1,7 @@
 # ビット内訳レポート  —  autzen_trim.laz
 
+> **履歴**（2026-09-23 の索引 `results/INDEX.md` による）: Python 試作（09-17）のビット内訳。**現在の数値は `results/standing.md`**。
+
 生成 2026-09-17 20:48   
 
 ## 0. データ概要

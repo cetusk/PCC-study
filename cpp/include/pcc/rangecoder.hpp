@@ -46,14 +46,21 @@ inline thread_local const std::atomic<size_t>* enc_best = nullptr;
 // 復号は一致する（LASzip の ArithmeticModel と同じ考え方）。
 struct FreqModel {
     int n = 0;
-    uint32_t upd = 0, cyc = 0;
+    uint32_t upd = 0, cyc = 0, mx = 0;
     std::vector<uint16_t> f;
     std::vector<uint32_t> c;               // c[i] = f[0..i-1] の和、c[n] が合計
+    // 作り直す間隔を**加わった重みの相対量**で決める。
+    // 間隔を字母の数で固定すると、**序盤が古い表のまま流れる**。
+    // 1065 点の extra では、最初の 65 個を一様な表で符号化することになり、
+    // 幾何が 0.25 bpp（33 byte）伸びていた。総和の 1/REFRESH ごとに作り直すと、
+    // 序盤は毎回・終盤は稀になる。定常では総和が 32768 で頭打ちなので
+    // 間隔は 64 に落ち着き、**作り直す回数は元とほとんど変わらない**。
+    static constexpr uint32_t REFRESH = 32;
     void init(int n_) {
         n = n_;
         f.assign((size_t)n, 1);
         c.assign((size_t)n + 1, 0);
-        cyc = (uint32_t)(n < 32 ? 32 : n);
+        mx = (uint32_t)(n < 32 ? 32 : n);
         rebuild();
     }
     void rebuild() {
@@ -69,6 +76,9 @@ struct FreqModel {
             c[(size_t)n] = s;
         }
         upd = 0;
+        cyc = c[(size_t)n] / (32u * REFRESH);
+        if (cyc < 1) cyc = 1;
+        if (cyc > mx) cyc = mx;
     }
     inline void bump(int s) {
         f[(size_t)s] = (uint16_t)(f[(size_t)s] + 32);
@@ -95,6 +105,16 @@ public:
         range_ = r * (m.c[(size_t)s + 1] - m.c[(size_t)s]);
         while (range_ < TOP) { range_ <<= 8; shiftLow(); }
         m.bump(s);
+    }
+    // 模型を通さずに等確率で書く。**一様に近いビットに適応模型は無力どころか
+    // 害になる**（p0 が雑音に振られるので、1 ビットが 1.0119 ビットに付く）。
+    // 仮数部の下位はほぼ一様なので、ここを素通しにすると 1.19% ぶん返ってくる。
+    inline void encode_raw(uint64_t v, int nbits) {
+        for (int i = nbits - 1; i >= 0; --i) {
+            range_ >>= 1;
+            if ((v >> i) & 1) low_ += range_;
+            while (range_ < TOP) { range_ <<= 8; shiftLow(); }
+        }
     }
     std::vector<uint8_t> finish() {
         for (int i = 0; i < 5; ++i) shiftLow();
@@ -136,6 +156,17 @@ public:
         while (range_ < TOP) { range_ <<= 8; code_ = (code_ << 8) | byte(); }
         return (int)(mask & 1u);
     }
+    inline uint64_t decode_raw(int nbits) {
+        uint64_t v = 0;
+        for (int i = 0; i < nbits; ++i) {
+            range_ >>= 1;
+            uint32_t bit = (code_ >= range_) ? 1u : 0u;
+            if (bit) code_ -= range_;
+            v = (v << 1) | bit;
+            while (range_ < TOP) { range_ <<= 8; code_ = (code_ << 8) | byte(); }
+        }
+        return v;
+    }
     inline int decode_freq(FreqModel& m) {
         uint32_t tot = m.c[(size_t)m.n];
         uint32_t r = range_ / tot;
@@ -171,6 +202,24 @@ public:
     // 流れごとに切り替える。codec_encode / codec_decode が符号器 id の旗から設定する。
     static thread_local int FSYM;
     static constexpr int FKMAX = 8;
+    // 仮数部のうち**上から何ビットを模型に通すか**。負なら全部通す（従来どおり）。
+    // 残りは encode_raw で素通しにする。流れごとに切り替える。
+    static thread_local int RAWKEEP;
+    // 桁長の並びに照合模型を掛けるか。FSYM のときだけ効く。
+    static thread_local int MATCH;
+    static constexpr int MKEY_BITS = 21;      // 桁長 3 つ分（7 bit × 3）
+    static constexpr int MTAB_BITS = 16;
+    static constexpr int MRUN_MAX  = 3;
+    // 文脈を束ねるか。FSYM のときだけ効く。
+    static thread_local int BUNDLE;
+    static constexpr uint32_t BND_T = 24;     // 自分の表に移るまでに見る数
+    static inline int mdl_bits(int k) {
+        if (RAWKEEP < 0 || k <= RAWKEEP) return k;
+        return RAWKEEP;
+    }
+    static inline uint64_t low_mask(int nb) {
+        return nb >= 64 ? ~0ull : ((1ull << nb) - 1);
+    }
     explicit UIntCoder(int n_ctx = 1, int max_k = 64)
         : max_k_(max_k), stride_(max_k + 1), nctx_(n_ctx),
           prefix_(FSYM ? 0 : (size_t)n_ctx * (max_k + 1)),
@@ -182,9 +231,26 @@ public:
             for (int c = 0; c < n_ctx; ++c)
                 for (int k = 1; k <= FKMAX; ++k)
                     cmod_[(size_t)c * (FKMAX + 1) + k].init(1 << k);
+            if (MATCH) {
+                // 旗が立った流れでしか確保しない。1 本あたり 64 KB ある。
+                mtab_.assign((size_t)1 << MTAB_BITS, 0);
+                mhit_.resize((size_t)n_ctx * (MRUN_MAX + 1));
+            }
+            if (BUNDLE) {
+                gmod_.init(max_k + 1);
+                gcnt_.assign((size_t)n_ctx, 0);
+                // **下位ビットの表は束ねない。**束ねると extra が
+                // 138.659 → 138.734 bpp と伸びた。桁数が決まったあとの
+                // 下位の分布は文脈にほとんど依らないので、既に共通に近い。
+            }
         }
     }
-    inline void encode(Encoder& e, uint64_t v, int ctx = 0) {
+    // 下位ビットの模型を桁数の文脈と分ける。桁数 k が決まったあとの下位ビットの
+    // 分布は、k を当てるのに使った文脈にはほとんど依らない。点数の少ない列では、
+    // 文脈ごとに下位の模型を持つと適応が薄まるだけになる。
+    inline void encode(Encoder& e, uint64_t v, int ctx = 0) { encode2(e, v, ctx, ctx); }
+    inline uint64_t decode(Decoder& d, int ctx = 0) { return decode2(d, ctx, ctx); }
+    inline void encode2(Encoder& e, uint64_t v, int ctx, int sctx) {
         // k = floor(log2(v+1))。v = 2^64-1 のとき v+1 が桁溢れするので
         // その場合だけ k=64 とし、サフィックスに v をそのまま 64 bit 書く。
         int k; uint64_t rem;
@@ -197,51 +263,137 @@ public:
             rem = t - (1ull << k);
         }
         if (FSYM) {
-            e.encode_freq(kmod_[(size_t)ctx], k);
+            if (MATCH)       match_enc(e, k, ctx);
+            else if (BUNDLE) bnd_enc(e, k, ctx);
+            else             e.encode_freq(kmod_[(size_t)ctx], k);
             if (k == 0) return;
             if (k <= FKMAX) {
-                e.encode_freq(cmod_[(size_t)ctx * (FKMAX + 1) + k], (int)rem);
+                e.encode_freq(cmod_[(size_t)sctx * (FKMAX + 1) + k], (int)rem);
                 return;
             }
-            BitModel* sm2 = &suffix_[ctx * stride_];
-            for (int i = k - 1; i >= 0; --i) e.encode(sm2[i], (rem >> i) & 1);
+            BitModel* sm2 = &suffix_[sctx * stride_];
+            const int md2 = mdl_bits(k);
+            for (int i = k - 1; i >= k - md2; --i) e.encode(sm2[i], (rem >> i) & 1);
+            if (k > md2) e.encode_raw(rem & low_mask(k - md2), k - md2);
             return;
         }
         BitModel* pm = &prefix_[ctx * stride_];
-        BitModel* sm = &suffix_[ctx * stride_];
+        BitModel* sm = &suffix_[sctx * stride_];
         for (int i = 0; i < k; ++i) e.encode(pm[i], 1);
         if (k < max_k_) e.encode(pm[k], 0);
-        for (int i = k - 1; i >= 0; --i) e.encode(sm[i], (rem >> i) & 1);
+        const int md = mdl_bits(k);
+        for (int i = k - 1; i >= k - md; --i) e.encode(sm[i], (rem >> i) & 1);
+        if (k > md) e.encode_raw(rem & low_mask(k - md), k - md);
     }
-    inline uint64_t decode(Decoder& d, int ctx = 0) {
+    inline uint64_t decode2(Decoder& d, int ctx, int sctx) {
         if (FSYM) {
-            int k2 = d.decode_freq(kmod_[(size_t)ctx]);
+            int k2 = MATCH  ? match_dec(d, ctx)
+                   : BUNDLE ? bnd_dec(d, ctx)
+                            : d.decode_freq(kmod_[(size_t)ctx]);
             if (k2 == 0) return 0;
             uint64_t rem2;
             if (k2 <= FKMAX) {
-                rem2 = (uint64_t)d.decode_freq(cmod_[(size_t)ctx * (FKMAX + 1) + k2]);
+                rem2 = (uint64_t)d.decode_freq(cmod_[(size_t)sctx * (FKMAX + 1) + k2]);
             } else {
-                BitModel* sm2 = &suffix_[ctx * stride_];
+                BitModel* sm2 = &suffix_[sctx * stride_];
+                const int md2 = mdl_bits(k2);
                 rem2 = 0;
-                for (int i = k2 - 1; i >= 0; --i)
+                for (int i = k2 - 1; i >= k2 - md2; --i)
                     rem2 = (rem2 << 1) | (uint64_t)d.decode(sm2[i]);
+                if (k2 > md2) {
+                    // **64 ビットのシフトは未定義**。md2=0 かつ k2=64 で到達する。
+                    // 符号化側の low_mask は場合分けしてあるので、こちらも合わせる。
+                    const int nb = k2 - md2;
+                    rem2 = (nb >= 64 ? 0ull : (rem2 << nb)) | d.decode_raw(nb);
+                }
             }
             if (k2 == 64) return rem2;
             return (1ull << k2) + rem2 - 1;
         }
         BitModel* pm = &prefix_[ctx * stride_];
-        BitModel* sm = &suffix_[ctx * stride_];
+        BitModel* sm = &suffix_[sctx * stride_];
         int k = 0;
         while (k < max_k_ && d.decode(pm[k])) ++k;
         uint64_t rem = 0;
-        for (int i = k - 1; i >= 0; --i) rem = (rem << 1) | static_cast<uint64_t>(d.decode(sm[i]));
+        const int md = mdl_bits(k);
+        for (int i = k - 1; i >= k - md; --i)
+            rem = (rem << 1) | static_cast<uint64_t>(d.decode(sm[i]));
+        if (k > md) {
+            const int nb = k - md;
+            rem = (nb >= 64 ? 0ull : (rem << nb)) | d.decode_raw(nb);
+        }
         if (k == 64) return rem;                       // 符号化側の特例と対にする
         return (1ull << k) + rem - 1;
     }
 private:
+    // 直前 3 つの桁長と文脈から合図を作る。表は「その合図のあと最後に来た桁長」を
+    // 1 byte で覚える（0 は空）。衝突はそのまま外れになるだけなので確認は要らない。
+    inline uint32_t mhash(int ctx) const {
+        uint32_t h = mkey_ * 2654435761u + (uint32_t)ctx * 40503u;
+        h ^= h >> 15;
+        return h & (((uint32_t)1 << MTAB_BITS) - 1);
+    }
+    inline void mstep(int k, uint32_t h) {
+        mtab_[h] = (uint8_t)(k + 1);
+        mkey_ = ((mkey_ << 7) | (uint32_t)k) & (((uint32_t)1 << MKEY_BITS) - 1);
+    }
+    inline void match_enc(Encoder& e, int k, int ctx) {
+        const uint32_t h = mhash(ctx);
+        const int pred = (int)mtab_[h] - 1;
+        if (pred >= 0) {
+            const bool hit = (k == pred);
+            e.encode(mhit_[(size_t)ctx * (MRUN_MAX + 1) + mrun_], hit ? 1 : 0);
+            if (hit) { if (mrun_ < MRUN_MAX) ++mrun_; mstep(k, h); return; }
+            mrun_ = 0;
+        } else {
+            mrun_ = 0;
+        }
+        e.encode_freq(kmod_[(size_t)ctx], k);
+        mstep(k, h);
+    }
+    inline int match_dec(Decoder& d, int ctx) {
+        const uint32_t h = mhash(ctx);
+        const int pred = (int)mtab_[h] - 1;
+        int k;
+        if (pred >= 0) {
+            if (d.decode(mhit_[(size_t)ctx * (MRUN_MAX + 1) + mrun_])) {
+                if (mrun_ < MRUN_MAX) ++mrun_;
+                mstep(pred, h);
+                return pred;
+            }
+            mrun_ = 0;
+        } else {
+            mrun_ = 0;
+        }
+        k = d.decode_freq(kmod_[(size_t)ctx]);
+        mstep(k, h);
+        return k;
+    }
+    // 束ね: まだ見た数が足りない文脈は共通の表に乗せる。どちらの表も毎回
+    // 更新するので、移った時点で自分の表は温まっている。
+    inline void bnd_enc(Encoder& e, int k, int ctx) {
+        FreqModel& own = kmod_[(size_t)ctx];
+        if (gcnt_[(size_t)ctx] < BND_T) { e.encode_freq(gmod_, k); own.bump(k); }
+        else                            { e.encode_freq(own, k); gmod_.bump(k); }
+        ++gcnt_[(size_t)ctx];
+    }
+    inline int bnd_dec(Decoder& d, int ctx) {
+        FreqModel& own = kmod_[(size_t)ctx];
+        int k;
+        if (gcnt_[(size_t)ctx] < BND_T) { k = d.decode_freq(gmod_); own.bump(k); }
+        else                            { k = d.decode_freq(own); gmod_.bump(k); }
+        ++gcnt_[(size_t)ctx];
+        return k;
+    }
     int max_k_, stride_, nctx_;
     std::vector<BitModel> prefix_, suffix_;   // 宣言順と初期化順を合わせる
     std::vector<FreqModel> kmod_, cmod_;
+    std::vector<uint8_t> mtab_;               // 照合の表（MATCH のときだけ確保）
+    std::vector<BitModel> mhit_;              // 当たり外れ（文脈 × 連続当たり数）
+    uint32_t mkey_ = 0;
+    int mrun_ = 0;
+    FreqModel gmod_;                          // 全文脈に共通の表（BUNDLE のとき）
+    std::vector<uint32_t> gcnt_;              // 文脈ごとに見た数
 };
 
 inline uint64_t zigzag(int64_t v)   { return (static_cast<uint64_t>(v) << 1) ^ static_cast<uint64_t>(v >> 63); }

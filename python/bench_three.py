@@ -11,6 +11,7 @@ from __future__ import annotations
 import os, sys, tempfile
 from pathlib import Path
 import numpy as np
+import laspy
 
 sys.path.insert(0, str(Path(__file__).parent))
 import exp_order_matrix as M
@@ -52,7 +53,13 @@ for lab in SEL:
 
         l = run([PY_, HELP, str(tmp / "xyz.npy"), str(tmp / "sc.npy"),
                  str(tmp / "of.npy"), str(tmp / "geom.laz")], ENV)
-        ls = (tmp / "geom.laz").stat().st_size * 8.0 / n
+        # **点データだけを数える。**ファイル全体だと LAS の頭と VLR が入り、
+        # G-PCC の bitstream や PCC2 のストリームと揃わない。1 万点のファイルでは
+        # 0.35 bpp の下駄になり、比較がこちらに有利な側へ片寄る
+        # （exp_order_matrix.laz_geom_bpp と同じ直し）。
+        with laspy.open(str(tmp / "geom.laz")) as fh0:
+            lhdr = fh0.header.offset_to_point_data
+        ls = ((tmp / "geom.laz").stat().st_size - lhdr) * 8.0 / n
 
         p = run([PCC, "pack", str(tmp / "in.laz"), str(tmp / "o.pcc2"),
                  "--fast-attr", "--no-fallback", "--no-verify"], ENV)
