@@ -4024,6 +4024,30 @@ Stream best_stream(const Frame& f, const std::vector<std::string>& cols,
             for (const auto& a : best.alt) if (same(r.second, a)) dup = true;
             if (!dup) { best.alt.push_back(r.second); break; }
         }
+    // **速い後半が最後に勝った流れは、候補の比較を速い表でやり直す。**
+    // 候補の比較は既定の表（遅い後半）で行うので、場面の変わる流れでは選ばれる候補
+    // そのものが変わる。最後の勝者に速い表を重ねても、比べ直すのはその 1 本だけで、
+    // 本来の勝者には戻れない（KITTI 200 万点の幾何: 修理後 16.830 → 17.008 bpp に悪化）。
+    // 速い表が勝ったこと自体を「場面の変わるデータ」の印に使い、その流れだけ全候補に
+    // 旗「速」を付けて選び直す。短いほうを採る。速い表が勝たない流れには費用が無い。
+    static const bool FAST_RERUN = [] {
+        const char* e = getenv("PCC_FAST_RERUN"); return !e || e[0] != '0'; }();
+    if (FAST_RERUN && !on_sample && !first && (best.codec & C_FAST_BIT) &&
+        !candidates.empty() && !(candidates[0].codec & C_FAST_BIT)) {
+        std::vector<Cand> fc;
+        fc.reserve(candidates.size());
+        for (const auto& c : candidates) fc.push_back({(uint16_t)(c.codec | C_FAST_BIT), c.param});
+        std::string tr2;
+        Stream again = best_stream(f, cols, fc, ctx, trace ? &tr2 : nullptr, preselect);
+        if (trace) {
+            char m[200];
+            snprintf(m, sizeof m, "      （速い後半が勝ったので候補の比較を速い表でやり直した: %s %.3f bpp）\n",
+                     cand_name(again.codec, again.param).c_str(),
+                     f.n ? again.data.size() * 8.0 / f.n : 0.0);
+            *trace += m + tr2;
+        }
+        if (!again.data.empty() && again.data.size() < best.data.size()) best = std::move(again);
+    }
     return best;
 }
 
