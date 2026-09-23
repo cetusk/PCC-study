@@ -26,3 +26,5 @@ __pycache__/
 *.pcc2
 *.pcc2.det
 *.laz.base
+cpp/build_native/
+!cpp/tests/fixtures/*.pcc2

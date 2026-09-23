@@ -7,7 +7,7 @@
 
     python python/regress_fixes.py        # リポジトリの根で。全項目「OK」なら通過
 """
-import os, sys, struct, subprocess, tempfile, numpy as np
+import hashlib, os, sys, struct, subprocess, tempfile, numpy as np
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from pcc2_craft import parse, build, crc64
 R = "cpp/tests/fixtures"
@@ -256,5 +256,28 @@ if TMC3 and os.path.exists(TMC3):
     else:
         r = run("combine", src, os.path.join(T, "gd.ply"), os.path.join(T, "g.bin"))
         check("combine に定数の列", r.returncode == 0 and "属性 完全一致=true" in r.stdout, f"rc={r.returncode} " + r.stderr[-150:])
+# 13. 決定性の検査が符号器を走らせ直していなかった（2026-09-23 の査読の指摘）。
+#     流れを器に書き直して比べるだけで、食い違っても止めていなかった。いまは選ばれた流れを
+#     新しい文脈で符号化し直して比べ、食い違えば戻り値 2 で何も残さない。
+#     試験用のつまみで流れの 1 byte を反転させ、捕まえることを確かめる。
+out13 = os.path.join(T, "det.pcc2")
+r = run("pack", "data/raw/small/autzen_trim.laz", out13, "--no-fallback",
+        env={"PCC_TEST_DET_FLIP": "1"})
+check("決定性の検査が食い違いを捕まえる",
+      r.returncode == 2 and "決定性に落ちた" in r.stderr and not os.path.exists(out13)
+      and not os.path.exists(out13 + ".part"), f"rc={r.returncode} " + r.stderr.strip()[:150])
+r = run("pack", "data/raw/small/autzen_trim.laz", out13, "--no-fallback")
+check("決定性の検査が通常は通る", r.returncode == 0 and "流れを符号化し直してバイト一致" in r.stdout,
+      f"rc={r.returncode} " + r.stderr.strip()[:150])
+# 14. 器の版 4 で、非可逆の極座標を戻す sin / cos を libm から自前の関数（dettrig.hpp）に替えた。
+#     版 3 の器は libm で戻さないと、座標（と、それで組む空間予測の順序）が変わりうる。
+#     版 3 の二値で作った作り物（回転 LiDAR 風 6000 点、--eps 0.1 で極座標、強度は sp(P=5)）を
+#     読み、版 3 の二値の復号と同じバイト列が出ることを確かめる。
+fx = "cpp/tests/fixtures/polar_v3.pcc2"
+out14 = os.path.join(T, "polar_v3.bin")
+r = run("unpack", fx, "--bin", out14)
+got = hashlib.md5(open(out14, "rb").read()).hexdigest() if os.path.exists(out14) else "-"
+check("版 3 の極座標の器を版 3 と同じに戻す", r.returncode == 0 and got == "4d57c3ea1305cf4cb0abb7c7341721dd",
+      f"rc={r.returncode} md5={got} " + r.stderr.strip()[:120])
 print(f"{sum(o for _, o in res)}/{len(res)} 通過")
 sys.exit(0 if all(o for _, o in res) else 1)

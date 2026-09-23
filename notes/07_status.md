@@ -275,7 +275,7 @@ LAZ に書いた 22.807 bpp を引いた見積り。取得順 54.368 に対し�
 | 作業の手引き | `notes/05_verification_checklist.md`（誤りの型 A〜N ＋ 手順） |
 | 時系列 | `notes/06_timeline.md` |
 | 回帰試験 | `python/regress_pcc2.py`（9 ファイル、可逆性・決定性・bpp）、`python/regress_fixes.py`（作り物・反例・旗つきの強制・combine 57 項目） |
-| 検証一式 | `python/verify_suite.py`（9 項目。測定と同時に走らせない） |
+| 検証一式 | `python/verify_suite.py`（10 項目。測定と同時に走らせない。isa は native で建てた `cpp/build_native` が要る） |
 | 計測の道具 | `python/runpeak.py`（汚染しないピーク計測）、`bench_geom.py`、`bench_pcc2.py` |
 | 集計 | `python/exp_order_summary.py`（30 節の正本）、`ordermatrix_io.py`（読み取りを 1 か所に） |
 

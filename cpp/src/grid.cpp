@@ -156,7 +156,7 @@ template <class F, class U>
 bool prove(const F* v, size_t n, double step, int dec_exp,
            std::vector<uint64_t>& neg_zero) {
     neg_zero.clear();
-    const double p10 = dec_exp >= 0 ? std::pow(10.0, dec_exp) : 0.0;
+    const double p10 = dec_exp >= 0 ? exact_pow10(dec_exp) : 0.0;
     for (size_t i = 0; i < n; ++i) {
         double q = dec_exp >= 0 ? std::round((double)v[i] * p10)
                                 : std::round((double)v[i] / step);

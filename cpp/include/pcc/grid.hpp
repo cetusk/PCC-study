@@ -24,6 +24,17 @@ struct GridFit {
     std::vector<uint64_t> neg_zero;   // -0.0 だった位置。整数を経ると符号が消える
 };
 
+// 10^d を正確に返す（0 <= d <= 22 は double で正確に表せる）。
+// **復号側で libm の pow を呼ばないため。**pow の結果は libm の実装で 1 ulp 揺れうるので、
+// 別の機械で復号すると十進の格子から戻した座標がずれうる。22 を超える d は
+// 符号化側が作らない（1〜15 しか試さない）ので、壊れた器として 0 を返す。
+inline double exact_pow10(int d) {
+    static const double T[23] = {1e0, 1e1, 1e2, 1e3, 1e4, 1e5, 1e6, 1e7, 1e8, 1e9, 1e10,
+                                 1e11, 1e12, 1e13, 1e14, 1e15, 1e16, 1e17, 1e18, 1e19,
+                                 1e20, 1e21, 1e22};
+    return (d >= 0 && d <= 22) ? T[d] : 0.0;
+}
+
 // float32 の並びに対して刻みを探し、証明する。
 GridFit fit_grid_f32(const float* v, size_t n);
 // float64 の並び（PLY の ascii など）に対して同じことをする。

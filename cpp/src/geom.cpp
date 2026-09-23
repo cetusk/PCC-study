@@ -1,4 +1,5 @@
 #include "pcc/geom.hpp"
+#include "pcc/dettrig.hpp"
 #include "pcc/nanoflann.hpp"
 #include <zstd.h>
 #include <random>
@@ -112,10 +113,9 @@ void polar_inverse(const std::vector<int64_t>& qr, const std::vector<int64_t>& q
     size_t n = qr.size();
     xyz.resize(n * 3);
     for (size_t i = 0; i < n; ++i) {
-        double r = qr[i] * dr, th = qa[i] * da, ph = qe[i] * da, c = std::cos(ph);
-        xyz[i * 3]     = r * c * std::cos(th) + o[0];
-        xyz[i * 3 + 1] = r * c * std::sin(th) + o[1];
-        xyz[i * 3 + 2] = r * std::sin(ph) + o[2];
+        const double r = qr[i] * dr, th = qa[i] * da, ph = qe[i] * da;
+        const double oo[3] = {o[0], o[1], o[2]};
+        polar_point(r, th, ph, oo, false, &xyz[i * 3]);   // 復号側（frame_world）と同じ式
     }
 }
 

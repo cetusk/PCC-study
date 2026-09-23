@@ -11,7 +11,8 @@
   ply       PLY 4 件の往復
   kitti     KITTI 108 frame の .bin → PCC2 → .bin のバイト比較
   force     幾何の基底候補を 1 本ずつ --force-geom で往復（5 ファイル）
-  lossy     KITTI 20 frame の非可逆（誤差上限 3 通り）で上限を守るか
+  lossy     KITTI 20 frame の非可逆（誤差上限 4 通り。0.1 m は極座標格子）で上限を守るか
+  isa       命令セットの違う二値（native で建てたもの）と器・復号が一致するか（exp_isa.py）
 
 以前はこのうち後半 4 つがその場のコマンドで、手順がリポジトリに残っていなかった。
 """
@@ -180,7 +181,8 @@ def t_lossy(say):
     frames = sorted(Path("data/raw/kitti").rglob("*.bin"))[:20]
     say(f"KITTI {len(frames)} frame。誤差上限ごとに pack（自己検証）→ unpack --bin で元と比べる。")
     bad = 0
-    for eps in (0.0, 0.002, 0.005, 0.02):
+    # 0.1 m では極座標格子が選ばれる（それ未満はデカルト格子）。極座標の経路もここで通す
+    for eps in (0.0, 0.002, 0.005, 0.02, 0.1):
         bpps, errs = [], []
         for k in frames:
             with tempfile.TemporaryDirectory() as t:
@@ -202,6 +204,30 @@ def t_lossy(say):
     return bad
 
 
+def t_isa(say):
+    # 命令セットの違う二値（cmake -DPCC_MARCH=native で cpp/build_native に建てたもの）と、
+    # 器の md5 と相互の復号を比べる。二値が無ければ落ちたものとして数える（黙って飛ばさない）。
+    nat = Path("cpp/build_native/pccnorm")
+    if not nat.exists():
+        say("cpp/build_native/pccnorm が無い（cmake -S cpp -B cpp/build_native -G Ninja -DPCC_MARCH=native）")
+        return 1
+    # 古いままの二値と比べると偽の失敗が出るので、いまの源から建て直す（済んでいれば一瞬）
+    b = subprocess.run(["ninja", "-C", "cpp/build_native", "pccnorm"], capture_output=True, text=True)
+    if b.returncode:
+        say("cpp/build_native を建て直せない\n" + b.stdout[-400:]); return 1
+    # 両方が同じ命令セットで建っていたら何も試していないことになる
+    def march(d):
+        m = re.search(r"^PCC_MARCH:\w+=(\S+)", Path(d, "CMakeCache.txt").read_text(), re.M)
+        return m.group(1) if m else "?"
+    ma, mb = march("cpp/build"), march("cpp/build_native")
+    say(f"命令セット cpp/build = {ma} / cpp/build_native = {mb}")
+    if ma == mb:
+        say("同じ命令セットで建っているので比べる意味が無い"); return 1
+    r = run_script(say, ["python/exp_isa.py", PCC, str(nat)])
+    m = re.search(r"一致しなかったもの (\d+)", r.stdout)
+    return int(m.group(1)) if m else 1
+
+
 SUMMARY: list = []
 section("regress", t_regress)
 section("size", t_size)
@@ -212,6 +238,7 @@ section("ply", t_ply)
 section("kitti", t_kitti)
 section("force", t_force)
 section("lossy", t_lossy)
+section("isa", t_isa)
 print("\n== まとめ ==")
 for n, b in SUMMARY:
     print(f"  {n:<8} 落ちたもの {b} 件")

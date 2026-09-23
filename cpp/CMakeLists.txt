@@ -12,7 +12,13 @@ endif()
 # -ffp-contract=off: 掛け算と足し算を 1 命令（FMA）にまとめない。まとめるかどうかは
 # CPU と最適化で変わり、座標や予測子の倍精度の値が機械ごとに食い違う。符号器と
 # 復号器が別の機械で走っても同じ値を得るために、IEEE の順どおりに計算させる。
-add_compile_options(-O3 -march=native -Wall -Wextra -fwrapv -ffp-contract=off)
+# PCC_MARCH: 命令セット。既定は x86-64（SSE2 だけ。どの x86-64 機でも動く）。
+# 以前は native（建てた機械の命令セット）だったが、x86-64 で建てても器と復号結果は
+# 59/59 件同じで（python/exp_isa.py）、15 件の中央 200 万点で符号化はむしろ −8.5%
+# （交互 3 回の最小。data/work/grid/ab_native_x86_v20.log）だったので替えた。
+# 命令セットに依らないことは verify_suite の isa で、native で建てた cpp/build_native と比べて確かめる。
+set(PCC_MARCH "x86-64" CACHE STRING "-march に渡す値")
+add_compile_options(-O3 -march=${PCC_MARCH} -Wall -Wextra -fwrapv -ffp-contract=off)
 
 set(LASZIP_ROOT "$ENV{HOME}/tools/laszip-install" CACHE PATH "LASzip install prefix")
 

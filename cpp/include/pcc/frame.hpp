@@ -66,6 +66,10 @@ struct Frame {
     double polar_origin[3] = {0, 0, 0};
     double polar_r_step = 0, polar_ang_step = 0;
     std::string polar_base = "f32bits";
+    // 版 3 の器から読んだときだけ立つ。版 3 は極座標を libm の sin / cos で戻していたので、
+    // 同じ座標（＝同じ空間予測の順序）を得るには libm で戻すしかない。版 4 からは
+    // 自前の関数（dettrig.hpp）で、機械に依らない。
+    bool polar_libm = false;
     // 自前の符号器より元の器のほうが短いときに、その中身をそのまま包んで運ぶ。
     // 空でなければ列ストリームは無く、復号はこの中身を書き出して読み直す。
     std::vector<uint8_t> embed;

@@ -17,6 +17,7 @@
 #include "pcc/distort.hpp"
 #include "pcc/surfcode.hpp"
 #include "pcc/pcc2.hpp"
+#include "pcc/dettrig.hpp"
 
 #include "pcc/rangecoder.hpp"
 #include <cstdio>
@@ -339,10 +340,8 @@ static int main_impl(int argc, char** argv) {
                         const double r = (double)g.streams[0][i] * dr;
                         const double th = (double)g.streams[1][i] * da;
                         const double ph = (double)g.streams[2][i] * da;
-                        const double c = std::cos(ph);
-                        v[0] = r * c * std::cos(th) + g.origin[0];
-                        v[1] = r * c * std::sin(th) + g.origin[1];
-                        v[2] = r * std::sin(ph)     + g.origin[2];
+                        const double oo[3] = {g.origin[0], g.origin[1], g.origin[2]};
+                        polar_point(r, th, ph, oo, false, v);   // 復号（frame_world）と同じ式
                     } else {
                         for (int d = 0; d < 3; ++d)
                             v[d] = (double)g.streams[d][i] * g.step + g.origin[d];
@@ -482,6 +481,11 @@ static int main_impl(int argc, char** argv) {
             st = plan_streams(f, joint, &log, &ctx, trace_all);
         }
         mem_mark("候補選択と符号化の後");
+        // 回帰試験用: 最初の流れの最後のバイトを反転させ、決定性の検査が
+        // 食い違いを捕まえて書かずに終わることを確かめる（regress_fixes.py）。
+        // 検証を飛ばす経路では効かせない（壊れた器が確定してしまう）。
+        if (!no_verify && getenv("PCC_TEST_DET_FLIP") && !st.empty() && !st[0].data.empty())
+            st[0].data.back() ^= 0x01;
         uint64_t bytes = 0;
         if (!write_pcc2(outp, f, st, bytes, err)) { fprintf(stderr, "書き込み失敗: %s\n", err.c_str()); return 1; }
         mem_mark("書き出した後");
@@ -533,10 +537,27 @@ static int main_impl(int argc, char** argv) {
         // 先にやっておけば、復号と読み直しを始める前に符号化側を手放せる。
         // 後回しにすると、符号化側・復号したもの・読み直したものの 3 つを
         // 同時に抱えることになる（200 万点・17 列で 1 つ 250 MB）。
+        //
+        // 確かめることは 2 つ。(a) 選ばれた流れを、選択で温まった表を使わずに符号化し直すと
+        // 同じバイト列になるか（符号器の決定性）。(b) 同じ流れを器に書き直すと同じバイト列に
+        // なるか（器の書き出しの決定性）。以前は (b) だけで、符号器を走らせ直していなかった。
+        // **どちらも食い違ったら書かない。**候補の選択そのものの決定性は、スレッド数を
+        // 変えた md5 の比較（verify_suite の threads）で見る。
+        // 選択で温まった表（近傍表・順序表・走査の文脈・字母・world）はもう要らない。
+        // 抱えたまま新しい文脈で同じ表を作り直すと、200 万点で 100 MB を超えて二重に持つ。
+        ctx.perm_by_n.clear();
+        ctx.pred_by_np.clear();
+        ctx.scan_cache.reset();
+        ctx.sym_cache.reset();
+        std::vector<double>().swap(ctx.world_own);
+        const double t_det0 = now();
+        std::string det_diff;
+        bool det = used_embed || reencode_matches(f, st, ctx, det_diff);
+        const double t_det = now() - t_det0;
         std::string p2 = outp + ".det";
         uint64_t b2 = 0;
-        bool det = (used_embed ? write_pcc2(p2, fe, {}, b2, err)
-                               : write_pcc2(p2, f, st, b2, err)) && b2 == bytes;
+        det = det && (used_embed ? write_pcc2(p2, fe, {}, b2, err)
+                                 : write_pcc2(p2, f, st, b2, err)) && b2 == bytes;
         if (det) {
             FILE* a = fopen(outp.c_str(), "rb"); FILE* b = fopen(p2.c_str(), "rb");
             std::vector<uint8_t> ba(bytes), bb(bytes);
@@ -544,8 +565,16 @@ static int main_impl(int argc, char** argv) {
                   fread(bb.data(), 1, bytes, b) == bytes && ba == bb;
             if (a) fclose(a);
             if (b) fclose(b);
+            if (!det) det_diff = "器に書き直すとバイト列が違う";
+        } else if (det_diff.empty()) {
+            det_diff = b2 != bytes && b2 ? "器に書き直すと長さが違う" : "器を書き直せない";
         }
         remove(p2.c_str());
+        if (!det) {
+            fprintf(stderr, "決定性に落ちた: %s\n検証に落ちたので %s は書かない\n",
+                    det_diff.c_str(), final_out.c_str());
+            return 2;
+        }
 
         // 以降で使う覚え書きだけ残して、列の実体と流れを手放す。
         const size_t rep_n = (size_t)f.n, rep_ncol = f.schema.size();
@@ -674,6 +703,13 @@ static int main_impl(int argc, char** argv) {
         }
         printf("5 軸        enc %.2fs / dec %.2fs / 読込 %.2fs / ピーク %.2f GB / 決定性 %s\n",
                t_enc, t_dec, t_read, peak_gb(), det ? "バイト一致" : "不一致");
+        // 見出しに「決定性」を使わない。集計スクリプト（regress_pcc2.py など）は「決定性」を
+        // 含む最後の行で「バイト一致」を探すので、上の 5 軸の行の判定を上書きしてしまう。
+        if (used_embed)
+            printf("再符号化    包んだ器なので省いた（器の書き直しはバイト一致）\n");
+        else
+            printf("再符号化    流れを符号化し直してバイト一致・器の書き直しもバイト一致（%.2fs）\n",
+                   t_det);
         if (!ok || !las_ok) {
             fprintf(stderr, "検証に落ちたので %s は書かない\n", final_out.c_str());
             return 2;

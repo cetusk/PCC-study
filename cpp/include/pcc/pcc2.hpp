@@ -227,6 +227,13 @@ std::string cand_name(uint16_t codec, const std::vector<uint8_t>& param);
 std::vector<Stream> plan_streams(const Frame& f, bool joint_geom, std::string* log = nullptr,
                                  const CodecCtx* ctx = nullptr, bool trace_all = false);
 
+// **符号化の決定性を確かめる。**選ばれた流れを、選択で温まった表を持たない
+// 新しい文脈（proto の設定だけ写す）でもう一度符号化し、バイト列が一致するかを見る。
+// 流れどうしは並列に回す。食い違った流れがあれば false を返し、diff にその名前を入れる。
+// 候補の選択そのものの決定性は見ない（それはスレッド数を変えた md5 の比較で見る）。
+bool reencode_matches(const Frame& f, const std::vector<Stream>& st, const CodecCtx& proto,
+                      std::string& diff);
+
 bool write_pcc2(const std::string& path, const Frame& f, const std::vector<Stream>& st,
                 uint64_t& bytes_out, std::string& err);
 bool read_pcc2(const std::string& path, Frame& f, std::string& err);

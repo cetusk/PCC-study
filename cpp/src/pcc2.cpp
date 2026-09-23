@@ -3411,8 +3411,10 @@ static void post_flags(Stream& best, size_t& bestsz, const std::vector<const Col
     const uint16_t b0 = best.codec;
     std::vector<Cand> pc;
     // 素通しの旗は UIntCoder の下位ビットに効く。模型を通らない符号器
-    // （恒等・素の幅）では同じバイト列になるので測らない。
-    const bool no_model = ((b0 & ~C_FLAG_MASK) == C_RAW64 || (b0 & ~C_FLAG_MASK) == C_RAW_W);
+    // （恒等・素の幅）と、UIntCoder を使わない字母（FreqModel だけ）では
+    // 同じバイト列になるので測らない。
+    const bool no_model = ((b0 & ~C_FLAG_MASK) == C_RAW64 || (b0 & ~C_FLAG_MASK) == C_RAW_W ||
+                           (b0 & ~C_FLAG_MASK) == C_RANGE_SYM);
     if (!(b0 & C_RAW_BIT) && !no_model) pc.push_back({(uint16_t)(b0 | C_RAW_BIT), best.param});
     // 符号つきの文脈は、それを読む符号器（下の sgn_ok）にだけ効く。長さの最適値は
     // ファイルで違うので、1 / 2 / 4 個の 3 通りを出して実測で選ばせる。
@@ -3696,9 +3698,10 @@ Stream best_stream(const Frame& f, const std::vector<std::string>& cols,
             // （記号版が勝つと固定した名前と違う符号器で書かれる）
             if (ctx && !ctx->force_geom.empty() && cand_name(c.codec, c.param) == ctx->force_geom)
                 continue;
-            // 模型を通らない符号器（恒等・素の幅）には旗が効かない。対を作っても
-            // 同じバイト列をもう一度符号化するだけになる。
-            if (c.codec == C_RAW64 || c.codec == C_RAW_W) continue;
+            // 模型を通らない符号器（恒等・素の幅）と UIntCoder を使わない字母には
+            // 記の旗が効かない。対を作っても同じバイト列をもう一度符号化するだけになる
+            // （字母の記号版は束・生束の後置検査も呼び込んでいた）。
+            if (c.codec == C_RAW64 || c.codec == C_RAW_W || c.codec == C_RANGE_SYM) continue;
             if (PAIR_MODE == 2) {
                 bool sp = (c.codec == C_ATTR_SPATIAL || c.codec == C_ATTR_COLOR) ||
                           (c.codec == C_ATTR_XREF && !c.param.empty() &&
@@ -4801,11 +4804,85 @@ bool plan_from_binary(const std::vector<uint8_t>& b, const Frame& f, std::string
 }
 }  // namespace
 
+bool reencode_matches(const Frame& f, const std::vector<Stream>& st, const CodecCtx& proto,
+                      std::string& diff) {
+    // 選択で温まった表（近傍表・走査の文脈・字母）を使い回すと、表の作り方が
+    // 揺れていても同じ表から同じ出力が出て、揺れを見逃す。設定だけ写した新しい文脈で回す。
+    CodecCtx ctx;
+    ctx.world = proto.world;
+    ctx.want_world = proto.want_world;
+    ctx.fr = proto.fr ? proto.fr : &f;
+    ctx.bitfields_first = proto.bitfields_first;
+    ctx.fast_attr = proto.fast_attr;
+    // 長い流れ（たいてい幾何）から先に配ると、最後に 1 本だけ残って機械が空く時間が短い
+    std::vector<size_t> ord(st.size());
+    for (size_t i = 0; i < ord.size(); ++i) ord[i] = i;
+    std::stable_sort(ord.begin(), ord.end(),
+                     [&](size_t a, size_t b) { return st[a].data.size() > st[b].data.size(); });
+    std::vector<std::string> werr(st.size());
+    auto work1 = [&](size_t i) {
+        const Stream& s = st[i];
+        std::vector<const Col*> cv;
+        for (const auto& c : s.cols) {
+            const Col* col = f.get(c);
+            if (!col) { werr[i] = "列が無い: " + c; return; }
+            cv.push_back(col);
+        }
+        std::vector<uint8_t> blob;
+        std::string e;
+        if (!codec_encode(s.codec, cv, s.param, blob, e, &ctx)) { werr[i] = "符号化に失敗: " + e; return; }
+        if (blob != s.data) {
+            werr[i] = "バイト列が違う（" + std::to_string(s.data.size()) + " → " +
+                      std::to_string(blob.size()) + " byte）";
+        }
+    };
+    // 糸の中の例外は外へ出すと std::terminate になり、.part も消えない。理由として持ち帰る。
+    auto work = [&](size_t i) {
+        try {
+            work1(i);
+        } catch (const std::exception& ex) {
+            werr[i] = std::string("符号化中の例外: ") + ex.what();
+        } catch (...) {
+            werr[i] = "符号化中の例外";
+        }
+    };
+    static const size_t NT = [] {
+        if (const char* e = getenv("PCC_THREADS")) { long v = atol(e); if (v > 0) return (size_t)v; }
+        unsigned hw = std::thread::hardware_concurrency();
+        return (size_t)(hw ? hw : 1);
+    }();
+    const size_t nt = NT < ord.size() ? NT : ord.size();
+    std::atomic<size_t> next{0};
+    auto loop = [&] { for (size_t a = next++; a < ord.size(); a = next++) work(ord[a]); };
+    std::vector<std::thread> th;
+    if (nt > 1) {
+        th.reserve(nt);
+        // 糸を立てられなかったら、立った分と呼び出し側で残りを回す（途中で投げると
+        // join できる糸を抱えたまま vector が壊れて terminate する）。
+        for (size_t t = 0; t + 1 < nt; ++t) {           // 呼び出し側が nt 本目
+            try { th.emplace_back(loop); } catch (...) { break; }
+        }
+    }
+    loop();                       // 呼び出し側も同じ待ち行列を回す（糸が 0 本でも全部終わる）
+    for (auto& x : th) x.join();
+    diff.clear();
+    for (size_t i = 0; i < st.size(); ++i) {
+        if (werr[i].empty()) continue;
+        std::string nm;
+        for (size_t c = 0; c < st[i].cols.size(); ++c) nm += (c ? "+" : "") + st[i].cols[c];
+        diff += (diff.empty() ? "" : " / ") + nm + " " + cand_name(st[i].codec, st[i].param) +
+                ": " + werr[i];
+    }
+    return diff.empty();
+}
+
 // 器の版。**読み方が変わったら上げる。**古い版は黙って読み違えるより、はっきり断る。
 //   1 … 2026-09 まで
 //   2 … LAS の封筒の末尾を「札つきの拡張」に改めた（ヘッダの欄・ユーザーデータを持つ）
 //   3 … 二値の模型の適応の速さを出現回数で変えるようにした（全部の流れのビット列が変わる）
-static const uint16_t PCC2_VERSION = 3;
+//   4 … 非可逆の極座標を戻す sin / cos を libm から自前の関数（dettrig.hpp）に替えた。
+//       版 3 の器も読む（極座標だけ libm で戻す。それ以外は版 4 と同じ読み方）
+static const uint16_t PCC2_VERSION = 4;
 
 bool write_pcc2(const std::string& path, const Frame& f, const std::vector<Stream>& st,
                 uint64_t& bytes_out, std::string& err) {
@@ -4925,11 +5002,12 @@ bool read_pcc2(const std::string& path, Frame& f, std::string& err) {
 
     Rd r{buf.data(), (size_t)sz - 8, 4};
     uint16_t ver = r.get<uint16_t>(); r.get<uint16_t>();
-    if (ver != PCC2_VERSION) {
-        err = "器の版 " + std::to_string(ver) + " は読めない（この復号器は版 " +
+    if (ver != PCC2_VERSION && ver != 3) {
+        err = "器の版 " + std::to_string(ver) + " は読めない（この復号器は版 3 と " +
               std::to_string(PCC2_VERSION) + " だけを読む。作り直すこと）";
         return false;
     }
+    f.polar_libm = (ver == 3);
     f.n = r.get<uint64_t>();
     uint32_t hl = r.get<uint32_t>();
     // 長さは**残りと比べて**確かめる（r.p + 長さ は壊れた値で桁あふれしうる）。

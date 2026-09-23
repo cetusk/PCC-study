@@ -1,5 +1,6 @@
 #include "pcc/frame.hpp"
 #include "pcc/grid.hpp"
+#include "pcc/dettrig.hpp"
 #include "pcc/normalize.hpp"
 #include <sys/stat.h>
 #include <cstring>
@@ -438,7 +439,7 @@ static bool load_kitti(const std::string& path, Frame& f, std::string& err, size
         std::vector<int64_t> v(n);
         if (as_int) {
             const double st = fit[c].step;
-            const double p10 = fit[c].dec_exp >= 0 ? pow(10.0, fit[c].dec_exp) : 0.0;
+            const double p10 = fit[c].dec_exp >= 0 ? exact_pow10(fit[c].dec_exp) : 0.0;
             for (size_t i = 0; i < n; ++i)
                 v[i] = (int64_t)llround(fit[c].dec_exp >= 0 ? (double)cols[c][i] * p10
                                                             : (double)cols[c][i] / st);
@@ -526,7 +527,7 @@ bool load_frame(const std::string& path, Frame& f, std::string& err, size_t max_
             std::vector<int64_t> v(n);
             if (geom_int) {
                 const double st = fit[c].step;
-                const double p10 = fit[c].dec_exp >= 0 ? pow(10.0, fit[c].dec_exp) : 0.0;
+                const double p10 = fit[c].dec_exp >= 0 ? exact_pow10(fit[c].dec_exp) : 0.0;
                 for (size_t i = 0; i < n; ++i)
                     v[i] = (int64_t)llround(fit[c].dec_exp >= 0 ? cols[c][i] * p10
                                                                 : cols[c][i] / st);
@@ -575,6 +576,7 @@ static bool get_grid_cols(const Frame& f, std::vector<GridCol>& out) {
         if (!get_str(e, p, c.name) || !get(e, p, c.step) || !get(e, p, c.dec_exp)
             || !get(e, p, nz)) return false;
         if (nz > (e.size() - p) / 8) return false;   // 壊れた個数で巨大な確保をしない
+        if (c.dec_exp > 22) return false;             // 符号化側は 1〜15 しか作らない（exact_pow10）
         c.neg_zero.resize(nz);
         for (uint32_t j = 0; j < nz; ++j)
             if (!get(e, p, c.neg_zero[j])) return false;
@@ -599,7 +601,7 @@ bool frame_to_kitti_bin(const Frame& f, const std::string& path, std::string& er
         const GridCol* g = nullptr;
         for (const auto& q : gc) if (q.name == nm[c]) g = &q;
         if (g) {
-            const double p10 = g->dec_exp >= 0 ? pow(10.0, g->dec_exp) : 0.0;
+            const double p10 = g->dec_exp >= 0 ? exact_pow10(g->dec_exp) : 0.0;
             for (size_t i = 0; i < n; ++i) {
                 double k = (double)(*v)[i];
                 buf[i * 4 + c] = (float)(g->dec_exp >= 0 ? k / p10 : k * g->step);
@@ -676,8 +678,7 @@ bool frames_equal(const Frame& a, const Frame& b, std::string& diff) {
 void frame_world(const Frame& f, std::vector<double>& xyz) {
     xyz.assign(f.n * 3, 0.0);
     if (f.geom_repr == "polar") {
-        // 逆変換は geom.cpp の polar_inverse と同じ式。依存を増やさないため
-        // ここに書く（式を変えるときは両方を直すこと）。
+        // 逆変換は geom.cpp の polar_inverse と同じ polar_point（dettrig.hpp）を通る。
         const Col* qr = f.get(f.geom[0]);
         const Col* qa = f.get(f.geom[1]);
         const Col* qe = f.get(f.geom[2]);
@@ -687,10 +688,7 @@ void frame_world(const Frame& f, std::vector<double>& xyz) {
             const double r = (double)(*qr)[i] * dr;
             const double th = (double)(*qa)[i] * da;
             const double ph = (double)(*qe)[i] * da;
-            const double c = std::cos(ph);
-            xyz[i * 3]     = r * c * std::cos(th) + f.polar_origin[0];
-            xyz[i * 3 + 1] = r * c * std::sin(th) + f.polar_origin[1];
-            xyz[i * 3 + 2] = r * std::sin(ph)     + f.polar_origin[2];
+            polar_point(r, th, ph, f.polar_origin, f.polar_libm, &xyz[i * 3]);
         }
         return;
     }
