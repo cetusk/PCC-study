@@ -146,6 +146,13 @@ static uint64_t fsize(const std::string& p) {
     struct stat st{}; return stat(p.c_str(), &st) == 0 ? (uint64_t)st.st_size : 0;
 }
 
+// 解析用のコマンドは列を .v で直に読む。読み込みは値が 1 種類の列を配列にせず 1 値だけ
+// 持つので、そのままでは範囲外を読む（`combine` に色だけの LAS を渡すと落ちた）。
+// pack / unpack の本流は定数のまま扱えるので、ここは解析用のコマンドだけで呼ぶ。
+static void materialize_all(PointCloud& pc) {
+    for (auto& kv : pc.fields) kv.second.materialize(pc.n);
+}
+
 static int main_impl(int argc, char** argv) {
     if (argc < 3) {
         fprintf(stderr,
@@ -755,6 +762,7 @@ static int main_impl(int argc, char** argv) {
             for (auto& ch : ext) ch = (char)tolower(ch);
             if (ext == ".laz" || ext == ".las") {
                 if (!read_las(path, pcA, e, mp)) { fprintf(stderr, "%s\n", e.c_str()); return 1; }
+                materialize_all(pcA);   // 解析用: 定数の列も配列にして .v で読めるようにする
                 n = pcA.n; with_attr = true; P.resize(n * 3);
                 for (size_t i = 0; i < n; ++i) {
                     P[i*3]   = pcA.X[i] * pcA.scale[0];
@@ -872,6 +880,7 @@ static int main_impl(int argc, char** argv) {
         PointCloud pc; std::string e;
         double t0 = now();
         if (!read_las(path, pc, e, mp)) { fprintf(stderr, "%s\n", e.c_str()); return 1; }
+        materialize_all(pc);   // 解析用: 定数の列も配列にして .v で読めるようにする
         size_t n = pc.n;
         std::vector<double> Xd; size_t nd = 0;
         if (!read_points_any(plydec, Xd, nd, e, 0)) { fprintf(stderr, "%s\n", e.c_str()); return 1; }
@@ -924,8 +933,10 @@ static int main_impl(int argc, char** argv) {
         for (auto& kv : pa.fields) {
             kv.second.materialize(n);
             if (kv.second.v.size() != n) continue;
-            const auto& src = pc.fields.at(kv.first).v;
-            for (size_t t = 0; t < n; ++t) kv.second.v[t] = src[(size_t)pe[t]];
+            // 元の列は定数なら値の配列を持たない（1 値だけ覚える）。at() で読む。
+            // 以前は .v を直に読み、定数の列がある入力（色だけの LAS など）で範囲外を読んで落ちた。
+            const Field& src = pc.fields.at(kv.first);
+            for (size_t t = 0; t < n; ++t) kv.second.v[t] = src.at((size_t)pe[t]);
         }
         // 予測子は実際の座標から作る（正準順序に並べ替えた幾何）
         std::vector<double> Xs(n * 3);
@@ -995,6 +1006,7 @@ static int main_impl(int argc, char** argv) {
         // --- 検証: 属性を復元して元と照合する
         PointCloud rb;
         if (!read_las(tmpL, rb, e)) { fprintf(stderr, "読み戻し失敗\n"); return 1; }
+        materialize_all(rb);   // 解析用: 定数の列も配列にして .v で読めるようにする
         std::string spec2; std::map<std::string, std::vector<int64_t>> ext2;
         if (!read_container(tmpC, spec2, ext2, n, e, true)) { fprintf(stderr, "コンテナ読み失敗\n"); return 1; }
         Plan p2 = Plan::from_json(spec2);
@@ -1047,6 +1059,7 @@ static int main_impl(int argc, char** argv) {
         }
         PointCloud pc; std::string e;
         if (!read_las(path, pc, e, mp)) { fprintf(stderr, "%s\n", e.c_str()); return 1; }
+        materialize_all(pc);   // 解析用: 定数の列も配列にして .v で読めるようにする
         size_t n = pc.n;
         printf("# 幾何の予測  %s  N=%zu\n\n", path.c_str(), n);
         std::vector<std::vector<int64_t>> V(3, std::vector<int64_t>(n));
@@ -1113,6 +1126,7 @@ static int main_impl(int argc, char** argv) {
         PointCloud pc; std::string e;
         double t0 = now();
         if (!read_las(path, pc, e, mp)) { fprintf(stderr, "%s\n", e.c_str()); return 1; }
+        materialize_all(pc);   // 解析用: 定数の列も配列にして .v で読めるようにする
         size_t n = pc.n;
         printf("# 属性の空間予測  %s  N=%zu  読み込み %.1fs\n", path.c_str(), n, now() - t0);
         std::vector<double> xyz(n * 3);
@@ -1365,6 +1379,7 @@ static int main_impl(int argc, char** argv) {
     PointCloud pc;
     if (!read_las(path, pc, err, max_points)) {
         fprintf(stderr, "読み込み失敗: %s\n", err.c_str()); return 1; }
+    materialize_all(pc);   // 解析用: 定数の列も配列にして .v で読めるようにする
     double t_read = now() - t0;
 
     if (cmd == "extern") {
@@ -1848,6 +1863,7 @@ static int main_impl(int argc, char** argv) {
     double tv = now();
     PointCloud rb;
     if (!read_las(tmpB, rb, err)) { fprintf(stderr, "B 読み戻し失敗: %s\n", err.c_str()); return 1; }
+    materialize_all(rb);   // 解析用: 定数の列も配列にして .v で読めるようにする
     std::string spec2;
     std::map<std::string, std::vector<int64_t>> ext2;
     if (!read_container(tmpC, spec2, ext2, pc.n, err, delta)) {

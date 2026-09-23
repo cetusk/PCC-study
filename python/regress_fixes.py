@@ -231,5 +231,25 @@ for g in ["幾何v0光", "幾何v1光", "向き光", "幾何v0符1", "幾何v1�
     got = m[0].split()[1] if m else "?"
     ok = r.returncode == 0 and "全列一致 = true" in r.stdout and got == g
     check(f"旗つきの強制 {g}", ok, "" if ok else f"選ばれた {got} / rc={r.returncode} " + r.stderr[-150:])
+# 12. combine（幾何を G-PCC に任せる構成）に定数の列がある入力を渡すと落ちていた（2026-09-23）。
+#     G-PCC の参照ソフト（環境変数 TMC3）があるときだけ回す。
+TMC3 = os.environ.get("TMC3")
+if TMC3 and os.path.exists(TMC3):
+    rng12 = np.random.default_rng(12)
+    n12 = 5000
+    h = laspy.LasHeader(point_format=2, version="1.2"); h.scales = [0.01] * 3; h.offsets = [0] * 3
+    d = laspy.LasData(h)
+    d.X = rng12.integers(0, 20000, n12); d.Y = rng12.integers(0, 20000, n12); d.Z = rng12.integers(0, 2000, n12)
+    d.red = rng12.integers(0, 65535, n12); d.green = rng12.integers(0, 65535, n12); d.blue = rng12.integers(0, 65535, n12)
+    src = os.path.join(T, "rgb_only.las"); d.write(src)          # 強度・分類などは定数
+    from bench_pcc2 import write_ply
+    xyz = np.stack([np.asarray(d.X), np.asarray(d.Y), np.asarray(d.Z)], 1)
+    write_ply(os.path.join(T, "g.ply"), xyz)
+    subprocess.run([TMC3, "--mode=0", f"--uncompressedDataPath={T}/g.ply", f"--compressedStreamPath={T}/g.bin",
+                    "--trisoupNodeSizeLog2=0", "--mergeDuplicatedPoints=0"], capture_output=True)
+    subprocess.run([TMC3, "--mode=1", f"--compressedStreamPath={T}/g.bin", f"--reconstructedDataPath={T}/gd.ply"],
+                   capture_output=True)
+    r = run("combine", src, os.path.join(T, "gd.ply"), os.path.join(T, "g.bin"))
+    check("combine に定数の列", r.returncode == 0 and "属性 完全一致=true" in r.stdout, f"rc={r.returncode} " + r.stderr[-150:])
 print(f"{sum(o for _, o in res)}/{len(res)} 通過")
 sys.exit(0 if all(o for _, o in res) else 1)

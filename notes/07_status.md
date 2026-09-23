@@ -205,8 +205,12 @@ fork から exec までの間に子が親の RSS を引き継ぐ。**同じ G-PC
 `coding.tex` の図 `fig:bits`(b) の 15 点、対角より上の件数 11 → 10、中央値 −13.1% / −18.1% /
 −16.3%。出どころは改善ループ 3 巡目の後の `bench_2m_v19.log`・`bench_split_v19.log`・
 `bench_three_v19.log`。PDF は作り直した（Overfull 0）。
-**`pcc.tex` の §e2e（6.3% / 22.3%、295.2 MB）は測り直していない**（LASzip を中に置く構成で
-自前の符号器の改良は効かないが、同日の正規化の直しの影響は確かめていない）。
+**`pcc.tex` の §e2e は旧い経路（`pccnorm combine`。空間予測の残差を `encode_ints` で送る）で、
+PCC2 の符号器の改良は通らない。**2026-09-23 に AHN4 31HZ1_20 の先頭 200 万点・幾何 + 色 3 成分で
+測り直し、「G-PCC の幾何 + 本手法」が 25.363 + 0.092 + 7.434 = **32.889 bpp とビット単位で再現**した
+（表の 25.36 / 7.43 / 32.89）。このとき、色だけの LAS（強度などが定数）を渡すと `combine` が
+segfault する不具合が見つかり、直した（`results/defects.md`）。800 万点の列とタイル全体
+（440 → 295.2 MB）は測り直していない。
 
 以下は 2026-09-22 に合わせたときの記録。
 
@@ -257,7 +261,7 @@ fork から exec までの間に子が親の RSS を引き継ぐ。**同じ G-PC
 | 測定の記録 | `results/scan_model_fitting.md`（74 節） |
 | 作業の手引き | `notes/05_verification_checklist.md`（誤りの型 A〜N ＋ 手順） |
 | 時系列 | `notes/06_timeline.md` |
-| 回帰試験 | `python/regress_pcc2.py`（9 ファイル、可逆性・決定性・bpp）、`python/regress_fixes.py`（作り物・反例・旗つきの強制 56 項目） |
+| 回帰試験 | `python/regress_pcc2.py`（9 ファイル、可逆性・決定性・bpp）、`python/regress_fixes.py`（作り物・反例・旗つきの強制・combine 57 項目） |
 | 検証一式 | `python/verify_suite.py`（9 項目。測定と同時に走らせない） |
 | 計測の道具 | `python/runpeak.py`（汚染しないピーク計測）、`bench_geom.py`、`bench_pcc2.py` |
 | 集計 | `python/exp_order_summary.py`（30 節の正本）、`ordermatrix_io.py`（読み取りを 1 か所に） |
