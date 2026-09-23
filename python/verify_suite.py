@@ -11,7 +11,7 @@
   ply       PLY 4 件の往復
   kitti     KITTI 108 frame の .bin → PCC2 → .bin のバイト比較
   force     幾何の基底候補を 1 本ずつ --force-geom で往復（5 ファイル）
-  lossy     KITTI 20 frame の非可逆（誤差上限 4 通り。0.1 m は極座標格子）で上限を守るか
+  lossy     KITTI 20 frame の非可逆（誤差上限 4 通り。極座標格子）と PLY 2 件（デカルト格子）で上限を守るか
   isa       命令セットの違う二値（native で建てたもの）と器・復号が一致するか（exp_isa.py）
 
 以前はこのうち後半 4 つがその場のコマンドで、手順がリポジトリに残っていなかった。
@@ -181,7 +181,7 @@ def t_lossy(say):
     frames = sorted(Path("data/raw/kitti").rglob("*.bin"))[:20]
     say(f"KITTI {len(frames)} frame。誤差上限ごとに pack（自己検証）→ unpack --bin で元と比べる。")
     bad = 0
-    # 0.1 m では極座標格子が選ばれる（それ未満はデカルト格子）。極座標の経路もここで通す
+    # KITTI では 2 mm〜0.1 m のどれでも極座標格子が選ばれる（lattice_kind_v21.log）
     for eps in (0.0, 0.002, 0.005, 0.02, 0.1):
         bpps, errs = [], []
         for k in frames:
@@ -201,6 +201,17 @@ def t_lossy(say):
                 bpps.append(float((re.search(r"^PCC2\s+\S+ MB\s+([0-9.]+)", r.stdout, re.M) or [0, "nan"])[1]))
         say(f"誤差上限 {eps:<6} 中央値 {np.median(bpps):7.3f} bpp  [{min(bpps):.3f}, {max(bpps):.3f}]"
             f"  実測最大誤差 {max(errs) if errs else float('nan'):.4g} m")
+    # 物体のスキャン（PLY）では粗いデカルト格子が選ばれる。KITTI だけだとこの経路を通らない。
+    # PLY には書き出しの口が無いので、pack の自己検証（誤差上限の中・属性一致）と選ばれた格子を見る
+    for f in ["data/raw/stanford/Armadillo.ply", "data/raw/stanford/bunny/data/bun000.ply"]:
+        for eps in (0.001, 0.01):
+            with tempfile.TemporaryDirectory() as t:
+                r = pcc("pack", f, f"{t}/p.pcc2", "--no-fallback", "--eps", str(eps))
+            cart = "粗いデカルト格子に量子化" in r.stdout
+            ok = r.returncode == 0 and "誤差上限の中 = true" in r.stdout and cart
+            if not ok:
+                bad += 1
+            say(f"{Path(f).name:<14} 誤差上限 {eps:<6} デカルト格子 {cart}  自己検証 {'通過' if ok else '落ちた'}")
     return bad
 
 

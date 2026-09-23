@@ -178,7 +178,7 @@ G-PCC には公称値どうしで 11/17（0.91x）。**G-PCC は点の順序を�
 | 推定を測定に替えるだけで戻った | 3.1 bit/点 | [lossless_refinements.md](results/lossless_refinements.md) |
 | 車載 LiDAR の float32 は 1 mm 格子に乗る（可逆に整数化） | 無圧縮比 −83.2%、整数 LAS にした LASzip 比 −6.6% | [forward_operator.md](results/forward_operator.md) §4 |
 | （撤回）車載 LiDAR の float32 は派生表現 | 前提の「格子は壊れている」が誤りだった | [kitti_polar_finding.md](results/kitti_polar_finding.md) |
-| 取得表現への復帰は地上型で逆効果 | +34〜57% | [tls_polar_finding.md](results/tls_polar_finding.md) |
+| （訂正）取得表現への復帰は地上型でも効く。「逆効果」は極座標の中心を重心にして測った誤り | スキャナ中心で器が −38〜−43%（旧表は重心中心の見積りで +34〜57%） | [tls_polar_finding.md](results/tls_polar_finding.md) |
 | octree は点間隔以下でゼロ情報 | 13 データセットで H(c)=2.976〜3.000 | [subspacing_finding.md](results/subspacing_finding.md) |
 | 反復測量の差分符号化 | 幾何ビットの 1.3% のみ | [repeat_survey_finding.md](results/repeat_survey_finding.md) |
 | 位相は一度も律速にならない | センサ床が常に 10〜40 倍きつい | [matrix_comparison.md](results/matrix_comparison.md) |

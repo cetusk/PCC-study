@@ -94,7 +94,7 @@
 | `results/lossy_surface_finding.md` | 参照 | P1 | 面を送る非可逆符号化と歪み尺度の落とし穴 |
 | `results/lossless_refinements.md` | 参照 | P1/P2 | 候補の拡張と選択の物差し |
 | `results/stanford_finding.md` | 参照 | P1 | 密なオブジェクトスキャンでの検証 |
-| `results/tls_polar_finding.md` | 参照 | P1 | 地上型では極座標への復帰が逆効果 |
+| `results/tls_polar_finding.md` | 参照（09-23 訂正） | P1 | 地上型の「極座標は逆効果」は、測る道具が重心を引いていた誤り。スキャナ中心なら 38〜43% 短い |
 | `results/matrix_comparison.md` | 参照 | P1 | 13 データ × 6 計測の一斉比較 |
 
 ### 履歴（後の文書に置き換えられた記録）

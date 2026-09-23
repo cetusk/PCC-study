@@ -8,7 +8,8 @@
   2) A の器を A と B で unpack し、出力の md5 を比べる（相互の復号）。PLY は書き出しの口が
      無いので、器の一致に加えて両方の二値で検証つきの pack を通す
 入力は 15 件の中央 200 万点（LAS）、KITTI 20 frame（可逆・--eps 0.005・--eps 0.1）、PLY 4 件と
-TLS の PLY の --eps 0.01。0.1 m と TLS は極座標格子が選ばれ、復号が sin / cos を通る。
+TLS の PLY の --eps 0.01、Armadillo の --eps 0.001。KITTI と TLS の非可逆は極座標格子（復号が
+sin / cos を通る）、Armadillo はデカルト格子が選ばれる（lattice_kind_v21.log）。
 """
 import hashlib, os, shutil, subprocess, sys, tempfile
 from pathlib import Path
@@ -69,12 +70,13 @@ frames = sorted(Path("data/raw/kitti").rglob("*.bin"))[:20]
 for k in frames:
     case(f"KITTI {k.stem} 可逆", k, [], "--bin", tmp)
     case(f"KITTI {k.stem} eps 5mm", k, ["--eps", "0.005"], "--bin", tmp)
-    # 0.1 m では極座標格子が選ばれる（復号が sin / cos を通る唯一の経路）
-    case(f"KITTI {k.stem} eps 0.1m 極座標", k, ["--eps", "0.1"], "--bin", tmp)
+    # KITTI の非可逆はどの誤差上限でも極座標格子（5 mm と 0.1 m で 2 通り試す）
+    case(f"KITTI {k.stem} eps 0.1m", k, ["--eps", "0.1"], "--bin", tmp)
 for f in ["data/raw/stanford/bunny/data/bun000.ply", "data/raw/stanford/dragon_stand/dragonStandRight_0.ply",
           "data/raw/stanford/Armadillo.ply", "data/work/tls_scan1.ply"]:
     case(Path(f).name, Path(f), [], None, tmp)
 case("tls_scan1.ply eps 1cm 極座標", Path("data/work/tls_scan1.ply"), ["--eps", "0.01"], None, tmp)
+case("Armadillo.ply eps 1mm デカルト", Path("data/raw/stanford/Armadillo.ply"), ["--eps", "0.001"], None, tmp)
 shutil.rmtree(tmp, ignore_errors=True)
 print(f"\n一致しなかったもの {bad} / {tot} 件")
 sys.exit(1 if bad else 0)

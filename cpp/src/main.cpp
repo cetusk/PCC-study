@@ -366,7 +366,9 @@ static int main_impl(int argc, char** argv) {
             double target = eps_lossy, got = 0;
             bool fit = false;
             for (int tries = 0; tries < 6; ++tries) {
-                gc = choose_geometry(w, f.n, target, true, 200000, false);
+                // PCC_GEOM_VERBOSE=1 で候補ごとの代理の符号長を出す（符号化側の診断だけ。器は変わらない）
+                static const bool GV = getenv("PCC_GEOM_VERBOSE") != nullptr;
+                gc = choose_geometry(w, f.n, target, true, 200000, GV);
                 if (gc.kind != "polar" && gc.kind != "grid") break;
                 got = end_err(gc);
                 if (got <= eps_lossy) { fit = true; break; }
@@ -1350,11 +1352,16 @@ static int main_impl(int argc, char** argv) {
                    S.keep_storage_order, S.consider_morton, S.consider_polar, S.consider_rotation);
             return 0;
         }
-        // 重心を引いてから測る
-        double c[3] = {0,0,0};
-        for (size_t i = 0; i < pc.n; ++i) for (int d = 0; d < 3; ++d) c[d] += W[i*3+d];
-        for (int d = 0; d < 3; ++d) c[d] /= (double)pc.n;
-        for (size_t i = 0; i < pc.n; ++i) for (int d = 0; d < 3; ++d) W[i*3+d] -= c[d];
+        // 重心を引いてから測る。**geom では引かない。**極座標の候補は座標の原点（地上型や
+        // 回転式ではスキャナの位置）を中心にするものを含むので、重心に寄せると原点の候補が
+        // 重心の候補と同じになり、スキャナの位置が失われる。TLS の講堂で「極座標は 34〜57% 長い」
+        // と出たのはこのためだった（pack は寄せないので 38〜43% 短い。results/tls_polar_finding.md）。
+        if (cmd != "geom") {
+            double c[3] = {0,0,0};
+            for (size_t i = 0; i < pc.n; ++i) for (int d = 0; d < 3; ++d) c[d] += W[i*3+d];
+            for (int d = 0; d < 3; ++d) c[d] /= (double)pc.n;
+            for (size_t i = 0; i < pc.n; ++i) for (int d = 0; d < 3; ++d) W[i*3+d] -= c[d];
+        }
         double sp = point_spacing(W);
         if (cmd == "octant") {
             printf("点間隔 %.6g\n", sp);
