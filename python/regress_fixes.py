@@ -219,5 +219,17 @@ for name, fmt, fill in [("pf6_flags", 6, "flags"), ("big_time", 6, "time"), ("du
         same = all(np.array_equal(np.asarray(a_[d]), np.asarray(b_[d])) for d in a_.point_format.dimension_names)
     ok = r.returncode == 0 and "LAS に書き戻して元と一致 = true" in r.stdout and same
     check(f"反例 {name}", ok, "" if ok else (r.stdout[-200:] + r.stderr[-200:]))
+# 11. 旗つきの版を名前で強制して往復させる（2026-09-23 の査読の指摘）。
+#     verify_suite.py の force は基底の名前だけを強制し、固定した候補には旗を重ねないので、
+#     光・符・速の付いた版は勝ったファイルでしか復号されていなかった。多重戻りのある USGS NY で通す。
+for g in ["幾何v0光", "幾何v1光", "向き光", "幾何v0符1", "幾何v1符2", "向き符4",
+          "幾何v1符1光", "走査v1符1", "走査変換符2", "幾何v1速", "幾何v4W16記光面8"]:
+    c = os.path.join(T, "ff.pcc2")
+    r = run("pack", "data/raw/usgs/NY_ClintonEssex_2014.laz", c, "--force-geom", g,
+            "--no-fallback", "--max-points", "100000")
+    m = [l for l in r.stdout.splitlines() if l.startswith("  X+Y+Z")]
+    got = m[0].split()[1] if m else "?"
+    ok = r.returncode == 0 and "全列一致 = true" in r.stdout and got == g
+    check(f"旗つきの強制 {g}", ok, "" if ok else f"選ばれた {got} / rc={r.returncode} " + r.stderr[-150:])
 print(f"{sum(o for _, o in res)}/{len(res)} 通過")
 sys.exit(0 if all(o for _, o in res) else 1)

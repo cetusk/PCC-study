@@ -4071,7 +4071,9 @@ Stream best_stream(const Frame& f, const std::vector<std::string>& cols,
     // 既定は 0（わずかでも勝てば選び直す）。1‰ で AHN5 +0.027%、3‰ で plane +0.117%、
     // 10‰ で符号化 −20% の代わりに 5 件で縮みを失った（losses.md §33）。サイズが第一なので 0。
     static const long FAST_RERUN_MIN = [] {
-        const char* e = getenv("PCC_FAST_RERUN_MIN"); return e ? atol(e) : 0L; }();
+        const char* e = getenv("PCC_FAST_RERUN_MIN");
+        const long v = e ? atol(e) : 0L;
+        return v < 0 ? 0L : (v > 1000 ? 1000L : v); }();   // 負や 1000 超えは端に寄せる
     const bool fast_gain_ok = before_fast > 0 &&
         (before_fast - best.data.size()) * 1000 >= (size_t)FAST_RERUN_MIN * before_fast;
     if (FAST_RERUN && fast_gain_ok && !on_sample && !first && (best.codec & C_FAST_BIT) &&

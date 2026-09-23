@@ -161,7 +161,8 @@ def t_force(say):
         elif on and re.match(r"^  \S", l): break
     say(f"基底候補 {len(names)} 本")
     bad = tot = 0
-    # USGS NY は多重戻りを持つので、後置検査で光・面の旗が立った版もここで往復する
+    # 基底の名前だけを強制する（固定した候補には旗を重ねないので、旗つきの版はここでは
+    # 通らない。旗つきの版は regress_fixes.py の「旗つきの強制」で名前を指定して通す）
     for f in ["data/raw/small/autzen_trim.laz", "data/raw/small/vegetation_1_3.las",
               "data/raw/small/fullwave.laz", "data/work/tls_scan1.ply",
               "data/raw/usgs/NY_ClintonEssex_2014.laz"]:

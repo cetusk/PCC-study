@@ -96,7 +96,7 @@ G-PCC を系列可逆にするには置換を送る必要がある。その費�
 ### 候補を 1 本に固定すれば、自前の符号器は G-PCC より速くて軽い（出力も短い）
 
 > **候補を幾何v3 1 本に固定したときの話である。**既定の全候補では、幾何のみで
-> G-PCC の **1.31 倍遅く**、メモリーも 4.1 倍重い（`results/standing.md` §5.2・§6.1。
+> G-PCC の **1.66 倍遅く**、メモリーも 4.4 倍重い（2026-09-23、`results/standing.md` §5.2・§6.1。
 > この軸は測るたびのばらつきが大きい）。
 
 100 万点・AHN4 _20・幾何のみ・候補 1 本固定（`data/work/grid/lean_scale.log`）:
@@ -200,10 +200,11 @@ fork から exec までの間に子が親の RSS を引き継ぐ。**同じ G-PC
 
 **2026-09-23 の改善ループの後にもう一度合わせた。**`pcc.tex` の表 `tab:alone`（15 行と中央値
 −14.3% → **−16.3%**、幾何 −13.1%・属性 −18.1%）、本文（対 G-PCC 0.91 [0.87, 1.09]・対 LAZ 0.89、
-速度 44.4x / 10.1x、G-PCC 比 1.64x、メモリ 739 byte/点・4.4x・9.6x、最後の工程の説明、
-中央値が 1 件の移動に敏感なことの但し書き）、要旨の 16.3%。`coding.tex` の図 `fig:bits`(b) の
-15 点、対角より上の件数 11 → 10、中央値 −13.1% / −18.1% / −16.3%。出どころは
-`bench_2m_v18.log`・`bench_split_v18.log`・`bench_three_v18.log`。PDF は作り直した（Overfull 0）。
+速度 44.8x / 10.3x、G-PCC 比 1.66x、メモリ 728 byte/点・4.4x・9.8x、最後の工程の説明、
+中央値が 1 件の移動に敏感なことの但し書き、LAS の欄ごとの比較 14/15 → 15/15）、要旨の 16.3%。
+`coding.tex` の図 `fig:bits`(b) の 15 点、対角より上の件数 11 → 10、中央値 −13.1% / −18.1% /
+−16.3%。出どころは改善ループ 3 巡目の後の `bench_2m_v19.log`・`bench_split_v19.log`・
+`bench_three_v19.log`。PDF は作り直した（Overfull 0）。
 **`pcc.tex` の §e2e（6.3% / 22.3%、295.2 MB）は測り直していない**（LASzip を中に置く構成で
 自前の符号器の改良は効かないが、同日の正規化の直しの影響は確かめていない）。
 
@@ -256,7 +257,7 @@ fork から exec までの間に子が親の RSS を引き継ぐ。**同じ G-PC
 | 測定の記録 | `results/scan_model_fitting.md`（74 節） |
 | 作業の手引き | `notes/05_verification_checklist.md`（誤りの型 A〜N ＋ 手順） |
 | 時系列 | `notes/06_timeline.md` |
-| 回帰試験 | `python/regress_pcc2.py`（9 ファイル、可逆性・決定性・bpp）、`python/regress_fixes.py`（作り物 42 項目） |
+| 回帰試験 | `python/regress_pcc2.py`（9 ファイル、可逆性・決定性・bpp）、`python/regress_fixes.py`（作り物・反例・旗つきの強制 56 項目） |
 | 検証一式 | `python/verify_suite.py`（9 項目。測定と同時に走らせない） |
 | 計測の道具 | `python/runpeak.py`（汚染しないピーク計測）、`bench_geom.py`、`bench_pcc2.py` |
 | 集計 | `python/exp_order_summary.py`（30 節の正本）、`ordermatrix_io.py`（読み取りを 1 か所に） |
