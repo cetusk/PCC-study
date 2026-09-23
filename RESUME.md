@@ -10,7 +10,7 @@
 > [`results/losses.md`](results/losses.md)（何をどう直したか）を見ること。文書の地図は
 > [`results/INDEX.md`](results/INDEX.md)。
 > 要点（2026-09-23）: 全列 対 LASzip **−16.3%（15/15、中央値。幅 −37.6〜−9.1%）**、幾何単体で
-> **LAZ に 17/17**（0.89x）、符号化 44.4x・復号 10.1x・739 byte/点。
+> **LAZ に 17/17**（0.89x）、符号化 44.8x・復号 10.3x・728 byte/点。
 > 2026-09-23 に器の版を 3 に上げた（`results/defects.md`・`results/losses.md` §29）。
 > **版 1・2 の .pcc2 は読めない**ので作り直すこと。
 
