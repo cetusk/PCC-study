@@ -221,7 +221,7 @@
       <div class="vrow pick">
         <dt>サイズだけを重く見る</dt>
         <dd class="pickname" style="color:var(--pcc2)">PCC2</dd>
-        <dd class="why">end-to-end で <span class="num">−16.3%</span>（15 ファイル中 15 件で小さい。中央値）。ただし符号化に <span class="num">44.8</span> 倍の時間と、1 点あたり <span class="num">728 byte</span> のメモリを払う。</dd>
+        <dd class="why">end-to-end で <span class="num">−16.3%</span>（15 ファイル中 15 件で小さい。中央値）。ただし符号化に <span class="num">43.9</span> 倍の時間と、1 点あたり <span class="num">742 byte</span> のメモリを払う。</dd>
       </div>
       <div class="vrow alt">
         <dt>速度・メモリ・互換性</dt>
@@ -338,14 +338,14 @@
       <figcaption>
         <span class="num">1.0</span> の線が相手と同等。左が良い。17 ファイル。
         サイズは G-PCC と互角（0.91）で LASzip より <b>11% 小さい</b>（0.89）。
-        速度は G-PCC より遅く（<b>1.66</b>）、LASzip より
-        <b>24 倍遅い</b>。<b>この軸は取り直すと 10% 動く</b>ので、細かい差は読まないこと。メモリはどちらにも負けるが、候補を 1 本に固定すれば
+        速度は G-PCC より遅く（<b>1.55</b>）、LASzip より
+        <b>17 倍遅い</b>。<b>この軸は取り直すと 10% 動く</b>ので、細かい差は読まないこと。メモリはどちらにも負けるが、候補を 1 本に固定すれば
         全規模で G-PCC を下回る。
       </figcaption>
     </figure>
     <p class="note prose">
-      属性込みで測ると、符号化は LASzip の <span class="num">44.8</span> 倍、復号は
-      <span class="num">10.3</span> 倍になる。符号化が重いのは<b>候補を全部符号化して最短を採る</b>
+      属性込みで測ると、符号化は LASzip の <span class="num">43.9</span> 倍、復号は
+      <span class="num">8.1</span> 倍になる（復号の比は LASzip の秒数が短いぶん揺れやすい）。符号化が重いのは<b>候補を全部符号化して最短を採る</b>
       ためで、復号は選ばれた 1 本しか通らない。<b>復号の比は規模で倍になる</b>
       （20 万点では 4.0 倍）。点数に比例して増える近傍表が効くためで、
       <b>速度を述べるときは規模が要る</b>。
@@ -371,10 +371,10 @@
       <div class="cav">
         <h3>速度とメモリ</h3>
         <p>
-          符号化は LASzip の <span class="num">44.8 倍</span>、復号は
-          <span class="num">10.3 倍</span>。候補を全部符号化して最短を採る作りなので、
-          符号化が高い。メモリは全列で 1 点あたり <span class="num">728 byte</span>、
-          幾何だけを G-PCC と比べると <span class="num">4.4 倍</span>使う。
+          符号化は LASzip の <span class="num">43.9 倍</span>、復号は
+          <span class="num">8.1 倍</span>。候補を全部符号化して最短を採る作りなので、
+          符号化が高い。メモリは全列で 1 点あたり <span class="num">742 byte</span>、
+          幾何だけを G-PCC と比べると <span class="num">4.5 倍</span>使う。
           <b>速度とメモリは、どちらの相手にも負けている。</b>
         </p>
       </div>
@@ -437,8 +437,9 @@
 (function () {
   "use strict";
 
-  /* 中央 200 万点（足りないものは全点）。出どころは bench_2m_v19.log /
-     bench_split_v19.log / bench_three_v19.log（2026-09-23、改善ループ 3 巡目の後）。
+  /* 中央 200 万点（足りないものは全点）。出どころはサイズが bench_2m_v19.log /
+     bench_split_v19.log / bench_three_v19.log（2026-09-23、改善ループ 3 巡目の後）、
+     速度とメモリが bench_2m_v21.log / bench_three_v21.log（同日、構成の査読の直しの後）。
      end-to-end の「欠けの費用」は全次元を運ぶようになったので全件 0。 */
   var E2E = [
     ["AHN4 _20",      69.817, 43.583, 0.000,  43.583, -37.6],
@@ -468,8 +469,8 @@
   };
   var AXES = [
     { k: "サイズ", unit: "bpp",   g: 0.91, l: 0.89 },
-    { k: "速度",   unit: "秒",     g: 1.66, l: 23.72 },
-    { k: "メモリ", unit: "ピーク MB", g: 4.38, l: 9.75 }
+    { k: "速度",   unit: "秒",     g: 1.55, l: 16.73 },
+    { k: "メモリ", unit: "ピーク MB", g: 4.52, l: 9.86 }
   ];
 
   var NS = "http://www.w3.org/2000/svg";
