@@ -229,7 +229,7 @@ std::vector<GeomCandidate> geometry_candidates(const std::vector<double>& xyz, s
 }
 
 GeomCandidate choose_geometry(const std::vector<double>& xyz, size_t n, double eps,
-                              bool allow_polar, size_t sample, bool verbose) {
+                              bool allow_polar, size_t sample, bool verbose, const std::string& kind) {
     auto cands = geometry_candidates(xyz, n, eps, allow_polar);
     size_t m = std::min(sample, n);
     GeomCandidate* best = nullptr;
@@ -239,6 +239,20 @@ GeomCandidate choose_geometry(const std::vector<double>& xyz, size_t n, double e
         for (int d = 0; d < 3; ++d) head[d].assign(c.streams[d].begin(), c.streams[d].begin() + m);
         c.bytes = rate_of(head, m);
         if (!best || c.bytes < best->bytes) best = &c;
+    }
+    // 実験: PCC_GEOM_KIND=grid / polar/origin / polar/centroid で格子の種類を固定する（符号化側だけ。
+    // 代理の符号長による選択がどれだけ損をしているかを、器で実際に符号化して測るため）。
+    std::string want_s = kind;
+    if (want_s.empty())
+        if (const char* want = getenv("PCC_GEOM_KIND")) want_s = want;
+    if (!want_s.empty()) {
+        GeomCandidate* hit = nullptr;
+        for (auto& c : cands) {
+            const std::string nm = c.kind + (c.anchor.empty() ? "" : "/" + c.anchor);
+            if (nm == want_s && c.max_err <= eps * 1.02) { hit = &c; break; }
+        }
+        if (!kind.empty() && !hit) return GeomCandidate{};   // 指定の種類は上限を守れない
+        if (hit) best = hit;
     }
     if (verbose)
         for (auto& c : cands)

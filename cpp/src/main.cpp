@@ -365,24 +365,68 @@ static int main_impl(int argc, char** argv) {
                 }
                 return worst;
             };
+            // 種類を 1 つ決めて、誤差上限に収まるまで刻みを詰める（kind が空なら代理の符号長で選ぶ）。
+            auto fit_kind = [&](const std::string& kind, GeomCandidate& g, double& got_out) -> bool {
+                double target = eps_lossy;
+                for (int tries = 0; tries < 6; ++tries) {
+                    // PCC_GEOM_VERBOSE=1 で候補ごとの代理の符号長を出す（符号化側の診断だけ。器は変わらない）
+                    static const bool GV = getenv("PCC_GEOM_VERBOSE") != nullptr;
+                    g = choose_geometry(w, f.n, target, true, 200000, GV, kind);
+                    if (g.kind != "polar" && g.kind != "grid") return false;
+                    got_out = end_err(g);
+                    if (got_out <= eps_lossy) return true;
+                    // 超えたぶんだけ刻みを詰めて測り直す。
+                    target *= eps_lossy / got_out * 0.98;
+                }
+                return false;
+            };
+            // **格子の種類は、幾何の流れを実際に符号化した長さで選ぶ。**代理の符号長（先頭 20 万点の
+            // 差分を汎用の圧縮器に通した長さ）で選ぶと、KITTI の 2 mm で 68 件中 3 件、直交格子のほうが
+            // 0.4〜1.2% 短いのに極座標を選んでいた（lattice_loss_v22.log）。3 種類それぞれで幾何だけの
+            // 計画を立てて比べる（比べる 3 回と本番を合わせて、非可逆の経路の幾何の計画が最大 4 回になる）。PCC_LATTICE_MEASURE=0 で
+            // 代理の選択に戻す。PCC_GEOM_KIND で種類を固定したときは測らない。
+            static const bool LAT_MEASURE = [] {
+                const char* e = getenv("PCC_LATTICE_MEASURE"); return !e || e[0] != '0'; }();
+            const bool measure = LAT_MEASURE && !getenv("PCC_GEOM_KIND");
+            auto geom_bytes = [&](const GeomCandidate& g) -> size_t {
+                Frame g2;
+                g2.n = f.n;
+                for (int c = 0; c < 3; ++c) g2.geom[c] = f.geom[c];
+                for (const auto& cs : f.schema)
+                    for (int c = 0; c < 3; ++c)
+                        if (cs.name == f.geom[c]) g2.schema.push_back(cs);
+                for (int c = 0; c < 3; ++c) g2.col[f.geom[c]] = Col(g.streams[c]);
+                CodecCtx c2; c2.fr = &g2; c2.force_geom = force_geom;   // 本番と同じ固定
+                std::string lg;
+                auto st2 = plan_streams(g2, joint, &lg, &c2);   // 本番と同じ幾何のまとめ方で
+                size_t b = 0;
+                for (const auto& x : st2) b += x.data.size() + x.param.size();
+                return b;
+            };
             GeomCandidate gc;
-            double target = eps_lossy, got = 0;
+            double got = 0;
             bool fit = false;
-            for (int tries = 0; tries < 6; ++tries) {
-                // PCC_GEOM_VERBOSE=1 で候補ごとの代理の符号長を出す（符号化側の診断だけ。器は変わらない）
-                static const bool GV = getenv("PCC_GEOM_VERBOSE") != nullptr;
-                gc = choose_geometry(w, f.n, target, true, 200000, GV);
-                if (gc.kind != "polar" && gc.kind != "grid") break;
-                got = end_err(gc);
-                if (got <= eps_lossy) { fit = true; break; }
-                // 超えたぶんだけ刻みを詰めて測り直す。
-                target *= eps_lossy / got * 0.98;
+            if (!measure) {
+                fit = fit_kind("", gc, got);
+            } else {
+                size_t best_b = (size_t)-1;
+                for (const char* kind : {"grid", "polar/origin", "polar/centroid"}) {
+                    GeomCandidate g; double gt = 0;
+                    if (!fit_kind(kind, g, gt)) continue;
+                    const size_t b = geom_bytes(g);
+                    if (getenv("PCC_GEOM_VERBOSE"))
+                        printf("    格子 %-16s 幾何の流れ %zu byte（誤差 %.4g mm）\n", kind, b, gt * 1000);
+                    if (b < best_b) { best_b = b; gc = std::move(g); got = gt; fit = true; }
+                }
             }
             std::vector<double>().swap(w);
             if (!fit) {
-                fprintf(stderr, "量子化が誤差上限に収まらなかった"
-                                "（種類 %s / 端から端までの実測誤差 %.6g m）\n",
-                        gc.kind.c_str(), got);
+                if (gc.kind.empty())
+                    fprintf(stderr, "量子化が誤差上限に収まらなかった（どの種類の格子も上限を守れなかった）\n");
+                else
+                    fprintf(stderr, "量子化が誤差上限に収まらなかった"
+                                    "（種類 %s / 端から端までの実測誤差 %.6g m）\n",
+                            gc.kind.c_str(), got);
                 return 1;
             }
             if (gc.kind == "polar") {
@@ -434,6 +478,9 @@ static int main_impl(int argc, char** argv) {
             sctx.fast_attr = fast_attr;
             if (do_spatial) { frame_world(fs, sworld); sctx.world = &sworld; }
             auto sel = plan_streams(fs, joint, &log, &sctx, trace_all);
+            // 旗「類」の相手の列は plan_streams が文脈に書く。全点での後置検査は本番の ctx で回すので写す
+            // （写さないと --sample-select の経路では類が一度も試されない）。
+            ctx.ctx_cols = sctx.ctx_cols;
             // 標本の 1 位が全点でも 1 位とは限らない。上位 2 つを全点で測り、
             // 短い方を採る。全候補を全点で測るより速く、1 位だけを信じるより安全。
             for (auto& s0 : sel) {
@@ -551,6 +598,7 @@ static int main_impl(int argc, char** argv) {
         // 選択で温まった表（近傍表・順序表・走査の文脈・字母・world）はもう要らない。
         // 抱えたまま新しい文脈で同じ表を作り直すと、200 万点で 100 MB を超えて二重に持つ。
         ctx.perm_by_n.clear();
+        ctx.cls_cache.clear();
         ctx.pred_by_np.clear();
         ctx.scan_cache.reset();
         ctx.sym_cache.reset();

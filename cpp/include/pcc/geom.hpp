@@ -55,9 +55,11 @@ struct GeomCandidate {
 std::vector<GeomCandidate> geometry_candidates(const std::vector<double>& xyz, size_t n,
                                                double eps, bool allow_polar = true,
                                                double origin_max_extent = 10.0);
+// kind を渡すと（"grid" / "polar/origin" / "polar/centroid"）その種類に固定する。誤差上限を守る候補に
+// その種類が無ければ、種類 "" の候補（kind も空）を返す。空なら代理の符号長で選ぶ。
 GeomCandidate choose_geometry(const std::vector<double>& xyz, size_t n, double eps,
                               bool allow_polar = true, size_t sample = 200000,
-                              bool verbose = false);
+                              bool verbose = false, const std::string& kind = "");
 
 // 3x3 対称行列の固有分解（昇順）。法線推定などで使う
 void eigh3(const double C[9], double evals[3], double evecs[9]);

@@ -135,9 +135,15 @@ inline constexpr int      LMS_SH         = 12;   // 重みの固定小数の桁
 // （KITTI・物体のスキャン）では速い表が勝つので、流れごとに選ぶ。
 inline constexpr uint16_t C_FAST_BIT     = 0x0040;
 
+// **列の類を文脈に足す**旗（名前は「類」）。既に復号済みの別の列（分類・戻り・強度など）の値を
+// 4 つの類に分け、残差の文脈に足す（戻りの種類の文脈「光」と同じ差し込み口を使うので、光とは併用しない）。
+// 類の分け方は列だけから決まる（値の種類が 64 以下なら出現の多い上位 3 値とその他、多ければ 4 分位）ので、
+// 復号側も同じ類を作れる。送るのは列の名前だけで、param の末尾に [名前][u16 長さ] として付ける。
+inline constexpr uint16_t C_CLS_BIT      = 0x0020;
+
 inline constexpr uint16_t C_FLAG_MASK =
     (uint16_t)(C_FSYM_BIT | C_RAW_BIT | C_MTC_BIT | C_BND_BIT |
-               C_LMS_BIT | C_SGN2_BIT | C_RAY_BIT | C_SURF_A | C_SURF_B | C_FAST_BIT);
+               C_LMS_BIT | C_SGN2_BIT | C_RAY_BIT | C_SURF_A | C_SURF_B | C_FAST_BIT | C_CLS_BIT);
 
 // 符号器が使ってよい副次情報。幾何は属性より先に復号されるので、
 // 属性の符号化時には座標が揃っている（命題: 副情報の不要性）。
@@ -185,6 +191,12 @@ struct CodecCtx {
     std::string force_geom;                       // X+Y+Z をこの候補名に固定する
     bool bitfields_first = false;                 // bit_fields が属性より先に出る（戻りの種類を属性の文脈に使える）
     bool fast_attr = false;                       // 属性列の候補を絞って時間を詰める
+    // 列ごとに、文脈（旗「類」）に使ってよい既に復号済みの列。plan_streams が候補を並べる前に埋める。
+    mutable std::map<std::string, std::vector<std::string>> ctx_cols;
+    // 旗「類」の類は列だけから決まるので、列名（と点数）ごとに 1 回だけ作ってとっておく。
+    // 候補ごとに作り直すと、4 分位で n×8 byte の写しを候補の本数だけ同時に抱える。
+    mutable std::map<std::pair<std::string, size_t>, std::shared_ptr<const std::vector<uint8_t>>> cls_cache;
+    mutable std::mutex cls_mu;
 };
 
 // 候補（符号器とそのパラメタ）
