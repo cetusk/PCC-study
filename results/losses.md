@@ -1106,7 +1106,7 @@ USGS AK・simple1_4、幾何v1 = red-rocks、向き追従 = autzen-2023）。
 ログは `data/work/grid/suite_v19.out` と `*_v19.log`（1 巡目の後は `suite_v17.out`、2 巡目の後は `suite_v18.out`）。
 
 - 作り物で不具合修理を 1 件ずつ（`regress_fixes.py`）: **57/57**（以前の査読の反例 3 件・旗つきの強制 11 本・
-  定数の列を持つ入力での `combine` を足した）
+  定数の列を持つ入力での `combine` を足した。`regress_fixes_v19c.log`。`suite_v19.out` の時点では 45/45）
 - 15 件の中央 200 万点で往復（全列一致）・**LAS に書き戻して元と照合**・決定性: **15/15**
 - スレッド数 1/3/7/16 で md5 一致: **17/17**
 - 点の次元が戻らないファイル（`bench_cover.py`、20 万点）: **0/15**

@@ -215,6 +215,14 @@ segfault する不具合が見つかり、直した（`results/defects.md`）。
 47.908 bpp。`data/work/grid/fulltile_bench_spatial_v19.log`、選択に 2794 s・ピーク 26.5 GB）。
 要旨の 295.2 MB を 295.0 MB に直した。
 
+**続けて表 `tab:e2e` の 11 ファイルを全部測り直した**（取得順と幾何から導いた順の 2 構成、22 回すべて
+ビット完全）。基準（LASzip のみ）は全次元を運ぶようになったぶん変わったファイルがある（fullwave
+73.480 → 149.503）。削減は AHN4 −32.9%・plane −21.1%・AHN5 −12.2%・fullwave −8.0%・AHN3 −6.6%・
+autzen-2023 −5.2%・autzen_trim −5.0%・red-rocks −4.1%・workshop −3.0%、simple1_4 と vegetation は
++0.1%（恒等を選ぶ）。表 `tab:grid`（格子 8/16/32 mm）、本文の時間（445 s → 2,911 s。選択に 2,794 s）、
+「O(M²N) を実装していない」（標本で絞るようにしてあり 14 s）、幾何と属性の内訳（41.9% / 58.1%）、
+結論の 28.5% → 32.9% も直した。ログと手順は `data/work/grid/e2e_v19/`（README.txt）。
+
 以下は 2026-09-22 に合わせたときの記録。
 
 `paper/pcc.tex` と `standing.html` の結果は、**点の次元・VLR・ヘッダを
