@@ -3,7 +3,9 @@
 実運用データ（航空 LiDAR / 車載 LiDAR / 地上型スキャナ）を対象に、
 「どこにビットが使われているか」を実測し、そこから符号化技術を設計・実装する作業場。
 
-符号化は毎回その場で復号して全列の一致を確認し、同じ入力を 2 回符号化してバイト一致（決定性）も確認済。
+`pack` は書いた器をその場で確かめてから確定する。選んだ流れを新しい状態で符号化し直してバイト一致（決定性）、
+復号して全列の一致、LAS なら元のファイルとの照合まで通らなければ器を残さない（元の LAZ を包んだときは
+符号化し直しの代わりに器の書き直しの一致を見る）。
 
 ---
 
@@ -14,10 +16,16 @@
 | | 内容 |
 |---|---|
 | [Lossless Coding of Airborne LiDAR Attributes in a Geometry-Derived Order](paper/coding.pdf) | 容器が幾何を先に復号する性質を使い、座標だけで決まる順序と予測子を副情報なしで使う |
-| [A Representation Normalization Layer for Point Cloud Compression](paper/pcc.pdf) | 符号化の前段に置く可逆写像の族。恒等写像を含めて実測で選ぶことで「元より悪化しない」を構成的に保証する。属性の符号化方式は上の論文に委ねる |
+| [A Representation Normalization Layer for Point Cloud Compression](paper/pcc.pdf) | 符号化の前段に置く可逆写像の族。恒等写像を含めて実測で選ぶことで「元より悪化しない」を構成的に保証する。属性の符号化方式は上の論文に委ねる。自前の器を単独で使った結果（全列で LASzip より 15 件すべてで小さく、中央値 −16.3%）も載せる |
+| [Input Order Is an Uncontrolled Variable in Lossless Point Cloud Compression Benchmarks](paper/order.pdf) | 点の並びが可逆符号器の比較を左右することを、8 通りの順序・4 符号器・17 ファイルの 41 ブロック、計 324 行で示す |
 
-いずれも LASzip を内側のコーデックとして用いる構成である。
+最初の 2 本の主な構成は LASzip を内側のコーデックとして用いる。
 **本リポジトリの現在の主題は、その外側ではなく符号器そのものの開発**（下記）。
+
+2026-09-23〜24 に 3 本とも数値と主張を見直した。主な訂正は、地上型スキャンで「極座標への復帰は
+34〜57% 逆効果」としていた結果が、測る道具が重心を引いていたための誤りだったこと
+（スキャナ中心なら 38〜43% 短い。[`results/tls_polar_finding.md`](results/tls_polar_finding.md)）と、
+車載 LiDAR の可逆を汎用の符号器の値（46.183 bpp）で比べていたこと（器では座標だけで 16.901 bpp）。
 
 ---
 
@@ -57,7 +65,22 @@ G-PCC には公称値どうしで 11/17（0.91x）。**G-PCC は点の順序を�
 
 メモリーは 1 点あたり中央値 **742 byte**（属性込み）。三者で最も重い（standing.md §6）。
 2026-09-23 の改善ループでサイズを全件で縮めた代わりに、符号化が約 3 割遅くなった
-（`results/losses.md` §27〜§33）。
+（`results/losses.md` §27〜§33）。その後の構成の査読の直し（効かない候補を外す・命令セット）で
+符号化は交互 3 回の比較で −5.9%（`ab_v19_v21.log`）。
+
+**構成の全体像**（入力側・流れの順序・符号器と旗・選び方・器の形・検証）は
+[`results/architecture.md`](results/architecture.md) にまとめてある。
+
+### 検証と再現性
+
+- **pack の自己検証**: 選んだ流れを符号化し直してバイト一致（決定性）→ 復号して全列一致 →
+  LAS なら `unpack --las` と同じ道で書き戻して元のファイルと欄ごとに照合。どれかに落ちたら器を残さない
+  （検証に落ちたら戻り値 2、復号そのものが失敗したら 1）
+- **検証一式** `python/verify_suite.py`（10 項目、単独で回す）: 回帰 60 件・15 件の往復と照合・
+  スレッド数を変えた md5 一致・次元の被覆・`unpack --las` の生バイト比較・PLY・KITTI 108 frame・
+  幾何の候補 58 本の強制・非可逆（極座標とデカルト格子）・命令セットの違う二値との一致（81/81）
+- **器の版は 4**（版 3 も読める）。**版 4 の器の復号は libm の三角関数を呼ばない**（非可逆の極座標は四則演算と
+  floor だけの sin/cos、十進の格子は正確な 10^d の表）。版 3 の器は互換のため極座標だけ libm で読む。二値の既定の命令セットは `x86-64`（SSE2 だけ）
 
 **符号化が復号より掛かるのは、候補を全部符号化して最短を採るためである。**
 復号は選ばれた 1 本しか通らない。
@@ -171,12 +194,12 @@ G-PCC には公称値どうしで 11/17（0.91x）。**G-PCC は点の順序を�
 | ALS の走査角は時刻から決まる | 0 次で −24% | [als_scan_structure.md](results/als_scan_structure.md) |
 | 走査モデル符号器と、当てはめの誤り | 幾何 −8.9%（200万点） | [scan_model_fitting.md](results/scan_model_fitting.md) |
 | 走査モデルが勝つのは 12 構成中 6 件 | 勝敗は退避した線の面外ビット長で決まる | [scan_model_fitting.md](results/scan_model_fitting.md) |
-| 標本選択は 10.2 倍速で +1.05% | 誤るのは 14 列中 X+Y+Z の 1 列だけ | [scan_model_fitting.md](results/scan_model_fitting.md) |
+| 標本選択は 10.2 倍速で +1.05%（当時。既定の経路を速くした後は `--sample-select` のほうが遅い） | 誤るのは 14 列中 X+Y+Z の 1 列だけ | [scan_model_fitting.md](results/scan_model_fitting.md) |
 | 自前符号器が LAS/LAZ 非依存に | タイル全体 −31.5%、全列一致 | [pcc2_codec.md](results/pcc2_codec.md) |
 | 面を送って点を引き直す符号化 | 同じ面忠実度でオクトツリーの 4.0 倍 | [lossy_surface_finding.md](results/lossy_surface_finding.md) |
 | 歪み尺度の落とし穴 2 件 | Chamfer の下限は点密度だけで決まる | [lossy_surface_finding.md](results/lossy_surface_finding.md) |
 | 推定を測定に替えるだけで戻った | 3.1 bit/点 | [lossless_refinements.md](results/lossless_refinements.md) |
-| 車載 LiDAR の float32 は 1 mm 格子に乗る（可逆に整数化） | 無圧縮比 −83.2%、整数 LAS にした LASzip 比 −6.6% | [forward_operator.md](results/forward_operator.md) §4 |
+| 車載 LiDAR の float32 は 1 mm 格子に乗る（可逆に整数化） | 無圧縮比 −83.3%（108 frame の中央値、強度込み。`kitti108_v19.log`）、座標だけなら走行全体で 16.901 bpp（−82.4%、`kitti_xyz_v22.log`）、整数 LAS にした LASzip 比 −6.6% | [forward_operator.md](results/forward_operator.md) §4（発見）・[standing.md](results/standing.md)（いまの値） |
 | （撤回）車載 LiDAR の float32 は派生表現 | 前提の「格子は壊れている」が誤りだった | [kitti_polar_finding.md](results/kitti_polar_finding.md) |
 | （訂正）取得表現への復帰は地上型でも効く。「逆効果」は極座標の中心を重心にして測った誤り | スキャナ中心で器が −38〜−43%（旧表は重心中心の見積りで +34〜57%） | [tls_polar_finding.md](results/tls_polar_finding.md) |
 | octree は点間隔以下でゼロ情報 | 13 データセットで H(c)=2.976〜3.000 | [subspacing_finding.md](results/subspacing_finding.md) |
@@ -199,7 +222,13 @@ Python venv（`$PCCPY`）、G-PCC 参照ソフト（`$TMC3`）、サンプルデ
 ```bash
 cd cpp && cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release && ninja -C build
 export LD_LIBRARY_PATH=$HOME/tools/laszip-install/lib:$LD_LIBRARY_PATH
+# 検証一式の isa 項目用に、この機械の命令セットで建てた二値も作る（出力は既定の二値と同じ）
+cmake -S . -B build_native -G Ninja -DCMAKE_BUILD_TYPE=Release -DPCC_MARCH=native && ninja -C build_native pccnorm
 ```
+
+命令セットは `-DPCC_MARCH=<値>` で選ぶ（既定 `x86-64`）。既存のビルド用ディレクトリは値を
+CMakeCache に覚えるので、既定を変えても ninja を回し直すだけでは前の値のまま（`-DPCC_MARCH=x86-64` を
+渡して cmake を回し直す）。`cpp/build` が native のままだと、検証一式の isa は「同じ命令セット」で落ちる。
 
 > virtiofs 上では ninja がヘッダの変更を検知しないことがある。
 > ヘッダを編集したら `touch cpp/include/pcc/*.hpp cpp/src/*.cpp` してからビルドする。
@@ -211,20 +240,27 @@ export LD_LIBRARY_PATH=$HOME/tools/laszip-install/lib:$LD_LIBRARY_PATH
 ### 自前符号器（PCC2）
 
 ```bash
-# 符号化 → その場で復号して全列一致を確認 → 5 軸を出す
+# 符号化 → 決定性・往復・LAS 書き戻しを確かめて確定 → 5 軸を出す
 ./cpp/build/pccnorm pack   <in.laz|in.bin|in.ply> <out.pcc2> [--max-points N] [--trace]
-./cpp/build/pccnorm unpack <out.pcc2> [--las restored.laz]
+./cpp/build/pccnorm unpack <out.pcc2> [--las restored.laz] [--bin restored.bin]
 ```
 
-主なオプション
+主なオプション（pack）
 
 | | 内容 |
 |---|---|
 | `--trace` | 候補ごとの実測 bpp を全部出す（採択の根拠） |
-| `--sample-select N` | 符号器の選択だけ先頭 N 点で行う（選択のずれは小ファイルで 0.3%） |
+| `--eps <m>` | 非可逆。float の器（KITTI `.bin`・PLY）だけ。誤差上限を守る格子（極座標か直交）に量子化する。属性はビット完全のまま |
+| `--no-verify` | 自己検証を全部飛ばす（ベンチで符号化の時間だけを測るとき） |
+| `--no-fallback` | 自前の出力より、同じ点を書き直した基準の LAZ が短いときに包む退避路を切る（LAS 入力だけ。測定用） |
+| `--force-geom <名前>` | 幾何の候補を 1 本に固定する（旗つきの名前も可）。選ばれなかった候補の往復に使う |
+| `--fast-attr` | 属性の候補を 2 本に絞って速くする（サイズは伸びる） |
+| `--sample-select N` | 符号器の選択を N 点の散らした標本で行う（いまは既定より遅く、サイズも伸びうる） |
 | `--no-normalize` | 正規化（定数・複製・整数アフィンの除去）を行わない |
 | `--no-spatial` | 属性の空間予測を候補に入れない |
 | `--split-geom` | 幾何 3 軸を別々のストリームにする |
+
+`unpack --bin` は KITTI の `.bin` として書き戻す。PLY を書き出す口は無い。
 
 ### 計測・診断
 
@@ -240,7 +276,14 @@ export LD_LIBRARY_PATH=$HOME/tools/laszip-install/lib:$LD_LIBRARY_PATH
 
 ### Python（対照実装と実験）
 
-C++ はレンジコーダのバイト列まで Python と一致する。実験スクリプトもここにある。
+旧形式（PCC1）のレンジコーダは C++ と Python でバイト列まで一致する。実験スクリプトもここにある。
+
+```bash
+$PCCPY python/verify_suite.py [札]          # 検証一式（10 項目。測定と同時に回さない。札を省くと日付）
+$PCCPY python/regress_fixes.py              # 直した不具合の回帰（60 件）
+BENCH_N=2000000 $PCCPY python/bench_all.py  # サイズ・速度・メモリを LASzip と比べる
+$PCCPY python/bench_ab.py <旧 pccnorm> <新 pccnorm>   # 2 つの二値を交互に回して速度とメモリを比べる
+```
 
 ```bash
 $PCCPY python/run_report.py <file.laz> --max-points 2000000 --kmax 9 --out results/x.md
@@ -288,6 +331,7 @@ data/       サンプルデータ（git 管理外。setup.sh が取得する）
 
 ## 背景メモ
 
+- [`results/architecture.md`](results/architecture.md) — **いまの構成の全体像**（コードから起こした一覧）
 - [`notes/00_plan.md`](notes/00_plan.md) — 確定した前提と Phase 分け
 - [`notes/01_normalization_layer.md`](notes/01_normalization_layer.md) — 正規化レイヤーの設計
 - [`notes/02_codec_container.md`](notes/02_codec_container.md) — PCC2 コンテナの設計
