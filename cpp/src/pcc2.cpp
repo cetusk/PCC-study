@@ -563,7 +563,8 @@ static void enc_geom_med(const std::vector<const Col*>& cols,
     Encoder e;
     const bool sgnctx = sgn_ctx_on();          // 符号つきの文脈（旗 符1/2/4）
     const int SM = sgnctx ? sgn_mul() : 1;
-    UIntCoder uc((int)nc * NCTX * SM, 64);
+    const int RM = ret_mul();                  // 戻りの種類の文脈（旗 光）
+    UIntCoder uc((int)nc * NCTX * SM * RM, 64);
     std::vector<MedPred> mp(nc);
     std::vector<int> ctx(nc, 0), sg(nc, 0);
     for (size_t i = 0; i < n; ++i)
@@ -571,7 +572,7 @@ static void enc_geom_med(const std::vector<const Col*>& cols,
             int64_t x = (*cols[c])[i];
             const int64_t r = x - mp[c].predict();
             uint64_t z = zigzag(r);
-            uc.encode(e, z, ((int)c * NCTX + ctx[c]) * SM + sg[c]);
+            uc.encode(e, z, (((int)c * NCTX + ctx[c]) * SM + sg[c]) * RM + ret_class(i));
             mp[c].push(x);
             ctx[c] = ctx_of(z);
             if (sgnctx) sg[c] = sgn_push(sg[c], r);
@@ -584,12 +585,13 @@ static void dec_geom_med(const uint8_t* data, size_t len, size_t n, size_t nc,
     Decoder d(data, len);
     const bool sgnctx = sgn_ctx_on();
     const int SM = sgnctx ? sgn_mul() : 1;
-    UIntCoder uc((int)nc * NCTX * SM, 64);
+    const int RM = ret_mul();
+    UIntCoder uc((int)nc * NCTX * SM * RM, 64);
     std::vector<MedPred> mp(nc);
     std::vector<int> ctx(nc, 0), sg(nc, 0);
     for (size_t i = 0; i < n; ++i)
         for (size_t c = 0; c < nc; ++c) {
-            uint64_t z = uc.decode(d, ((int)c * NCTX + ctx[c]) * SM + sg[c]);
+            uint64_t z = uc.decode(d, (((int)c * NCTX + ctx[c]) * SM + sg[c]) * RM + ret_class(i));
             const int64_t r = unzigzag(z);
             int64_t x = mp[c].predict() + r;
             out[c][i] = x;
@@ -975,7 +977,8 @@ static void enc_geom_dir(const std::vector<const Col*>& cols, int pmode,
     Encoder e;
     const bool sgnctx = sgn_ctx_on();          // 符号つきの文脈（旗 符1/2/4）
     const int SM = sgnctx ? sgn_mul() : 1;
-    UIntCoder uc(3 * NCTX * SM, 64);
+    const int RM = ret_mul();                  // 戻りの種類の文脈（旗 光）
+    UIntCoder uc(3 * NCTX * SM * RM, 64);
     Pred mp[3];
     for (int c = 0; c < 3; ++c) mp[c].mode = pmode;
     int prev_kx = 0, sg[3] = {0, 0, 0};
@@ -991,7 +994,7 @@ static void enc_geom_dir(const std::vector<const Col*>& cols, int pmode,
             uint64_t z = zigzag(r);
             int ctxc = (c == 0) ? prev_kx : (c == 1 ? k[0] : (k[0] + k[1]) / 2);
             if (ctxc >= NCTX) ctxc = NCTX - 1;
-            uc.encode(e, z, (c * NCTX + ctxc) * SM + sg[c]);
+            uc.encode(e, z, ((c * NCTX + ctxc) * SM + sg[c]) * RM + ret_class(i));
             mp[c].push(v);
             k[c] = ctx_of(z);
             if (sgnctx) sg[c] = sgn_push(sg[c], r);
@@ -1007,7 +1010,8 @@ static void dec_geom_dir(const uint8_t* data, size_t len, size_t n, int pmode,
     Decoder d(data, len);
     const bool sgnctx = sgn_ctx_on();
     const int SM = sgnctx ? sgn_mul() : 1;
-    UIntCoder uc(3 * NCTX * SM, 64);
+    const int RM = ret_mul();
+    UIntCoder uc(3 * NCTX * SM * RM, 64);
     Pred mp[3];
     for (int c = 0; c < 3; ++c) mp[c].mode = pmode;
     int prev_kx = 0, sg[3] = {0, 0, 0};
@@ -1018,7 +1022,7 @@ static void dec_geom_dir(const uint8_t* data, size_t len, size_t n, int pmode,
         for (int c = 0; c < 3; ++c) {
             int ctxc = (c == 0) ? prev_kx : (c == 1 ? k[0] : (k[0] + k[1]) / 2);
             if (ctxc >= NCTX) ctxc = NCTX - 1;
-            uint64_t z = uc.decode(d, (c * NCTX + ctxc) * SM + sg[c]);
+            uint64_t z = uc.decode(d, ((c * NCTX + ctxc) * SM + sg[c]) * RM + ret_class(i));
             int64_t pr = (c == 1) ? dir_pred_y(py, dx, pdx, pdy) : mp[c].predict();
             const int64_t r = unzigzag(z);
             int64_t v = wadd(pr, r);
@@ -3400,7 +3404,8 @@ static void encode_many(const std::vector<Cand>& cs,
 // `--force-geom` で名前ごと固定された勝者には何も足さない（固定した名前と
 // 違う符号器で書かれてしまうため）。
 static void post_flags(Stream& best, size_t& bestsz, const std::vector<const Col*>& cv,
-                       const CodecCtx* ctx, std::string* trace, size_t npts) {
+                       const CodecCtx* ctx, std::string* trace, size_t npts,
+                       size_t* before_fast = nullptr) {
     if (ctx && !ctx->force_geom.empty() && cand_name(best.codec, best.param) == ctx->force_geom)
         return;
     const uint16_t b0 = best.codec;
@@ -3482,9 +3487,13 @@ static void post_flags(Stream& best, size_t& bestsz, const std::vector<const Col
     static const bool ATTR_RAY = [] {
         const char* e = getenv("PCC_ATTR_RAY"); return !e || e[0] != '0'; }();
     bool ray_attr = false;
+    // 2026-09-23 から、点の並び順に残差を送る幾何の符号器（幾何v0 = enc_cols・
+    // 幾何v1 と med3 = enc_geom_med・向き追従 = enc_geom_dir）にも同じ文脈を試す。
     if (ATTR_RAY && ctx && ctx->bitfields_first && !(b0 & C_RAY_BIT) &&
         (bid0 == C_RANGE || bid0 == C_RANGE_DELTA || bid0 == C_RANGE_CTX || bid0 == C_RANGE_CTX2 ||
-         bid0 == C_ATTR_XREF || bid0 == C_ATTR_SPATIAL || bid0 == C_ATTR_COLOR)) {
+         bid0 == C_ATTR_XREF || bid0 == C_ATTR_SPATIAL || bid0 == C_ATTR_COLOR ||
+         bid0 == C_RANGE_MED || bid0 == C_GEOM_DIR ||
+         (bid0 == C_GEOM_XYZ && (gp0 == 0 || gp0 == 1)))) {
         bool pre_col = false;
         for (const auto& c : best.cols)
             if (c == "point_source_id" || c == "gps_time" || c == "bit_fields") pre_col = true;
@@ -3495,6 +3504,8 @@ static void post_flags(Stream& best, size_t& bestsz, const std::vector<const Col
                 if ((((uint64_t)(*bf)[i] >> 4) & 15) > 1) ray_attr = true;
         }
     }
+    // 光は符号の 4 通りと組にして同時に試す。符号の勝者が決まってから 1 本だけ重ねる形は
+    // 4 件で縮みを失った（autzen-2023 +0.058% など。losses.md §33）。
     if (ray_attr) {
         pc.push_back({(uint16_t)(b0 | C_RAY_BIT), best.param});
         if (!(b0 & (C_LMS_BIT | C_SGN2_BIT))) {
@@ -3600,6 +3611,7 @@ static void post_flags(Stream& best, size_t& bestsz, const std::vector<const Col
     // （逆に、既定を速い表にして最後に遅い表を試すと、候補の選び方が変わって
     // LAS の 6 件で縮みが減った）。二値の模型を通らない符号器（恒等・素の幅・字母）には
     // 効かないので試さない。
+    if (before_fast) *before_fast = bestsz;     // 速 を試す前の長さ（選び直しの判断に使う）
     {
         static const bool FAST_ON = [] {
             const char* e = getenv("PCC_FAST"); return !e || e[0] != '0'; }();
@@ -4019,7 +4031,8 @@ Stream best_stream(const Frame& f, const std::vector<std::string>& cols,
                 *trace += "      どの候補も通らなかったので恒等符号器で書いた\n";
         }
     }
-    if (!first && !on_sample) post_flags(best, bestsz, cv, ctx, trace, (size_t)f.n);
+    size_t before_fast = 0;
+    if (!first && !on_sample) post_flags(best, bestsz, cv, ctx, trace, (size_t)f.n, &before_fast);
     for (size_t i = 1; i < rank.size() && best.alt.size() < KEEP_ALT; ++i)
         best.alt.push_back(rank[i].second);
     // 標本で順位を付けると、空間予測を使う候補が系統的に不利になる。
@@ -4054,7 +4067,14 @@ Stream best_stream(const Frame& f, const std::vector<std::string>& cols,
     // 旗「速」を付けて選び直す。短いほうを採る。速い表が勝たない流れには費用が無い。
     static const bool FAST_RERUN = [] {
         const char* e = getenv("PCC_FAST_RERUN"); return !e || e[0] != '0'; }();
-    if (FAST_RERUN && !on_sample && !first && (best.codec & C_FAST_BIT) &&
+    // 速い表の勝ち幅の下限（‰。PCC_FAST_RERUN_MIN。符号化器だけの選択で器は変わらない）。
+    // 既定は 0（わずかでも勝てば選び直す）。1‰ で AHN5 +0.027%、3‰ で plane +0.117%、
+    // 10‰ で符号化 −20% の代わりに 5 件で縮みを失った（losses.md §33）。サイズが第一なので 0。
+    static const long FAST_RERUN_MIN = [] {
+        const char* e = getenv("PCC_FAST_RERUN_MIN"); return e ? atol(e) : 0L; }();
+    const bool fast_gain_ok = before_fast > 0 &&
+        (before_fast - best.data.size()) * 1000 >= (size_t)FAST_RERUN_MIN * before_fast;
+    if (FAST_RERUN && fast_gain_ok && !on_sample && !first && (best.codec & C_FAST_BIT) &&
         !candidates.empty() && !(candidates[0].codec & C_FAST_BIT)) {
         std::vector<Cand> fc;
         fc.reserve(candidates.size());

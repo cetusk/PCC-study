@@ -181,5 +181,43 @@ for nm, kw in cases.items():
             same = all(a_[k] == b_[k] for k in range(hs_) if k not in skip)
         ok = r.returncode == 0 and "LAS に書き戻して元と一致 = true" in r.stdout and same
         check(f"ヘッダ {nm} {ext}", ok, "" if ok else (r.stdout[-200:] + r.stderr[-200:] + u.stderr[-200:]))
+# 10. 以前の査読が作った反例 3 件（2026-09-22 の二値でしか確かめていなかった）
+import laspy
+def lp_case(name, fmt, fill):
+    h = laspy.LasHeader(point_format=fmt, version="1.4")
+    h.scales = [0.01, 0.01, 0.01]; h.offsets = [0, 0, 0]
+    rng10 = np.random.default_rng(10)
+    n = 3000
+    if fill == "time":
+        h.add_extra_dims([laspy.ExtraBytesParams(name="Time", type=np.float64)])
+    d = laspy.LasData(h)
+    d.X = rng10.integers(0, 100000, n); d.Y = rng10.integers(0, 100000, n); d.Z = rng10.integers(0, 5000, n)
+    d.intensity = rng10.integers(0, 4000, n)
+    d.return_number = np.ones(n, np.uint8); d.number_of_returns = np.ones(n, np.uint8)
+    if fill == "flags":
+        d.classification = rng10.integers(0, 10, n)
+        d.synthetic = rng10.integers(0, 2, n).astype(bool)
+        d.key_point = rng10.integers(0, 2, n).astype(bool)
+        d.withheld = rng10.integers(0, 2, n).astype(bool)
+        d.overlap = rng10.integers(0, 2, n).astype(bool)
+    if fill == "time":
+        d["Time"] = 1.7e9 + np.cumsum(rng10.uniform(0, 1e-3, n))   # 大きな値（エポック秒）
+        d.gps_time = rng10.uniform(0, 1e6, n)
+    if fill == "dupcolor":
+        c = rng10.integers(0, 65535, n)
+        d.red = c; d.green = c; d.blue = c                          # 3 列が同じ値
+    path = os.path.join(T, name + ".las"); d.write(path)
+    return path
+for name, fmt, fill in [("pf6_flags", 6, "flags"), ("big_time", 6, "time"), ("dup_color", 7, "dupcolor")]:
+    src = lp_case(name, fmt, fill)
+    c = os.path.join(T, name + ".pcc2"); o = os.path.join(T, name + ".out.las")
+    r = run("pack", src, c, "--no-fallback")
+    u = run("unpack", c, "--las", o) if r.returncode == 0 else r
+    same = False
+    if u.returncode == 0:
+        a_, b_ = laspy.read(src), laspy.read(o)
+        same = all(np.array_equal(np.asarray(a_[d]), np.asarray(b_[d])) for d in a_.point_format.dimension_names)
+    ok = r.returncode == 0 and "LAS に書き戻して元と一致 = true" in r.stdout and same
+    check(f"反例 {name}", ok, "" if ok else (r.stdout[-200:] + r.stderr[-200:]))
 print(f"{sum(o for _, o in res)}/{len(res)} 通過")
 sys.exit(0 if all(o for _, o in res) else 1)
