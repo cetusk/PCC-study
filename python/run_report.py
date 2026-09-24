@@ -1,6 +1,6 @@
 """Phase 1 レポート生成器: 1ファイル投げれば「ビット内訳」が全部出る。
 
-usage: $PCCPY python/run_report.py <file> [--max-points N] [--kmax 10] [--out results/x.md]
+usage: $PCCPY python/run_report.py <file> [--max-points N] [--kmax 10] [--out <名前>]
 """
 from __future__ import annotations
 import argparse, sys, json, time
@@ -14,7 +14,7 @@ from fieldshare import analyse as field_analyse
 
 
 def order_redundancy(pc, sample=None) -> str:
-    """点の順序が持つ冗長 (survey 攻め筋③ / Q2)。
+    """点の順序が持つ冗長。
 
     log2(N!)/N は「集合として送れば節約できる」理論上限。ただし取得順そのものが
     予測可能（走査順）なら、実際の符号長は既にそれを回収している。

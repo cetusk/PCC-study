@@ -6,6 +6,19 @@
 /notes/
 /RESUME.md
 
+# ---- 実験用のスクリプト（公開しない）。検証やベンチが読み込むものだけ残す
+/python/exp_*.py
+!/python/exp_isa.py
+!/python/exp_octant_predict.py
+!/python/exp_order.py
+!/python/exp_order_matrix.py
+!/python/exp_regime.py
+!/python/exp_surface_vs_sampling.py
+!/python/exp_threads.py
+!/python/exp_topology.py
+/scripts/*
+!/scripts/setup.sh
+
 # ---- 実装と関係のないもの
 /claude_sandbox.bat
 /survey/

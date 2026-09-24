@@ -1,6 +1,6 @@
 """ベースライン符号化器。常に 5 軸 (bytes / enc / dec / peak mem / 決定性) を返す。
 
-survey 攻め筋⑧: bpp だけで評価すると「実は使えない」になる。最初から一緒に測る。
+bpp だけで評価すると「実は使えない」になる。最初から一緒に測る。
 """
 from __future__ import annotations
 import io, os, time, lzma, subprocess, tempfile, hashlib, resource

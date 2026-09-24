@@ -158,9 +158,9 @@ cpp/        C++ 実装（本体）
   include/pcc/  frame・pcc2・scanmodel・rangecoder・las・normalize・geom ほか
   src/
   tests/fixtures/  回帰試験用の作り物のデータ
-python/     Python の対照実装・検証・ベンチ・実験スクリプト
+python/     Python の対照実装・検証・ベンチ
 paper/      論文（PDF）
-scripts/    環境の用意・一括実行
+scripts/    環境の用意（setup.sh）
 data/       サンプルデータ（git 管理外。setup.sh が取得する）
 ```
 

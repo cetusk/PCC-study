@@ -1782,8 +1782,6 @@ static void dec_resid(const uint8_t* data, size_t len, size_t n, size_t nc,
 
 
 // ============================================================ 走査モデル経由の幾何
-// 裏付けは results/als_scan_structure.md、設計は notes/03_scan_model_codec.md。
-//
 // 復号器が先に持っているもの: point_source_id, gps_time, bit_fields（戻り番号）。
 // そこから走査順（psid と gps の安定ソート）と掃引の切れ目（時刻の隙間。しきい値は
 // 発射間隔の中央値の 20 倍で、gps_time から測る）が
@@ -3658,7 +3656,7 @@ static void post_flags(Stream& best, size_t& bestsz, const std::vector<const Col
         }
     }
     // 光は符号の 4 通りと組にして同時に試す。符号の勝者が決まってから 1 本だけ重ねる形は
-    // 4 件で縮みを失った（autzen-2023 +0.058% など。losses.md §33）。
+    // 4 件で縮みを失った（autzen-2023 +0.058% など）。
     if (ray_attr) {
         pc.push_back({(uint16_t)(b0 | C_RAY_BIT), best.param});
         if (!(b0 & (C_LMS_BIT | C_SGN2_BIT))) {
@@ -4289,7 +4287,7 @@ Stream best_stream(const Frame& f, const std::vector<std::string>& cols,
     // 組合せ（素通し＋束ね）もここで一緒に測れる。
     // **照合模型（C_MTC_BIT）はここに入れない。**22 列で測って採られたのは 0 列。
     // 桁長の文脈が既に効いているので、当たり外れの 1 ビットぶんだけ損になる。
-    // 符号器は残してある。記録は losses.md §17。
+    // 符号器は残してある。
     // **どの候補も失敗したら、恒等符号器で書く。**
     // 器の設計は「恒等候補 raw64 を必ず含むので長さは有限で閉じる」だが、
     // `--force-geom` は候補を 1 本に絞るので、その 1 本が失敗すると
@@ -4360,7 +4358,7 @@ Stream best_stream(const Frame& f, const std::vector<std::string>& cols,
         const char* e = getenv("PCC_FAST_RERUN"); return !e || e[0] != '0'; }();
     // 速い表の勝ち幅の下限（‰。PCC_FAST_RERUN_MIN。符号化器だけの選択で器は変わらない）。
     // 既定は 0（わずかでも勝てば選び直す）。1‰ で AHN5 +0.027%、3‰ で plane +0.117%、
-    // 10‰ で符号化 −20% の代わりに 5 件で縮みを失った（losses.md §33）。サイズが第一なので 0。
+    // 10‰ で符号化 −20% の代わりに 5 件で縮みを失った。サイズが第一なので 0。
     static const long FAST_RERUN_MIN = [] {
         const char* e = getenv("PCC_FAST_RERUN_MIN");
         const long v = e ? atol(e) : 0L;
@@ -4532,11 +4530,13 @@ std::vector<Stream> plan_streams(const Frame& f, bool joint_geom, std::string* l
                              // workshop 19.120 → 21.862 など、測った全部で負けた。
                              // 見積りの相手が素朴な差分だったのが原因で、実際の
                              // 勝者（幾何v4・走査・向き・回転）は区間で切り替える
-                             // Pred の 8 通りよりずっと強い。記録は losses.md §16。
+                             // Pred の 8 通りよりずっと強い。
                              // **内挿（C_GEOM_LIFT）は候補から外してある。**
                              // 10 ファイルで測って全部負けた（+6.4〜27.0%）。
-                             // 段数を 1 まで浅くしても変わらない。理由は
-                             // `results/literature_2026.md` §7 と losses.md §15。
+                             // 段数を 1 まで浅くしても変わらない。持ち上げは
+                             // 系列が滑らかなことを前提にするが、格納順で前後の
+                             // 点が空間的に近いとは限らない（勝者は直近 16 点の
+                             // うち最も近い点から予測する 幾何v4 だった）。
                              // 符号器は残してあるので、粗い層に強い予測子を使う形で
                              // やり直すときは候補に戻すだけでよい。
                              {C_GEOM_XYZ, {0}}, {C_GEOM_XYZ, {1}}, {C_GEOM_XYZ, {3}},
@@ -4617,8 +4617,6 @@ std::vector<Stream> plan_streams(const Frame& f, bool joint_geom, std::string* l
             };
             add("gps_time"); add("point_source_id"); add(ret);
             // v2（z を中央値予測）と v3（z の文脈を面内・面外から作る）と v4 も出す。
-            // 以前は既定で外していたが、**その根拠だった集計は誤りだった**
-            // （results/scan_model_fitting.md 16・32 節）。測り直したところ、
             // 記号版を標本から守るようにした上で全部出すと、悪化が 1 件も無く
             // AHN4 _21 −0.13% / AHN5 _20 −0.25% / fullwave −0.28% が縮んだ。
             // 代償は符号化が 10.9 倍 → 12.7 倍。サイズが第一なので出す。

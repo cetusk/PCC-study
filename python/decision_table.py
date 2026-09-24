@@ -1,6 +1,6 @@
 """精度要件 → 削減量 の意思決定テーブル。
 
-survey 攻め筋②「精度担保の定義は技術判断ではなく合意事項」に対する
+「精度担保の定義は技術判断ではなく合意事項」という見方に対する
 具体的な材料。「何を合意すれば何 bpp 浮くか」を一枚にする。
 """
 from __future__ import annotations
@@ -41,5 +41,6 @@ def build(sweep_json: str, attr_bpp: float, extrabytes_saving: float,
 
 
 if __name__ == "__main__":
-    print(build("results/ahn4_31HZ1_20_4M.md.sweep.json",
+    # 引数は run_report.py --out <名前> が書く <名前>.sweep.json
+    print(build(sys.argv[1],
                 attr_bpp=49.044, extrabytes_saving=19.507, extrabytes_floor=5.937))

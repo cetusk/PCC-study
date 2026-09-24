@@ -36,7 +36,7 @@ if [ "$need_pkg" = 1 ]; then
       libzstd-dev libeigen3-dev libgmp-dev libmpfr-dev libboost-dev libcgal-dev
 fi
 # LASzip（LAS/LAZ の読み書き）。liblaszip_api は動的ロード用のシムなので
-# liblaszip に直接リンクする必要がある（CPP_PORT.md の記録を参照）。
+# liblaszip に直接リンクする必要がある。
 if [ ! -e "$TOOLS/laszip-install/include/laszip/laszip_api.h" ]; then
   mkdir -p "$TOOLS" && cd "$TOOLS"
   [ -d LASzip ] || git clone -q --depth 1 https://github.com/LASzip/LASzip.git

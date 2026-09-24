@@ -30,7 +30,7 @@ inline constexpr int PROB_RATE = 5;
 //     寄せて雑音に振られないようにする。LAS の 15 件で全件が縮んだ。
 //   速い後半（BM_RATE_FAST、旗 C_FAST_BIT）: 同じ区間に 1,2,2,3,3,4,5,5,5,5（後半は従来の
 //     1/32）。場面の変わる KITTI・物体のスキャンでは既定の表より縮むので、流れごとに実測で
-//     選ぶ（results/losses.md）。codec_encode / codec_decode が流れごとに切り替える。
+//     選ぶ。codec_encode / codec_decode が流れごとに切り替える。
 constexpr std::array<uint8_t, 256> make_bm_rate(const int (&sched)[10]) {
     std::array<uint8_t, 256> t{};
     for (int n = 0; n < 256; ++n) {
