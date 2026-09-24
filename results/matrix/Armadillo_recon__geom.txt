@@ -1,7 +1,0 @@
-### geom data/raw/stanford/Armadillo.ply --max-points 400000
-誤差上限 0.0268344（点間隔 0.42935 の 1/16）
-    候補 grid              33.701 bpp  誤差  26.622mm  ← 採用
-    候補 polar/origin      38.505 bpp  誤差  26.628mm
-    候補 polar/centroid    38.505 bpp  誤差  26.628mm
-  選択 grid  実誤差 26.6221 mm
-__elapsed .491479200 s

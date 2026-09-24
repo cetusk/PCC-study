@@ -8,7 +8,7 @@ import numpy as np
 from dataclasses import dataclass, asdict
 from pathlib import Path
 
-TMC3 = os.environ.get("TMC3", "/home/agent/tools/tmc13/build/tmc3/tmc3")
+TMC3 = os.environ.get("TMC3", os.path.expanduser("~/tools/tmc13/build/tmc3/tmc3"))
 
 
 @dataclass

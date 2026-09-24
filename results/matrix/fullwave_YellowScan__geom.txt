@@ -1,7 +1,0 @@
-### geom data/raw/small/fullwave.laz --max-points 400000
-誤差上限 0.0124853（点間隔 0.199765 の 1/16）
-    候補 grid              16.952 bpp  誤差  12.272mm  ← 採用
-    候補 polar/origin      18.990 bpp  誤差  11.797mm
-    候補 polar/centroid    18.989 bpp  誤差  11.797mm
-  選択 grid  実誤差 12.2717 mm
-__elapsed .036329400 s

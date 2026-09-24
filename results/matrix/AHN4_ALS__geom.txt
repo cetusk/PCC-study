@@ -1,7 +1,0 @@
-### geom data/raw/ahn4/31HZ1_20.LAZ --max-points 400000
-誤差上限 0.00818058（点間隔 0.130889 の 1/16）
-    候補 grid              15.330 bpp  誤差   8.172mm  ← 採用
-    候補 polar/origin      17.419 bpp  誤差   8.108mm
-    候補 polar/centroid    17.419 bpp  誤差   8.108mm
-  選択 grid  実誤差 8.1725 mm
-__elapsed .996327800 s

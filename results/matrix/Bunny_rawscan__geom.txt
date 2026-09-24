@@ -1,7 +1,0 @@
-### geom data/raw/stanford/bunny/data/bun000.ply --max-points 400000
-誤差上限 3.2252e-05（点間隔 0.000516032 の 1/16）
-    候補 grid               6.535 bpp  誤差   0.032mm  ← 採用
-    候補 polar/origin      14.606 bpp  誤差   0.032mm
-    候補 polar/centroid    14.606 bpp  誤差   0.032mm
-  選択 grid  実誤差 0.0320 mm
-__elapsed .101121600 s

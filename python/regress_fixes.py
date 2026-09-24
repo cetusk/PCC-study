@@ -280,12 +280,12 @@ got = hashlib.md5(open(out14, "rb").read()).hexdigest() if os.path.exists(out14)
 check("版 3 の極座標の器を版 3 と同じに戻す", r.returncode == 0 and got == "4d57c3ea1305cf4cb0abb7c7341721dd",
       f"rc={r.returncode} md5={got} " + r.stderr.strip()[:120])
 # 15. 器の版 5（旗「類」を足した）の復号器が、版 4 の器を版 4 の二値と同じに戻す。
-#     版 4 の二値（c05db51〜7eb1ee7）で作った fullwave の器と、その二値の unpack --las の md5。
-fx4 = "cpp/tests/fixtures/fullwave_v4.pcc2"
-out15 = os.path.join(T, "fw4.las")
+#     版 4 の二値（c05db51〜7eb1ee7）で作り物の l1_undoc.las を符号化した器と、その二値の unpack --las の md5。
+fx4 = "cpp/tests/fixtures/synth_v4.pcc2"
+out15 = os.path.join(T, "s4.las")
 r = run("unpack", fx4, "--las", out15)
 got = hashlib.md5(open(out15, "rb").read()).hexdigest() if os.path.exists(out15) else "-"
-check("版 4 の器を版 4 と同じに戻す", r.returncode == 0 and got == "a3ed98b2b22f66b2f899ab59b758a07c",
+check("版 4 の器を版 4 と同じに戻す", r.returncode == 0 and got == "59ff7eeef04193259a406b8343783b39",
       f"rc={r.returncode} md5={got} " + r.stderr.strip()[:120])
 # 16. 旗「類」（既に復号済みの列の類を文脈に足す）が選ばれた流れの往復。fullwave では波形の列などで選ばれる。
 #     色の 3 列は鎖（blue → green → red）でスキーマと逆順に依存しうるので、互いを類の相手にしない

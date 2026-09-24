@@ -1,6 +1,11 @@
 # ---- データ（git 管理外。scripts/setup.sh が取得する）
 /data/
 
+# ---- 途中過程の記録（公開しない。手元にだけ置く）
+/results/
+/notes/
+/RESUME.md
+
 # ---- 実装と関係のないもの
 /claude_sandbox.bat
 /survey/

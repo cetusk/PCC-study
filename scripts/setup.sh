@@ -3,8 +3,9 @@
 #   bash scripts/setup.sh
 set -euo pipefail
 PROJ="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-VENV=/home/agent/.venvs/pcc
-TOOLS=/home/agent/tools
+# 置き場所は環境変数で変えられる（既定はホームの下）
+VENV="${PCC_VENV:-$HOME/.venvs/pcc}"
+TOOLS="${PCC_TOOLS:-$HOME/tools}"
 
 echo "== 1. ビルドツール =="
 if ! command -v cmake >/dev/null || ! command -v g++ >/dev/null; then
@@ -14,8 +15,8 @@ fi
 g++ --version | head -1; cmake --version | head -1
 
 echo "== 2. Python 環境 =="
-# 注意: プロジェクトは virtiofs マウント上でシンボリックリンクが作れないため
-#       venv は必ず $HOME 側に作る（/c/... 上に作ると uv venv が壊れる）
+# 注意: プロジェクトをシンボリックリンクの作れない場所（共有フォルダなど）に置くときは、
+#       venv をプロジェクトの外（既定は $HOME の下）に作る
 if [ ! -x "$VENV/bin/python" ]; then
   uv venv --python 3.12 "$VENV"
   uv pip install -q --python "$VENV/bin/python" \
@@ -66,11 +67,10 @@ if [ ! -x "$TOOLS/tmc13/build/tmc3/tmc3" ]; then
 fi
 "$TOOLS/tmc13/build/tmc3/tmc3" --help 2>&1 | head -1 || true
 
-echo "== 4. 環境変数の永続化 =="
-grep -q 'PCCPY' /etc/sandbox-persistent.sh 2>/dev/null || \
-  echo "export PCCPY=$VENV/bin/python  # PCC-study" | sudo tee -a /etc/sandbox-persistent.sh >/dev/null
-grep -q 'export TMC3=' /etc/sandbox-persistent.sh 2>/dev/null || \
-  echo "export TMC3=$TOOLS/tmc13/build/tmc3/tmc3  # PCC-study" | sudo tee -a /etc/sandbox-persistent.sh >/dev/null
+echo "== 4. 環境変数 =="
+# スクリプトは PCCPY（Python）と TMC3（G-PCC の参照ソフト）を環境変数で探す。シェルの設定に足しておくこと。
+echo "  export PCCPY=$VENV/bin/python"
+echo "  export TMC3=$TOOLS/tmc13/build/tmc3/tmc3"
 
 echo "== 5. データ =="
 cd "$PROJ"
@@ -78,7 +78,7 @@ cd "$PROJ"
 # すべて再取得できる。URL は 2026-09-19 に到達性とバイト数を実測して確認した。
 #
 # 切り詰められたダウンロードは部分読み込みでは成功したように見えるため気づきにくい
-# （results/vendor_generality.md: ちょうど 10 MiB で切れた laz を 1 件掴んだ）。
+# （ちょうど 10 MiB で切れた laz を 1 件掴んだことがある）。
 # そこで取得のたびにバイト数を照合し、合わなければその場で落とす。
 fetch() {   # fetch <url> <出力パス> <期待バイト数|0>
   local url="$1" out="$2" want="$3"
@@ -123,7 +123,7 @@ for f in autzen_trim.laz vegetation_1_3.las simple1_4.las plane.laz fullwave.laz
   fetch "$LASPY/$f" "data/raw/small/$f" 0
 done
 
-# ---- ExtraBytes を持つ他ベンダのファイル（results/vendor_generality.md）
+# ---- ExtraBytes を持つ他ベンダのファイル
 fetch "$LASPY/extra.laz"      data/raw/extrabytes/extra.laz      29084
 fetch "$LASPY/extrabytes.las" data/raw/extrabytes/extrabytes.las 66354
 fetch "https://github.com/PDAL/data/raw/main/workshop/TM_551_101.laz" \
@@ -143,7 +143,7 @@ if [ ! -d data/raw/kitti/2011_09_26 ]; then
 fi
 
 # ---- 三角測量スキャナ: Stanford 3D Scanning Repository
-#      生スキャンと再構成を対にして使う（results/matrix_comparison.md ①）
+#      生スキャンと再構成を対にして使う
 STAN=http://graphics.stanford.edu/pub/3Dscanrep
 fetch "$STAN/bunny.tar.gz"                   data/raw/stanford/bunny.tar.gz          4894286
 fetch "$STAN/dragon/dragon_recon.tar.gz"     data/raw/stanford/dragon_recon.tar.gz  11197764
@@ -158,7 +158,7 @@ fetch "$STAN/armadillo/Armadillo_scans.tar.gz" data/raw/stanford/Armadillo_scans
  [ -s Armadillo.ply ] || gunzip -kf Armadillo.ply.gz)
 
 # ---- 地上型レーザースキャナ: Würzburg の講堂（RIEGL VZ-400）
-#      results/tls_polar_finding.md。450MB あるので最後に置く
+#      450MB あるので最後に置く
 fetch "http://kos.informatik.uni-osnabrueck.de/3Dscans/lecturehall.tar.xz" \
       data/raw/tls/lecturehall.tar.xz 451591544
 (cd data/raw/tls && [ -d lecturehall ] || tar xJf lecturehall.tar.xz)

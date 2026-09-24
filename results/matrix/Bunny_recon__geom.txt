@@ -1,7 +1,0 @@
-### geom data/raw/stanford/bunny/reconstruction/bun_zipper.ply --max-points 400000
-誤差上限 6.32572e-05（点間隔 0.00101212 の 1/16）
-    候補 grid              24.991 bpp  誤差   0.063mm  ← 採用
-    候補 polar/origin      28.467 bpp  誤差   0.063mm
-    候補 polar/centroid    28.467 bpp  誤差   0.063mm
-  選択 grid  実誤差 0.0630 mm
-__elapsed .110150200 s

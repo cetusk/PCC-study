@@ -1,7 +1,0 @@
-### geom data/raw/small/autzen_trim.laz --max-points 400000
-誤差上限 0.0835258（点間隔 1.33641 の 1/16）
-    候補 grid              13.891 bpp  誤差  82.893mm  ← 採用
-    候補 polar/origin      18.726 bpp  誤差  80.153mm
-    候補 polar/centroid    18.726 bpp  誤差  80.153mm
-  選択 grid  実誤差 82.8930 mm
-__elapsed .291671500 s

@@ -1,7 +1,0 @@
-### geom data/raw/small/simple1_4.las --max-points 400000
-誤差上限 0.0883883（点間隔 1.41421 の 1/16）
-    候補 grid               5.008 bpp  誤差  87.846mm  ← 採用
-    候補 polar/origin      16.636 bpp  誤差  87.673mm
-    候補 polar/centroid    16.636 bpp  誤差  87.673mm
-  選択 grid  実誤差 87.8462 mm
-__elapsed .062635800 s
